@@ -10,6 +10,7 @@ from pathlib import Path
 from .adapter import AdapterUnavailable, NvmlAdapter
 from .diagnose import diagnose
 from .fakes import make_fake
+from .load import LoadUnavailable, TorchGemmLoad
 from .metrics import derive
 from .report import render_report
 from .resultjson import build_result, canonical_dumps
@@ -39,9 +40,17 @@ def _make_adapter(args):
     return make_fake(args.fake) if args.fake else NvmlAdapter()
 
 
-def _make_load():
-    # TODO(Task 9): return TorchGemmLoad() when torch is available.
-    return NullLoad()
+def _make_load(args):
+    if args.fake:  # fake adapters supply their own achieved_tflops
+        return NullLoad()
+    try:
+        return TorchGemmLoad()
+    except LoadUnavailable:
+        print(
+            "no torch/CUDA — running without load; performance metrics will be gaps",
+            file=sys.stderr,
+        )
+        return NullLoad()
 
 
 def _config(args) -> RunConfig:
@@ -65,7 +74,7 @@ def _execute(adapter, args):
             t[0] += s
 
         kwargs = {"clock": clock, "sleep": sleep}
-    return spec, execute_run(adapter, _make_load(), _config(args), spec, **kwargs)
+    return spec, execute_run(adapter, _make_load(args), _config(args), spec, **kwargs)
 
 
 def main(argv: list[str] | None = None) -> int:
