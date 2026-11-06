@@ -143,7 +143,7 @@ def _underperforming(m: Metrics, spec: GpuSpec | None) -> Finding | None:
 
 
 def _insufficient_evidence(m: Metrics, spec: GpuSpec | None) -> Finding | None:
-    if spec is None or not _throttled(m):
+    if not _throttled(m):
         return None
     if m.idle_temp_c is not None and m.idle_temp_c <= TIM_IDLE_MAX_C:
         return None

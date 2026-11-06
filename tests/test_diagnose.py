@@ -207,6 +207,21 @@ def test_power_capped_limit_arm_runs_without_spec():
     assert "POWER_CAPPED" in codes(diagnose(healthy(), PF, inv(power_limit=300.0, default=450.0), None))
 
 
+def test_insufficient_emitted_without_spec_when_idle_missing():
+    m = tim_metrics(idle_temp_c=None)
+    out = diagnose(m, PF, inv(), None)
+    assert "TIM_DEGRADATION" not in codes(out)
+    f = find(out, "INSUFFICIENT_EVIDENCE")
+    assert (f.severity, f.confidence) == ("info", "low")
+
+
+def test_insufficient_emitted_without_spec_when_idle_hot():
+    m = tim_metrics(idle_temp_c=50.0)
+    out = diagnose(m, PF, inv(), None)
+    assert "TIM_DEGRADATION" not in codes(out)
+    assert "INSUFFICIENT_EVIDENCE" in codes(out)
+
+
 def test_power_capped_limit_arm_skipped_when_limits_unknown():
     assert "POWER_CAPPED" not in codes(diagnose(healthy(), PF, inv(power_limit=None, default=450.0), SPEC))
     assert "POWER_CAPPED" not in codes(diagnose(healthy(), PF, inv(power_limit=300.0, default=None), SPEC))
