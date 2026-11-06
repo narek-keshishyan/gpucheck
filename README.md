@@ -12,7 +12,7 @@ uvx --from "gpucheck[load]" gpucheck --quick
 pip install "gpucheck[load]"
 ```
 
-The load generator needs PyTorch with CUDA. It is an optional extra (`[load]`) because torch is large; if you already have a CUDA build of torch installed, plain `pip install gpucheck` is enough. Without torch the tool cannot generate load.
+The load generator needs PyTorch with CUDA. It is an optional extra (`[load]`) because torch is large; if you already have a CUDA build of torch installed, plain `pip install gpucheck` is enough. Without torch/CUDA the tool still runs but generates no load (it prints a warning), so performance metrics are left blank.
 
 ## Usage
 
@@ -23,11 +23,11 @@ gpucheck --long          # 60 s baseline, 30 min load
 gpucheck --offline       # never contacts a server
 gpucheck --dry-run       # print exactly what would be uploaded, upload nothing
 gpucheck --yes-upload    # upload without the prompt
-gpucheck --server URL    # use a different server
+gpucheck --server URL    # upload server (http or https); the built-in default is a placeholder until a public server exists
 gpucheck --json PATH     # where to write result.json (default ./gpucheck-result.json)
 ```
 
-The result is always written locally to `result.json` first. The tool only reads from the GPU; it does not change any settings. Ctrl-C stops a run at any time.
+The result is always written locally to `result.json` first. The tool only reads from the GPU; it does not change any settings. Ctrl-C stops a run at any time; an interrupted run writes no result.json and uploads nothing.
 
 ### Upload flow
 
@@ -50,13 +50,13 @@ The payload is the contents of `result.json`: GPU model and driver details, meas
 | 0 | Run completed |
 | 1 | Preflight refused to run (for example the GPU is busy) |
 | 2 | No NVIDIA GPU or driver available |
-| 3 | Run aborted partway |
+| 3 | Run aborted partway (thermal limit, ECC errors, or lost telemetry); result.json is still written |
 
 ## Limitations
 
 - NVIDIA GPUs on Linux only.
 - MIG instances give measurements only; they are not graded.
-- Needs PyTorch with CUDA to generate load.
+- Needs PyTorch with CUDA to generate load; without it, performance numbers are blank.
 - It refuses to run on a GPU that is already busy.
 - Grades depend on a reference set of comparable runs; for new or rare models you will see "insufficient reference".
 - A single run is a snapshot. A healthy result does not guarantee the card will never fail.

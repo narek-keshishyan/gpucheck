@@ -70,5 +70,5 @@ Keep for each GPU tested: the exact model name as reported, driver version, powe
 
 - gpucheck only reads from the GPU and runs a compute load; it changes no settings.
 - It refuses to run if the GPU is already in use.
-- Ctrl-C stops the run immediately and releases the GPU.
+- Ctrl-C stops the run (load is cleaned up); no result.json is written for an interrupted run.
 - Destroy the rented instance when finished so it stops billing.
