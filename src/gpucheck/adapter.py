@@ -28,7 +28,9 @@ class GpuInventory:
     mig_enabled: bool
     fractional: bool
     retired_pages: int | None
-    remapped_rows: int | None
+    remapped_rows: int | None  # correctable + uncorrectable
+    row_remap_pending: bool | None = None
+    row_remap_failure: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -38,7 +40,7 @@ class TelemetrySample:
     power_w: float | None
     sm_clock_mhz: float | None
     fan_pct: float | None
-    throttle_reasons: frozenset[str]
+    throttle_reasons: frozenset[str] | None  # None = NVML could not report reasons (unknown)
     ecc_volatile: int | None
     achieved_tflops: float | None
 
@@ -67,6 +69,35 @@ def _try(fn, *args):
         return None
 
 
+# NVML ABI values, used only when pynvml exposes neither naming family.
+_ABI = {
+    "SwPowerCap": 0x4,
+    "SwThermalSlowdown": 0x20,
+    "HwThermalSlowdown": 0x40,
+    "HwPowerBrakeSlowdown": 0x80,
+}
+
+
+def _const(nv, *names: str, default: int) -> int:
+    """First of `names` that pynvml defines, else `default`; never raises."""
+    for name in names:
+        value = getattr(nv, name, None)
+        if isinstance(value, int):
+            return value
+    return default
+
+
+def _reason_bit(nv, suffix: str) -> int:
+    # pynvml renamed "ClocksThrottleReason" to "ClocksEventReason" (NVML 12.x); the
+    # upper-case NVML_CLOCKS_THROTTLE_REASON_* spelling never existed in pynvml.
+    return _const(
+        nv,
+        f"nvmlClocksEventReason{suffix}",
+        f"nvmlClocksThrottleReason{suffix}",
+        default=_ABI[suffix],
+    )
+
+
 class NvmlAdapter(TelemetryAdapter):
     """Reads GPU 0 through NVML (pynvml)."""
 
@@ -83,17 +114,25 @@ class NvmlAdapter(TelemetryAdapter):
             raise AdapterUnavailable(f"NVML unavailable: {exc}") from exc
         self._t0 = time.monotonic()
 
+    def _q(self, name: str, *args):
+        """Optional NVML query by name: None if pynvml lacks it or the GPU does not support it."""
+        fn = getattr(self._nv, name, None)
+        return None if fn is None else _try(fn, *args)
+
     def inventory(self) -> GpuInventory:
         nv, h = self._nv, self._h
         uuid = _text(nv.nvmlDeviceGetUUID(h))
-        cuda_raw = _try(nv.nvmlSystemGetCudaDriverVersion)
+        cuda_raw = self._q("nvmlSystemGetCudaDriverVersion")
         cuda = f"{cuda_raw // 1000}.{(cuda_raw % 1000) // 10}" if cuda_raw else None
-        ecc = _try(nv.nvmlDeviceGetEccMode, h)
-        limit = _try(nv.nvmlDeviceGetPowerManagementLimit, h)
-        default = _try(nv.nvmlDeviceGetPowerManagementDefaultLimit, h)
-        mig = _try(nv.nvmlDeviceGetMigMode, h)
-        retired = _try(nv.nvmlDeviceGetRetiredPages, h, nv.NVML_PAGE_RETIREMENT_CAUSE_MULTIPLE_SINGLE_BIT_ECC_ERRORS)
-        remap = _try(nv.nvmlDeviceGetRemappedRows, h)
+        ecc = self._q("nvmlDeviceGetEccMode", h)
+        limit = self._q("nvmlDeviceGetPowerManagementLimit", h)
+        default = self._q("nvmlDeviceGetPowerManagementDefaultLimit", h)
+        mig = self._q("nvmlDeviceGetMigMode", h)
+        cause = _const(nv, "NVML_PAGE_RETIREMENT_CAUSE_MULTIPLE_SINGLE_BIT_ECC_ERRORS", default=0)
+        retired = self._q("nvmlDeviceGetRetiredPages", h, cause)
+        # (correctable rows, uncorrectable rows, remap pending, remap failure occurred)
+        remap = self._q("nvmlDeviceGetRemappedRows", h)
+        remap_ok = isinstance(remap, (tuple, list)) and len(remap) >= 4
         return GpuInventory(
             model_name=_text(nv.nvmlDeviceGetName(h)),
             uuid_hash=hash_uuid(uuid),
@@ -105,29 +144,38 @@ class NvmlAdapter(TelemetryAdapter):
             mig_enabled=bool(mig and mig[0]),
             fractional=False,
             retired_pages=len(retired) if retired is not None else None,
-            remapped_rows=remap[0] if remap else None,
+            remapped_rows=int(remap[0]) + int(remap[1]) if remap_ok else None,
+            row_remap_pending=bool(remap[2]) if remap_ok else None,
+            row_remap_failure=bool(remap[3]) if remap_ok else None,
         )
+
+    def _throttle_mask(self) -> int | None:
+        for name in ("nvmlDeviceGetCurrentClocksEventReasons", "nvmlDeviceGetCurrentClocksThrottleReasons"):
+            mask = self._q(name, self._h)
+            if mask is not None:
+                return int(mask)
+        return None  # unknown: recorded as a telemetry gap, never as "no throttling"
 
     def sample(self) -> TelemetrySample:
         nv, h = self._nv, self._h
-        temp = _try(nv.nvmlDeviceGetTemperature, h, nv.NVML_TEMPERATURE_GPU)
-        power = _try(nv.nvmlDeviceGetPowerUsage, h)
-        clock = _try(nv.nvmlDeviceGetClockInfo, h, nv.NVML_CLOCK_SM)
-        fan = _try(nv.nvmlDeviceGetFanSpeed, h)
-        mask = _try(nv.nvmlDeviceGetCurrentClocksEventReasons, h) or 0
-        ecc = _try(
-            nv.nvmlDeviceGetTotalEccErrors,
+        temp = self._q("nvmlDeviceGetTemperature", h, _const(nv, "NVML_TEMPERATURE_GPU", default=0))
+        power = self._q("nvmlDeviceGetPowerUsage", h)
+        clock = self._q("nvmlDeviceGetClockInfo", h, _const(nv, "NVML_CLOCK_SM", default=1))
+        fan = self._q("nvmlDeviceGetFanSpeed", h)
+        mask = self._throttle_mask()
+        ecc = self._q(
+            "nvmlDeviceGetTotalEccErrors",
             h,
-            nv.NVML_MEMORY_ERROR_TYPE_UNCORRECTED,
-            nv.NVML_VOLATILE_ECC,
+            _const(nv, "NVML_MEMORY_ERROR_TYPE_UNCORRECTED", default=1),
+            _const(nv, "NVML_VOLATILE_ECC", default=0),
         )
-        names = {
-            "thermal": nv.NVML_CLOCKS_THROTTLE_REASON_HW_THERMAL_SLOWDOWN
-            | nv.NVML_CLOCKS_THROTTLE_REASON_SW_THERMAL_SLOWDOWN,
-            "power": nv.NVML_CLOCKS_THROTTLE_REASON_SW_POWER_CAP
-            | nv.NVML_CLOCKS_THROTTLE_REASON_HW_POWER_BRAKE_SLOWDOWN,
-        }
-        reasons = frozenset(name for name, bits in names.items() if mask & bits)
+        reasons: frozenset[str] | None = None
+        if mask is not None:
+            names = {
+                "thermal": _reason_bit(nv, "HwThermalSlowdown") | _reason_bit(nv, "SwThermalSlowdown"),
+                "power": _reason_bit(nv, "SwPowerCap") | _reason_bit(nv, "HwPowerBrakeSlowdown"),
+            }
+            reasons = frozenset(name for name, bits in names.items() if mask & bits)
         return TelemetrySample(
             t_s=time.monotonic() - self._t0,
             temp_c=float(temp) if temp is not None else None,
@@ -140,5 +188,5 @@ class NvmlAdapter(TelemetryAdapter):
         )
 
     def busy(self) -> bool | None:
-        procs = _try(self._nv.nvmlDeviceGetComputeRunningProcesses, self._h)
+        procs = self._q("nvmlDeviceGetComputeRunningProcesses", self._h)
         return None if procs is None else len(procs) > 0

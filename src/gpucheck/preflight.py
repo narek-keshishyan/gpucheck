@@ -10,11 +10,19 @@ from dataclasses import dataclass, field, fields
 from typing import Literal
 
 from .adapter import TelemetryAdapter, TelemetrySample
+from .specs import lookup
 
 Mode = Literal["full", "measurements_only", "refuse"]
 
 # TelemetrySample fields that are None by design at preflight, not missing hardware.
 _EXPECTED_NONE = frozenset({"achieved_tflops"})
+
+# "Active at idle" heuristic: a process list hidden by a container can make busy()
+# report False/None while something else is running. Flag (never refuse) when the
+# idle sample draws over half the power limit with SM clocks near boost.
+ACTIVE_POWER_FRACTION = 0.5
+ACTIVE_CLOCK_FRACTION = 0.9
+ACTIVE_REASON = "GPU appears active at idle"
 
 
 @dataclass(frozen=True)
@@ -53,12 +61,19 @@ def run_preflight(adapter: TelemetryAdapter) -> Preflight:
     if busy is None:
         reasons.append("busy-state unknown")
 
-    sample = adapter.sample()
+    try:
+        sample: TelemetrySample | None = adapter.sample()
+    except Exception:  # an unreadable sample is missing telemetry, not a crash
+        sample = None
     missing = [
         f.name
         for f in fields(TelemetrySample)
-        if getattr(sample, f.name) is None and f.name not in _EXPECTED_NONE
+        if f.name not in _EXPECTED_NONE and (sample is None or getattr(sample, f.name) is None)
     ]
+
+    # Rule 4: best-effort "something is already running" check (adds a reason only).
+    if busy is not True and sample is not None and _looks_active(sample, inv):
+        reasons.append(ACTIVE_REASON)
 
     if refuse:
         mode: Mode = "refuse"
@@ -67,3 +82,14 @@ def run_preflight(adapter: TelemetryAdapter) -> Preflight:
     else:
         mode = "full"
     return Preflight(mode=mode, reasons=reasons, missing_telemetry=missing)
+
+
+def _looks_active(sample: TelemetrySample, inv) -> bool:
+    if sample.power_w is None or not inv.power_limit_w:
+        return False
+    if sample.power_w <= ACTIVE_POWER_FRACTION * inv.power_limit_w:
+        return False
+    spec = lookup(inv.model_name)
+    if spec is None or sample.sm_clock_mhz is None:
+        return spec is None  # no clock reference: high power alone is the signal
+    return sample.sm_clock_mhz >= ACTIVE_CLOCK_FRACTION * spec.boost_clock_mhz

@@ -221,3 +221,23 @@ def test_ecc_gap_only_when_all_readings_none():
 def test_no_duplicate_gap_entries():
     m = derive(make_run([s(0)], load_series(3, start=1)), SPEC)
     assert len(m.telemetry_gaps) == len(set(m.telemetry_gaps))
+
+
+def _unknown(t, **kw):
+    from dataclasses import replace
+
+    return replace(s(t, **kw), throttle_reasons=None)
+
+
+def test_unknown_throttle_reasons_are_a_gap_not_empty():
+    load = [_unknown(60 + i, temp=70.0, tflops=10.0) for i in range(5)]
+    m = derive(make_run([s(0, temp=40.0)], load), SPEC)
+    assert "throttle_reasons" in m.telemetry_gaps
+    assert m.time_to_throttle_s is None and m.throttle_reasons_seen == []
+
+
+def test_partially_unknown_throttle_reasons_use_known_samples():
+    load = [_unknown(60, temp=70.0), s(61, temp=71.0, reasons=["thermal"])]
+    m = derive(make_run([s(0, temp=40.0)], load), SPEC)
+    assert "throttle_reasons" not in m.telemetry_gaps
+    assert m.time_to_throttle_s == 1.0 and m.throttle_reasons_seen == ["thermal"]

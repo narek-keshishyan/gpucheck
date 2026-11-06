@@ -103,9 +103,22 @@ def test_thermal_needs_three_consecutive():
     assert run(ScriptedAdapter(fn)).aborted is None
 
 
-def test_no_watchdog_without_spec():
+def test_unknown_gpu_thermal_falls_back_to_95c():
     r = run(ScriptedAdapter(lambda i, b: replace(b.sample(), temp_c=120.0)), spec=None)
+    assert r.aborted == "thermal" and len(r.load) == 3
+
+
+def test_unknown_gpu_below_95c_does_not_abort():
+    r = run(ScriptedAdapter(lambda i, b: replace(b.sample(), temp_c=94.9)), spec=None)
     assert r.aborted is None and len(r.load) == 10
+
+
+def test_unknown_gpu_ecc_abort_still_runs():
+    def fn(i, base):
+        return replace(base.sample(), ecc_volatile=0 if i < 9 else 500)
+
+    r = run(ScriptedAdapter(fn), spec=None)
+    assert r.aborted == "ecc"
 
 
 def test_watchdog_aborts_on_ecc_growth():
@@ -128,7 +141,7 @@ def test_sampling_survives_adapter_exceptions():
     assert r.aborted is None and len(r.load) == 10
     bad = [s for s in r.baseline + r.load if s.temp_c is None]
     assert len(bad) == 2
-    assert bad[0].power_w is None and bad[0].throttle_reasons == frozenset()
+    assert bad[0].power_w is None and bad[0].throttle_reasons is None  # unknown, not empty
     assert bad[0].ecc_volatile is None and bad[0].achieved_tflops is None
 
 

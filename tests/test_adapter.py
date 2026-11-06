@@ -57,3 +57,30 @@ def test_uuid_hash_formula_and_unknown_profile():
     )
     with pytest.raises(ValueError):
         make_fake("nope")
+
+
+def test_healthy_idles_cool_then_heats_under_load():
+    a = make_fake("healthy")
+    samples = [a.sample() for _ in range(200)]
+    idle = samples[1:61]
+    assert all(s.temp_c < 37 for s in idle)
+    assert all(s.power_w < 0.5 * 700 for s in idle)
+    assert samples[-1].temp_c > 60
+    assert samples[-1].achieved_tflops == pytest.approx(950.0)
+
+
+def test_healthy_quick_and_standard_runs_have_no_findings(tmp_path):
+    import json
+
+    from gpucheck.cli import main
+
+    for flags in (["--quick"], []):
+        out = tmp_path / "r.json"
+        assert main(["--fake", "healthy", "--offline", *flags, "--json", str(out)]) == 0
+        r = json.loads(out.read_text())
+        assert r["findings"] == [], (flags, r["findings"])
+        assert r["preflight"]["reasons"] == []
+
+
+def test_hot_env_keeps_55c():
+    assert make_fake("hot_env").sample().temp_c == pytest.approx(55.0, abs=1)

@@ -71,7 +71,13 @@ def render_report(result: dict) -> str:
     out.append("------------")
     out += [f"  {label + ':':<30}{_fmt(met.get(key), unit)}" for key, label, unit in _MEASUREMENTS]
     seen = met.get("throttle_reasons_seen") or []
-    out.append(f"  {'Throttle reasons seen:':<30}{', '.join(seen) if seen else 'none'}")
+    if seen:
+        seen_text = ", ".join(seen)
+    elif "throttle_reasons" in (met.get("telemetry_gaps") or []):
+        seen_text = "unknown"
+    else:
+        seen_text = "none"
+    out.append(f"  {'Throttle reasons seen:':<30}{seen_text}")
     out.append("")
 
     out.append("Findings")

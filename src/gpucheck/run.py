@@ -19,6 +19,7 @@ from .preflight import Preflight, run_preflight
 from .specs import GpuSpec
 
 THERMAL_MARGIN_C = 5.0
+UNKNOWN_GPU_THERMAL_LIMIT_C = 95.0  # abort limit when the model is not in the spec table
 THERMAL_CONSECUTIVE = 3
 ECC_JUMP = 100
 MAX_CONSECUTIVE_SAMPLE_ERRORS = 10
@@ -62,13 +63,11 @@ class RawRun:
 
 class _Watchdog:
     def __init__(self, spec: GpuSpec | None) -> None:
-        self._limit = spec.max_temp_c + THERMAL_MARGIN_C if spec is not None else None
+        self._limit = spec.max_temp_c + THERMAL_MARGIN_C if spec is not None else UNKNOWN_GPU_THERMAL_LIMIT_C
         self._hot = 0
         self._last_ecc: int | None = None
 
     def check(self, s: TelemetrySample) -> str | None:
-        if self._limit is None:
-            return None
         if s.temp_c is not None and s.temp_c >= self._limit:
             self._hot += 1
             if self._hot >= THERMAL_CONSECUTIVE:
@@ -89,7 +88,7 @@ def _empty_sample(t_s: float) -> TelemetrySample:
         power_w=None,
         sm_clock_mhz=None,
         fan_pct=None,
-        throttle_reasons=frozenset(),
+        throttle_reasons=None,  # unknown, not "no throttling"
         ecc_volatile=None,
         achieved_tflops=None,
     )

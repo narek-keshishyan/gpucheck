@@ -77,3 +77,27 @@ def test_reasons_follow_evaluation_order():
     assert len(result.reasons) == 2
     assert "MIG" in result.reasons[0]
     assert result.reasons[1] == "busy-state unknown"
+
+
+def _active(power_w, clock):
+    base = make_fake("healthy")
+
+    class A(StubAdapter):
+        def sample(self):
+            return replace(base.sample(), power_w=power_w, sm_clock_mhz=clock)
+
+    return A(base, busy=False)
+
+
+def test_active_at_idle_adds_reason_without_mode_change():
+    result = run_preflight(_active(power_w=600.0, clock=1980.0))  # H100: 700 W limit, 1980 boost
+    assert result.mode == "full"
+    assert "GPU appears active at idle" in result.reasons
+
+
+def test_low_power_idle_is_not_active():
+    assert "GPU appears active at idle" not in run_preflight(_active(power_w=80.0, clock=1980.0)).reasons
+
+
+def test_low_clock_idle_is_not_active():
+    assert "GPU appears active at idle" not in run_preflight(_active(power_w=600.0, clock=210.0)).reasons

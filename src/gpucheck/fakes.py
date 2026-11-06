@@ -54,11 +54,17 @@ def _wobble(i: int) -> float:
     return (0.0, 0.5, 1.0, 0.5)[i % 4] - 0.5  # deterministic, in [-0.5, 0.5]
 
 
+IDLE_SAMPLES = 61  # preflight sample + the longest (60 s) baseline
+
+
 def _healthy() -> Iterator[TelemetrySample]:
     i = 0
     while True:
-        warm = min(i, 20) / 20  # ramp 40 -> 62 C over 20 s, then steady
-        yield _sample(float(i), 40.0 + 22.0 * warm + _wobble(i))
+        if i < IDLE_SAMPLES:  # cool, low-power idle through preflight and baseline
+            yield _sample(float(i), 35.0 + _wobble(i), power_w=80.0, sm_clock_mhz=210.0)
+        else:
+            warm = min(i - IDLE_SAMPLES, 20) / 20  # ramp 35 -> 62 C over 20 s, then steady
+            yield _sample(float(i), 35.0 + 27.0 * warm + _wobble(i))
         i += 1
 
 

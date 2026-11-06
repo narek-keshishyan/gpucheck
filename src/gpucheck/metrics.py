@@ -63,7 +63,11 @@ def derive(run: RawRun, spec: GpuSpec | None) -> Metrics:
         gap("temp_c")
 
     time_to_throttle: float | None = None
-    for s in load:
+    known_reasons = [s for s in load if s.throttle_reasons is not None]
+    if not known_reasons:
+        gap("throttle_reasons")  # unknown throttle state is a gap, never "no throttling"
+    for s in known_reasons:
+        assert s.throttle_reasons is not None
         if THERMAL_REASON in s.throttle_reasons:
             time_to_throttle = s.t_s - load[0].t_s
             break
@@ -96,7 +100,7 @@ def derive(run: RawRun, spec: GpuSpec | None) -> Metrics:
     if load_ecc and len(all_ecc) >= 2:
         ecc_delta = load_ecc[-1] - all_ecc[0]
 
-    reasons_seen = sorted({r for s in load for r in s.throttle_reasons})
+    reasons_seen = sorted({r for s in known_reasons for r in (s.throttle_reasons or ())})
 
     return Metrics(
         idle_temp_c=idle_temp,
