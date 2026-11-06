@@ -61,6 +61,11 @@ def test_lookup_a100_sxm(name):
     assert s.tdp_w == 400.0
 
 
+@pytest.mark.parametrize("name", ["NVIDIA H100 NVL", "nvidia h100nvl"])
+def test_lookup_h100_nvl_is_none(name):
+    assert lookup(name) is None
+
+
 def test_lookup_a100_without_80gb_is_none():
     assert lookup("NVIDIA A100 40GB") is None
 

@@ -43,6 +43,8 @@ def lookup(model_name: str) -> GpuSpec | None:
     """
     s = "".join(model_name.lower().split())
     if "h100" in s:
+        if "nvl" in s:  # H100 NVL is not in the v1 table; never silently match SXM
+            return None
         return _SPECS["h100-pcie"] if "pcie" in s else _SPECS["h100-sxm"]
     if "a100" in s:
         if "pcie" in s:
