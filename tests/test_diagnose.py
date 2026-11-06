@@ -297,3 +297,49 @@ def test_findings_are_frozen_dataclass_instances():
     out = diagnose(healthy(ecc_delta=1), PF, inv(), SPEC)
     assert isinstance(out[0], Finding)
     assert isinstance(out[0].message, str) and out[0].message.endswith(".")
+
+
+# --- THERMAL_THROTTLING (warn, medium) --------------------------------------
+
+
+def test_thermal_throttling_late_throttle_with_cool_idle():
+    m = tim_metrics(time_to_throttle_s=360.0, idle_temp_c=40.0)
+    out = diagnose(m, PF, inv(), SPEC)
+    assert "TIM_DEGRADATION" not in codes(out)
+    f = find(out, "THERMAL_THROTTLING")
+    assert (f.severity, f.confidence) == ("warn", "medium")
+
+
+def test_thermal_throttling_not_when_tim_fires():
+    out = diagnose(tim_metrics(), PF, inv(), SPEC)
+    assert "TIM_DEGRADATION" in codes(out) and "THERMAL_THROTTLING" not in codes(out)
+
+
+def test_thermal_throttling_not_when_insufficient_evidence_fires():
+    out = diagnose(tim_metrics(idle_temp_c=48.0), PF, inv(), SPEC)
+    assert "INSUFFICIENT_EVIDENCE" in codes(out) and "THERMAL_THROTTLING" not in codes(out)
+
+
+def test_thermal_throttling_ordered_after_hot_environment():
+    m = tim_metrics(time_to_throttle_s=360.0, idle_temp_c=40.0)
+    out = diagnose(m, PF, inv(remapped=1), SPEC)
+    assert codes(out).index("THERMAL_THROTTLING") > codes(out).index("MEMORY_WEAR")
+
+
+def test_thermal_throttling_without_spec():
+    m = tim_metrics(idle_temp_c=40.0)
+    assert "THERMAL_THROTTLING" in codes(diagnose(m, PF, inv(), None))
+
+
+def test_no_thermal_throttling_on_healthy():
+    assert "THERMAL_THROTTLING" not in codes(diagnose(healthy(), PF, inv(), SPEC))
+
+
+# --- unknown throttle data ---------------------------------------------------
+
+
+def test_underperforming_with_unknown_throttle_data_does_not_claim_no_throttling():
+    m = healthy(tflops_ratio_vs_spec=0.5, telemetry_gaps=["throttle_reasons"])
+    f = find(diagnose(m, PF, inv(), SPEC), "UNDERPERFORMING_UNKNOWN")
+    assert "no throttling seen" not in f.message
+    assert "unavailable" in f.message

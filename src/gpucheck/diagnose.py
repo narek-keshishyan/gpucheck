@@ -1,8 +1,9 @@
 """Diagnosis rule table: turn derived metrics into plain-language findings.
 
 Rules are evaluated in a fixed order (MEMORY_WEAR, TIM_DEGRADATION,
-HOT_ENVIRONMENT, POWER_CAPPED, UNDERPERFORMING_UNKNOWN, INSUFFICIENT_EVIDENCE)
-and each rule fires at most once. A rule whose required inputs are None does
+HOT_ENVIRONMENT, THERMAL_THROTTLING, POWER_CAPPED, UNDERPERFORMING_UNKNOWN,
+INSUFFICIENT_EVIDENCE) and each rule fires at most once. Unknown throttle data
+("throttle_reasons" in telemetry_gaps) is treated as unknown, never as "none". A rule whose required inputs are None does
 not fire. Rules that compare against the datasheet need `spec`; they are
 skipped when it is None.
 """
@@ -52,6 +53,8 @@ def _memory_wear(m: Metrics, inv: GpuInventory) -> Finding | None:
         parts.append(f"ECC error count rose by {m.ecc_delta} during the run")
     if inv.remapped_rows is not None and inv.remapped_rows > 0:
         parts.append(f"{inv.remapped_rows} memory row(s) were remapped")
+    if inv.row_remap_failure:
+        parts.append("memory row remapping has failed")
     if not parts:
         return None
     sentence = " and ".join(parts)
@@ -128,17 +131,35 @@ def _power_capped(m: Metrics, inv: GpuInventory, spec: GpuSpec | None) -> Findin
     return None
 
 
+def _thermal_throttling(m: Metrics) -> Finding | None:
+    """Throttling that neither TIM_DEGRADATION nor INSUFFICIENT_EVIDENCE explains."""
+    if not _throttled(m):
+        return None
+    when = f" after {_g(m.time_to_throttle_s)} s of load" if m.time_to_throttle_s is not None else ""
+    return Finding(
+        "THERMAL_THROTTLING",
+        "warn",
+        "medium",
+        f"The card thermal-throttled{when} even though it idled cool, so sustained "
+        "clocks were limited by heat; check airflow and cooler.",
+    )
+
+
 def _underperforming(m: Metrics, spec: GpuSpec | None) -> Finding | None:
     if spec is None or m.tflops_ratio_vs_spec is None or m.throttle_reasons_seen:
         return None
     if m.tflops_ratio_vs_spec >= UNDERPERFORMING_RATIO:
         return None
+    if "throttle_reasons" in m.telemetry_gaps:
+        context = "and throttle-reason data was unavailable"
+    else:
+        context = "with no throttling seen"
     return Finding(
         "UNDERPERFORMING_UNKNOWN",
         "warn",
         "low",
-        f"Sustained throughput was {m.tflops_ratio_vs_spec:.1%} of the datasheet peak with no "
-        "throttling seen, and the cause is unknown.",
+        f"Sustained throughput was {m.tflops_ratio_vs_spec:.1%} of the datasheet peak {context}, "
+        "and the cause is unknown.",
     )
 
 
@@ -167,12 +188,16 @@ def diagnose(
 ) -> list[Finding]:
     """Return the findings for one card, in fixed rule order; empty means healthy."""
     del preflight  # the v1 rule table does not consult preflight
+    tim = _tim_degradation(metrics, spec)
+    insufficient = _insufficient_evidence(metrics, spec)
+    throttling = _thermal_throttling(metrics) if tim is None and insufficient is None else None
     rules = (
         _memory_wear(metrics, inventory),
-        _tim_degradation(metrics, spec),
+        tim,
         _hot_environment(metrics),
+        throttling,
         _power_capped(metrics, inventory, spec),
         _underperforming(metrics, spec),
-        _insufficient_evidence(metrics, spec),
+        insufficient,
     )
     return [f for f in rules if f is not None]
