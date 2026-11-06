@@ -107,3 +107,7 @@ def test_run_id_stable_across_key_order():
     assert run_id(a) == run_id(b)
     assert len(run_id(a)) == 16
     assert run_id(a) != run_id({"a": 2})
+
+
+def test_negative_zero_canonicalized():
+    assert canonical_dumps({"a": -0.00001}) == canonical_dumps({"a": 0.0})
