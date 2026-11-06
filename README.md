@@ -23,7 +23,7 @@ gpucheck --long          # 60 s baseline, 30 min load
 gpucheck --offline       # never contacts a server
 gpucheck --dry-run       # print exactly what would be uploaded, upload nothing
 gpucheck --yes-upload    # upload without the prompt
-gpucheck --server URL    # upload server (http or https); no public server exists yet, so uploads need this flag
+gpucheck --server URL    # upload server (http or https); default https://gpucheck-api.fly.dev
 gpucheck --json PATH     # where to write result.json (default ./gpucheck-result.json)
 ```
 
@@ -31,7 +31,7 @@ The result is always written locally to `result.json` first. The tool only reads
 
 ### Upload flow
 
-After a run, unless you passed `--offline`, gpucheck asks whether to upload (there is no public server yet, so without `--server URL` it says so and skips the upload). If you say yes you get a result page URL, a grade such as `Grade B — delivers 94.1% of a healthy <model> (n=12, low confidence)` (or the reason there is none, for example "insufficient reference (n=X)" while too few comparable runs exist, or "measurements only" for MIG), and a delete token. Save the token: it is the only way to delete the page later.
+After a run, unless you passed `--offline`, gpucheck asks whether to upload (to `https://gpucheck-api.fly.dev` unless you pass `--server URL`). If you say yes you get a result page URL, a grade such as `Grade B — delivers 94.1% of a healthy <model> (n=12, low confidence)` (or the reason there is none, for example "insufficient reference (n=X)" while too few comparable runs exist, or "measurements only" for MIG), and a delete token. Save the token: it is the only way to delete the page later.
 
 ```
 curl -X DELETE -H "X-Delete-Token: <token>" <server>/v1/runs/<run_id>
