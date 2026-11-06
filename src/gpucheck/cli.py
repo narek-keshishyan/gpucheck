@@ -16,6 +16,7 @@ from .report import render_report
 from .resultjson import build_result, canonical_dumps
 from .run import NullLoad, RunConfig, execute_run
 from .specs import lookup
+from .upload import upload
 
 DEFAULT_SERVER = "https://gpucheck.example.invalid"  # placeholder until Task 10
 
@@ -77,6 +78,31 @@ def _execute(adapter, args):
     return spec, execute_run(adapter, _make_load(args), _config(args), spec, **kwargs)
 
 
+def _maybe_upload(result: dict, args) -> None:
+    if args.dry_run:
+        print(canonical_dumps(result))
+        return
+    if not args.yes_upload:
+        if not sys.stdin.isatty():
+            print("Not uploaded. To upload this result, re-run with --yes-upload.")
+            return
+        if input(f"Upload this result to {args.server}? [y/N] ").strip().lower() != "y":
+            return
+    out = upload(result, args.server)
+    if not out.ok:
+        print(f"warning: upload failed ({out.error}); result.json is saved locally")
+        return
+    if out.url:
+        print(f"Result page: {out.url}")
+    if out.grade:
+        print(f"Grade: {out.grade}")
+    elif out.n is not None:
+        print(f"Grade: insufficient reference (n={out.n})")
+    if out.delete_token:
+        print(f"Delete token: {out.delete_token}")
+        print("(save this token to delete the page later)")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -105,5 +131,6 @@ def main(argv: list[str] | None = None) -> int:
     Path(args.json).write_text(canonical_dumps(result))  # before any upload consideration
     print(render_report(result))
     print(f"Result written to {args.json}")
-    # Upload (--yes-upload / --dry-run / --server) is wired in Task 10; --offline skips it.
+    if not args.offline:
+        _maybe_upload(result, args)
     return EXIT_ABORTED if run.aborted else EXIT_OK
