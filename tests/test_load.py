@@ -1,4 +1,6 @@
 import argparse
+import sys
+import types
 
 import pytest
 
@@ -13,6 +15,10 @@ from gpucheck.run import NullLoad
         (8 * 1024**3, 16384),  # n<=29308 -> clamped to max
         (1 * 1024**3, 10362),
         (64 * 1024**2, 2590),
+        (41943040, 2048),  # raw exactly 2048
+        (2684354560, 16384),  # raw exactly 16384
+        (2684682250, 16384),  # raw 16385 -> clamped
+        (10_000_000, 2048),  # raw 1000 -> clamped up
         (0, 2048),
         (1024, 2048),
         (10**15, 16384),
@@ -34,7 +40,30 @@ def test_tflops_math():
     assert tflops(8192, 100, 0.8) == pytest.approx(2 * 8192**3 * 100 / 0.8 / 1e12)
 
 
-def test_load_unavailable_without_torch_cuda():
+def _stub_torch(monkeypatch, available=True, mem_info=None):
+    cuda = types.SimpleNamespace(is_available=lambda: available)
+    if mem_info is not None:
+        cuda.mem_get_info = mem_info
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+
+
+def test_load_unavailable_when_torch_missing(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", None)
+    with pytest.raises(LoadUnavailable):
+        TorchGemmLoad()
+
+
+def test_load_unavailable_when_cuda_unavailable(monkeypatch):
+    _stub_torch(monkeypatch, available=False)
+    with pytest.raises(LoadUnavailable):
+        TorchGemmLoad()
+
+
+def test_load_unavailable_when_cuda_broken(monkeypatch):
+    def boom():
+        raise RuntimeError("CUDA error")
+
+    _stub_torch(monkeypatch, mem_info=boom)
     with pytest.raises(LoadUnavailable):
         TorchGemmLoad()
 

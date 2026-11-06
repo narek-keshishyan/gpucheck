@@ -33,10 +33,13 @@ class TorchGemmLoad:
             import torch
         except ImportError as e:
             raise LoadUnavailable("torch is not installed") from e
-        if not torch.cuda.is_available():
-            raise LoadUnavailable("CUDA is not available")
+        try:
+            if not torch.cuda.is_available():
+                raise LoadUnavailable("CUDA is not available")
+            free, _total = torch.cuda.mem_get_info()
+        except RuntimeError as e:
+            raise LoadUnavailable(f"CUDA probe failed: {e}") from e
         self._torch = torch
-        free, _total = torch.cuda.mem_get_info()
         self._n = pick_gemm_size(free)
         self._a = self._b = self._c = None
 
