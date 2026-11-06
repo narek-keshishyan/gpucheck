@@ -18,8 +18,7 @@ from .run import NullLoad, RunConfig, execute_run
 from .specs import lookup
 from .upload import UploadOutcome, upload
 
-DEFAULT_SERVER = "https://gpucheck.example.invalid"  # placeholder: no public server exists yet
-NO_SERVER_MESSAGE = "Not uploaded: no public server is configured yet; pass --server URL to upload."
+DEFAULT_SERVER = "https://gpucheck-api.fly.dev"
 
 EXIT_OK, EXIT_REFUSED, EXIT_NO_GPU, EXIT_ABORTED = 0, 1, 2, 3
 
@@ -110,9 +109,6 @@ def _maybe_upload(result: dict, args) -> None:
         print(canonical_dumps(result))
         return
     server = args.server or DEFAULT_SERVER
-    if server == DEFAULT_SERVER:
-        print(NO_SERVER_MESSAGE)
-        return
     if not args.yes_upload:
         if not sys.stdin.isatty():
             print("Not uploaded. To upload this result, re-run with --yes-upload.")

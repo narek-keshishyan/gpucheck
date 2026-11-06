@@ -208,21 +208,23 @@ def test_cli_prints_formatted_grade(server, tmp_path, capsys):
     )
 
 
-# --- placeholder default server ----------------------------------------------
+# --- default server ----------------------------------------------------------
 
 
-def test_default_placeholder_server_skips_upload_with_one_line(tmp_path, capsys, monkeypatch):
-    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+def test_default_server_is_production_and_used_without_flag(tmp_path, monkeypatch):
+    from gpucheck import cli as cli_mod
 
-    def no_prompt(prompt=""):
-        raise AssertionError("must not prompt")
+    assert cli_mod.DEFAULT_SERVER == "https://gpucheck-api.fly.dev"
+    seen = {}
 
-    monkeypatch.setattr("builtins.input", no_prompt)
+    def fake_upload(result, server, timeout_s=20):
+        seen["server"] = server
+        return UploadOutcome(ok=True, url=None, grade=None, delete_token=None, error=None)
+
+    monkeypatch.setattr(cli_mod, "upload", fake_upload)
     rc, _ = _run(tmp_path, "--yes-upload")
     assert rc == 0
-    out = capsys.readouterr().out
-    assert "no public server is configured yet; pass --server URL" in out
-    assert "upload failed" not in out.lower()
+    assert seen["server"] == cli_mod.DEFAULT_SERVER
 
 
 # --- prompt interrupted -------------------------------------------------------
