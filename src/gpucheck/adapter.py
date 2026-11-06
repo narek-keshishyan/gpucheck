@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -71,7 +72,9 @@ class NvmlAdapter(TelemetryAdapter):
 
     def __init__(self, index: int = 0) -> None:
         try:
-            import pynvml
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FutureWarning)  # pynvml deprecation notice
+                import pynvml
 
             pynvml.nvmlInit()
             self._nv = pynvml
