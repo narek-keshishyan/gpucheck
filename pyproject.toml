@@ -1,0 +1,25 @@
+[project]
+name = "gpucheck"
+version = "0.1.0"
+description = "Open-source CLI that health-checks NVIDIA GPUs"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "narekkeshishyan", email = "keshishyan01@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = ["pynvml"]
+
+[project.optional-dependencies]
+load = ["torch"]
+
+[project.scripts]
+gpucheck = "gpucheck.cli:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
