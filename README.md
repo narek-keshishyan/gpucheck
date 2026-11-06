@@ -23,7 +23,7 @@ gpucheck --long          # 60 s baseline, 30 min load
 gpucheck --offline       # never contacts a server
 gpucheck --dry-run       # print exactly what would be uploaded, upload nothing
 gpucheck --yes-upload    # upload without the prompt
-gpucheck --server URL    # upload server (http or https); the built-in default is a placeholder until a public server exists
+gpucheck --server URL    # upload server (http or https); no public server exists yet, so uploads need this flag
 gpucheck --json PATH     # where to write result.json (default ./gpucheck-result.json)
 ```
 
@@ -31,7 +31,7 @@ The result is always written locally to `result.json` first. The tool only reads
 
 ### Upload flow
 
-After a run, unless you passed `--offline`, gpucheck asks whether to upload. If you say yes you get a result page URL, a grade (or "insufficient reference (n=X)" while too few comparable runs exist), and a delete token. Save the token: it is the only way to delete the page later.
+After a run, unless you passed `--offline`, gpucheck asks whether to upload (there is no public server yet, so without `--server URL` it says so and skips the upload). If you say yes you get a result page URL, a grade such as `Grade B — delivers 94.1% of a healthy <model> (n=12, low confidence)` (or the reason there is none, for example "insufficient reference (n=X)" while too few comparable runs exist, or "measurements only" for MIG), and a delete token. Save the token: it is the only way to delete the page later.
 
 ```
 curl -X DELETE -H "X-Delete-Token: <token>" <server>/v1/runs/<run_id>
@@ -41,7 +41,9 @@ curl -X DELETE -H "X-Delete-Token: <token>" <server>/v1/runs/<run_id>
 
 Nothing, unless you opt in. Uploading is off in non-interactive shells unless you pass `--yes-upload`. `--dry-run` prints the exact payload so you can read it first.
 
-The payload is the contents of `result.json`: GPU model and driver details, measurements, findings, and the time series of samples. The GPU identifier is replaced by a salted-hash UUID, so the raw serial is never sent. The run ID is derived from the content, and the server returns a delete token (stored only as a hash) that lets you remove your page.
+The payload is the contents of `result.json`: GPU model and driver details, measurements, findings, and the time series of samples. The GPU identifier is replaced by a salted-hash UUID, so the raw serial is never sent. The salt is a public constant in this source code, so anyone who already knows your GPU's UUID can recompute the hash and recognise your card.
+
+Result pages are public to anyone with the link, and the server also serves back the full uploaded JSON (every field above, including the sample time series) at `/v1/runs/<run_id>`. The run ID is derived from the content, and the server returns a delete token (stored only as a hash) that lets you remove your page.
 
 ## Exit codes
 

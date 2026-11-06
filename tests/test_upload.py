@@ -152,3 +152,91 @@ def test_offline_skips_upload_silently(server, tmp_path, capsys):
     assert rc == 0 and server["requests"] == []
     out = capsys.readouterr().out.replace(str(tmp_path), "")
     assert "upload" not in out.lower()
+
+
+# --- grade line formatting ---------------------------------------------------
+
+from gpucheck.cli import format_grade  # noqa: E402
+
+MODEL = "NVIDIA H100 80GB HBM3"
+
+
+def test_format_graded_low_confidence():
+    g = {"letter": "B", "ratio": 0.94123, "n": 12, "low_confidence": True}
+    assert format_grade(UploadOutcome(True, None, g, None, None, 12), MODEL) == (
+        "Grade B — delivers 94.1% of a healthy NVIDIA H100 80GB HBM3 (n=12, low confidence)"
+    )
+
+
+def test_format_graded_confident():
+    g = {"letter": "A", "ratio": 0.99, "n": 40, "low_confidence": False}
+    assert format_grade(UploadOutcome(True, None, g, None, None, 40), MODEL) == (
+        "Grade A — delivers 99.0% of a healthy NVIDIA H100 80GB HBM3 (n=40)"
+    )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["insufficient reference (n=3)", "measurements only", "no throughput measured", "unknown model"],
+)
+def test_format_null_grade_uses_reason_verbatim(reason):
+    o = UploadOutcome(True, None, None, None, None, 3, reason)
+    assert format_grade(o, MODEL) == f"Grade: {reason}"
+
+
+def test_format_null_grade_without_reason_falls_back_to_n():
+    assert format_grade(UploadOutcome(True, None, None, None, None, 4), MODEL) == (
+        "Grade: insufficient reference (n=4)"
+    )
+
+
+def test_format_nothing_known():
+    assert format_grade(UploadOutcome(True, None, None, None, None, None), MODEL) is None
+
+
+def test_upload_parses_reason(server):
+    server["body"] = json.dumps({**OK_BODY, "grade": None, "reason": "measurements only"}).encode()
+    assert upload(RESULT, server["url"]).reason == "measurements only"
+
+
+def test_cli_prints_formatted_grade(server, tmp_path, capsys):
+    g = {"letter": "B", "ratio": 0.941, "n": 12, "low_confidence": True}
+    server["body"] = json.dumps({**OK_BODY, "grade": g}).encode()
+    _run(tmp_path, "--yes-upload", "--server", server["url"])
+    assert "Grade B — delivers 94.1% of a healthy NVIDIA H100 80GB HBM3 (n=12, low confidence)" in (
+        capsys.readouterr().out
+    )
+
+
+# --- placeholder default server ----------------------------------------------
+
+
+def test_default_placeholder_server_skips_upload_with_one_line(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+
+    def no_prompt(prompt=""):
+        raise AssertionError("must not prompt")
+
+    monkeypatch.setattr("builtins.input", no_prompt)
+    rc, _ = _run(tmp_path, "--yes-upload")
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no public server is configured yet; pass --server URL" in out
+    assert "upload failed" not in out.lower()
+
+
+# --- prompt interrupted -------------------------------------------------------
+
+
+@pytest.mark.parametrize("exc", [EOFError, KeyboardInterrupt])
+def test_prompt_eof_or_interrupt_means_no(server, tmp_path, capsys, monkeypatch, exc):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+
+    def raise_(prompt=""):
+        raise exc
+
+    monkeypatch.setattr("builtins.input", raise_)
+    rc, out = _run(tmp_path, "--server", server["url"])
+    assert rc == 0 and server["requests"] == [] and out.exists()
+    c = capsys.readouterr()
+    assert "Traceback" not in c.out + c.err

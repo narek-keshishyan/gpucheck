@@ -16,9 +16,10 @@ from .report import render_report
 from .resultjson import build_result, canonical_dumps
 from .run import NullLoad, RunConfig, execute_run
 from .specs import lookup
-from .upload import upload
+from .upload import UploadOutcome, upload
 
-DEFAULT_SERVER = "https://gpucheck.example.invalid"  # placeholder until Task 10
+DEFAULT_SERVER = "https://gpucheck.example.invalid"  # placeholder: no public server exists yet
+NO_SERVER_MESSAGE = "Not uploaded: no public server is configured yet; pass --server URL to upload."
 
 EXIT_OK, EXIT_REFUSED, EXIT_NO_GPU, EXIT_ABORTED = 0, 1, 2, 3
 
@@ -32,7 +33,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--yes-upload", action="store_true", help="upload without prompting")
     p.add_argument("--dry-run", action="store_true", help="show what would be uploaded")
     p.add_argument("--json", metavar="PATH", default="./gpucheck-result.json", help="where to write result.json")
-    p.add_argument("--server", metavar="URL", default=DEFAULT_SERVER, help="upload server URL")
+    p.add_argument("--server", metavar="URL", default=None, help="upload server URL")
     p.add_argument("--fake", metavar="PROFILE", help=argparse.SUPPRESS)
     return p
 
@@ -78,26 +79,55 @@ def _execute(adapter, args):
     return spec, execute_run(adapter, _make_load(args), _config(args), spec, **kwargs)
 
 
+def format_grade(out: UploadOutcome, model: str | None) -> str | None:
+    """One-line grade summary from the server's response, or None if it said nothing."""
+    g = out.grade
+    if g:
+        letter = g.get("letter", "?")
+        ratio = g.get("ratio")
+        if not isinstance(ratio, (int, float)) or isinstance(ratio, bool):
+            return f"Grade {letter}"
+        n = g.get("n", out.n)
+        extra = f"n={n}" + (", low confidence" if g.get("low_confidence") else "")
+        return f"Grade {letter} — delivers {ratio * 100:.1f}% of a healthy {model or 'card of this model'} ({extra})"
+    if out.reason:
+        return f"Grade: {out.reason}"
+    if out.n is not None:
+        return f"Grade: insufficient reference (n={out.n})"
+    return None
+
+
+def _confirm(server: str) -> bool:
+    try:
+        return input(f"Upload this result to {server}? [y/N] ").strip().lower() == "y"
+    except (EOFError, KeyboardInterrupt):  # closed stdin or Ctrl-C at the prompt means "no"
+        print()
+        return False
+
+
 def _maybe_upload(result: dict, args) -> None:
     if args.dry_run:
         print(canonical_dumps(result))
+        return
+    server = args.server or DEFAULT_SERVER
+    if server == DEFAULT_SERVER:
+        print(NO_SERVER_MESSAGE)
         return
     if not args.yes_upload:
         if not sys.stdin.isatty():
             print("Not uploaded. To upload this result, re-run with --yes-upload.")
             return
-        if input(f"Upload this result to {args.server}? [y/N] ").strip().lower() != "y":
+        if not _confirm(server):
             return
-    out = upload(result, args.server)
+    out = upload(result, server)
     if not out.ok:
         print(f"warning: upload failed ({out.error}); result.json is saved locally")
         return
     if out.url:
         print(f"Result page: {out.url}")
-    if out.grade:
-        print(f"Grade: {out.grade}")
-    elif out.n is not None:
-        print(f"Grade: insufficient reference (n={out.n})")
+    line = format_grade(out, (result.get("inventory") or {}).get("model_name"))
+    if line:
+        print(line)
     if out.delete_token:
         print(f"Delete token: {out.delete_token}")
         print("(save this token to delete the page later)")

@@ -17,6 +17,7 @@ class UploadOutcome:
     delete_token: str | None
     error: str | None
     n: int | None = None
+    reason: str | None = None  # server's explanation when grade is None
 
 
 def _fail(e: BaseException) -> UploadOutcome:
@@ -44,6 +45,7 @@ def upload(result: dict, server: str, timeout_s: float = 20) -> UploadOutcome:
             body.get("delete_token"),
             None,
             body.get("n") if isinstance(body.get("n"), int) else None,
+            body.get("reason") if isinstance(body.get("reason"), str) else None,
         )
     except Exception as e:  # noqa: BLE001 - upload must never break the local run
         return _fail(e)
