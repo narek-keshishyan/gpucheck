@@ -32,7 +32,7 @@ def _normalize(obj: Any) -> Any:
         return [_normalize(v) for v in obj]
     if isinstance(obj, float):
         # round(nan/inf) returns them unchanged; json.dumps(allow_nan=False) rejects.
-        return round(obj, FLOAT_DP)
+        return round(obj, FLOAT_DP) + 0.0  # + 0.0 turns -0.0 into 0.0
     return obj
 
 
