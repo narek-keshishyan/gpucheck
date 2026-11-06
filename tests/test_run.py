@@ -1,3 +1,4 @@
+import pytest
 from dataclasses import replace
 
 from gpucheck.fakes import make_fake
@@ -149,3 +150,58 @@ def test_load_stopped_when_adapter_aborts_run():
     r = run(ScriptedAdapter(lambda i, b: (_ for _ in ()).throw(RuntimeError()) if i else b.sample()), load)
     assert r.aborted == "telemetry"
     assert load.events.count("stop") == load.events.count("start")
+
+
+class BusyAdapter(ScriptedAdapter):
+    def busy(self):
+        return True
+
+
+def test_preflight_refused_runs_nothing():
+    load = RecordingLoad()
+    r = run(BusyAdapter(lambda i, b: b.sample()), load)
+    assert r.preflight.mode == "refuse"
+    assert r.aborted == "preflight_refused"
+    assert r.baseline == [] and r.load == []
+    assert load.events == []
+
+
+def test_measurements_only_still_runs_load_phase():
+    load = RecordingLoad()
+    r = run(make_fake("mig"), load)
+    assert r.preflight.mode == "measurements_only"
+    assert r.aborted is None and len(r.baseline) == 5 and len(r.load) == 10
+    assert load.events == ["start"] + ["tick"] * 10 + ["stop"]
+
+
+class StepClock:
+    def __init__(self, step):
+        self.now = 0.0
+        self.step = step
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
+
+
+def _sleeps(step):
+    sleeps = []
+    execute_run(
+        make_fake("healthy"),
+        NullLoad(),
+        RunConfig(baseline_s=1, load_s=1, hz=2.0),
+        SPEC,
+        clock=StepClock(step),
+        sleep=sleeps.append,
+    )
+    return sleeps
+
+
+def test_pacing_sleeps_follow_schedule_at_2hz():
+    # clock reads 0.2 per call: phase start, then one read per iteration; period 0.5
+    # baseline start=0.2: 0.2+0.5-0.4=0.3, 0.2+1.0-0.6=0.6; load start=0.8: 0.3, 0.6
+    assert _sleeps(0.2) == [pytest.approx(x) for x in (0.3, 0.6, 0.3, 0.6)]
+
+
+def test_pacing_never_sleeps_negative_when_behind():
+    assert _sleeps(10.0) == [0.0, 0.0, 0.0, 0.0]
