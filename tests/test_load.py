@@ -94,3 +94,44 @@ def test_fake_quick_run_still_ok(tmp_path, capsys):
     rc = cli.main(["--fake", "healthy", "--offline", "--quick", "--json", str(tmp_path / "r.json")])
     assert rc == 0
     assert "no torch/CUDA" not in capsys.readouterr().err
+
+
+def test_init_pins_pci_bus_device_order_before_torch_import(monkeypatch):
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    _stub_torch(monkeypatch, available=False)
+    with pytest.raises(LoadUnavailable):
+        TorchGemmLoad()
+    import os
+
+    assert os.environ["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+
+
+def test_tick_synchronizes_after_every_matmul(monkeypatch):
+    events = []
+    cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        mem_get_info=lambda: (1024**3, 1024**3),
+        synchronize=lambda: events.append("sync"),
+        empty_cache=lambda: None,
+    )
+    fake = types.SimpleNamespace(
+        cuda=cuda,
+        bfloat16="bf16",
+        randn=lambda *a, **k: object(),
+        empty=lambda *a, **k: object(),
+        matmul=lambda *a, **k: events.append("mm"),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    import gpucheck.load as load_mod
+
+    ticks = iter([0.0, 0.1, 0.2, 0.3, 0.9, 1.0])
+    monkeypatch.setattr(load_mod, "time", types.SimpleNamespace(perf_counter=lambda: next(ticks)))
+    g = TorchGemmLoad()
+    g.start()
+    events.clear()
+    assert g.tick() is not None
+    # one sync before timing, then every matmul is followed by its own sync
+    assert events[0] == "sync"
+    body = events[1:]
+    assert body.count("mm") == 3
+    assert all(body[i + 1] == "sync" for i, e in enumerate(body) if e == "mm")

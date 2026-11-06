@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 
 MIN_N = 2048
@@ -29,6 +30,10 @@ def tflops(n: int, iters: int, elapsed_s: float) -> float:
 
 class TorchGemmLoad:
     def __init__(self) -> None:
+        # Make torch's cuda:0 the same physical card NVML index 0 reads; CUDA's
+        # default "fastest first" order can differ from NVML's PCI bus order.
+        # Must be set before torch initialises CUDA, so before the import.
+        os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         try:
             import torch
         except ImportError as e:
@@ -59,6 +64,10 @@ class TorchGemmLoad:
         t0 = time.perf_counter()
         while time.perf_counter() - t0 < TICK_S:
             t.matmul(self._a, self._b, out=self._c)
+            # Wait for each kernel: matmul only enqueues, so without this the loop
+            # would queue thousands of kernels in 0.8 s and the tick (and the
+            # watchdog sampling between ticks) would stall for minutes.
+            t.cuda.synchronize()
             iters += 1
         t.cuda.synchronize()
         elapsed = time.perf_counter() - t0
