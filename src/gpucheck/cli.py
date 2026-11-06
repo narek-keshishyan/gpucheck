@@ -72,12 +72,16 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         adapter = _make_adapter(args)
-        spec, run = _execute(adapter, args)
     except AdapterUnavailable as e:
         print(f"gpucheck: no NVIDIA GPU or driver available ({e}).", file=sys.stderr)
         return EXIT_NO_GPU
-    except ValueError as e:  # bad --fake profile
+    except ValueError as e:  # only _make_adapter resolves --fake, so this is a bad profile name
         print(f"gpucheck: {e}", file=sys.stderr)
+        return EXIT_NO_GPU
+    try:
+        spec, run = _execute(adapter, args)
+    except AdapterUnavailable as e:
+        print(f"gpucheck: no NVIDIA GPU or driver available ({e}).", file=sys.stderr)
         return EXIT_NO_GPU
 
     if run.aborted == "preflight_refused":

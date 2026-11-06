@@ -92,3 +92,21 @@ def test_quick_and_long_durations(tmp_path):
     assert (d["baseline_s"], d["load_s"]) == (60, 600)
     lg = cfg("--long")
     assert (lg["baseline_s"], lg["load_s"]) == (60, 1800)
+
+
+def test_bad_fake_profile_is_friendly(capsys):
+    assert main(["--fake", "nope", "--offline"]) == 2
+    c = capsys.readouterr()
+    assert "Traceback" not in c.out + c.err
+    assert len((c.out + c.err).strip().splitlines()) == 1
+
+
+def test_unrelated_value_error_propagates(monkeypatch):
+    import pytest
+
+    def boom(*a, **k):
+        raise ValueError("real bug")
+
+    monkeypatch.setattr(cli, "execute_run", boom)
+    with pytest.raises(ValueError):
+        main(["--fake", "healthy", "--offline", "--quick"])
