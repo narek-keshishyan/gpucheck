@@ -52,7 +52,7 @@ Result pages are public to anyone with the link, and the server also serves back
 
 What you need:
 
-- A server that has certification turned on. The default server is `https://gpucheck-api.fly.dev`; pass `--server URL` for another one. If the server has it turned off, gpucheck stops with a message and exits with code 1 before the run starts.
+- A server that has certification turned on. The default server is `https://gpucheck-api.fly.dev`; pass `--server URL` for another one. If the challenge cannot be fetched (the server has certification turned off, or cannot be reached), gpucheck stops before the run with a message and exit code 1.
 - Working PyTorch with CUDA. Without it, `--certify` stops with exit code 1 instead of falling back to a run with no load.
 - The normal upload prompt still applies. A certificate can only be made from an uploaded result, so answer yes, or pass `--yes-upload` in a script.
 
