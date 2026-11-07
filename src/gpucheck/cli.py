@@ -29,7 +29,7 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--quick", action="store_true", help="shorter run (30s baseline, 150s load)")
     g.add_argument("--long", action="store_true", help="longer run (60s baseline, 1800s load)")
     p.add_argument("--offline", action="store_true", help="never upload; report locally only")
-    p.add_argument("--certify", action="store_true", help="request a server challenge and run its prescribed workload (requires upload)")
+    p.add_argument("--certify", action="store_true", help="request a server challenge and run its prescribed workload (requires a server; excludes --offline/--dry-run)")
     p.add_argument("--yes-upload", action="store_true", help="upload without prompting")
     p.add_argument("--dry-run", action="store_true", help="show what would be uploaded")
     p.add_argument("--json", metavar="PATH", default="./gpucheck-result.json", help="where to write result.json")
@@ -43,6 +43,8 @@ def _parse(argv):
     args = p.parse_args(argv)
     if args.certify and args.offline:
         p.error("--certify cannot be combined with --offline")
+    if args.certify and args.dry_run:
+        p.error("--certify cannot be combined with --dry-run")
     return args
 
 

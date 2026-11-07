@@ -162,3 +162,111 @@ def test_certify_real_adapter_without_torch_exits_1(server, monkeypatch, tmp_pat
     assert rc == 1
     assert len(err.strip().splitlines()) == 1
     assert "load generator" in err
+
+
+def test_v1_build_result_frozen_run_id():
+    """Anchor captured at base commit 8cca976 (fake healthy, quick, virtual clock)."""
+    import hashlib
+    from gpucheck.diagnose import diagnose
+    from gpucheck.metrics import derive
+    from gpucheck.resultjson import build_result, canonical_dumps, run_id
+    from gpucheck.run import NullLoad, RunConfig, execute_run
+    from gpucheck.specs import lookup
+
+    a = make_fake("healthy")
+    spec = lookup(a.inventory().model_name)
+    t = [0.0]
+    run = execute_run(a, NullLoad(), RunConfig(30, 150, 1.0), spec,
+                      clock=lambda: t[0], sleep=lambda s: t.__setitem__(0, t[0] + s))
+    m = derive(run, spec)
+    r = build_result(run, m, diagnose(m, run.preflight, run.inventory, spec))
+    assert run_id(r) == "51e81faff8547d20"
+    assert hashlib.sha256(canonical_dumps(r).encode()).hexdigest() == (
+        "51e81faff8547d20ee93a49cc6bb2a66102202ced25cfded6f16a377625d0222"
+    )
+
+
+def test_certify_dry_run_is_argparse_error():
+    with pytest.raises(SystemExit) as ei:
+        main(["--fake", "healthy", "--certify", "--dry-run"])
+    assert ei.value.code == 2
+
+
+@pytest.mark.parametrize("offs,seed", [
+    ([0, "8", 16, 24], 1),
+    ([0, True, 16, 24], 1),
+    ([0, 8, 16, 24.0], 1),
+    ([0, 8, 16, 24], True),
+    ([0, 8, 16, 24], "5"),
+])
+def test_fetch_challenge_rejects_bad_types(server, offs, seed):
+    server["challenge"] = {**CHALLENGE, "workload": {"gemm_n_offsets": offs, "order_seed": seed}}
+    with pytest.raises(ChallengeUnavailable):
+        fetch_challenge(server["url"])
+
+
+def _stub_torch_calls(monkeypatch):
+    import sys, types
+    calls = []
+
+    class T:
+        def __init__(self, shape):
+            self.shape = shape
+
+        def __getitem__(self, sl):
+            return T((sl.stop,))
+
+        def view(self, n, m):
+            return T((n, m))
+
+    cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        mem_get_info=lambda: (1024**3, 1024**3),
+        synchronize=lambda: None,
+        empty_cache=lambda: None,
+    )
+    fake = types.SimpleNamespace(
+        cuda=cuda, bfloat16="bf16",
+        randn=lambda *a, **k: T(a),
+        empty=lambda *a, **k: T(a),
+        matmul=lambda a, b, out=None: calls.append(a.shape),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    import gpucheck.load as load_mod
+    clock = [0.0]
+
+    def pc():  # each call advances 0.5 s -> exactly one matmul per tick
+        clock[0] += 0.5
+        return clock[0]
+
+    monkeypatch.setattr(load_mod, "time", types.SimpleNamespace(perf_counter=pc))
+    return calls
+
+
+def test_torchgemmload_workload_cycles_and_resolves(monkeypatch):
+    from gpucheck.load import TorchGemmLoad
+    calls = _stub_torch_calls(monkeypatch)
+    base = pick_gemm_size(1024**3)
+    g = TorchGemmLoad({"gemm_n_offsets": [-64, 0, 16, 128], "order_seed": 9})
+    g.start()
+    expect = [base - 64, base, base + 16, base + 128]
+    assert g.resolved_workload == {"gemm_n": expect, "order_seed": 9}
+    calls.clear()
+    for _ in range(5):
+        assert g.tick() is not None
+    ns = [c[0] for c in calls]
+    assert ns == (expect * 2)[:5]
+    assert all(c == (c[0], c[0]) for c in calls)
+
+
+def test_torchgemmload_no_workload_unchanged(monkeypatch):
+    from gpucheck.load import TorchGemmLoad
+    calls = _stub_torch_calls(monkeypatch)
+    g = TorchGemmLoad()
+    assert g.resolved_workload is None
+    g.start()
+    calls.clear()
+    for _ in range(3):
+        g.tick()
+    n = pick_gemm_size(1024**3)
+    assert calls == [(n, n)] * 3

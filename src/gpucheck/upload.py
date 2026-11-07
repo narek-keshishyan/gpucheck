@@ -47,7 +47,13 @@ def fetch_challenge(server: str, timeout_s: float = 20) -> dict:
             if not isinstance(body.get(k), str):
                 raise ValueError(f"challenge missing {k}")
         w = body["workload"]
-        if not isinstance(w.get("gemm_n_offsets"), list) or not w["gemm_n_offsets"] or not isinstance(w.get("order_seed"), int):
+        offs = w.get("gemm_n_offsets")
+        if (
+            not isinstance(offs, list)
+            or not offs
+            or not all(type(o) is int for o in offs)  # type() rejects bools
+            or type(w.get("order_seed")) is not int
+        ):
             raise ValueError("challenge workload malformed")
         return body
     except urllib.error.HTTPError as e:
