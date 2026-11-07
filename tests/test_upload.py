@@ -56,6 +56,15 @@ def _dead_url():
 RESULT = {"schema_version": "1", "x": 1.5}
 
 
+def test_upload_parses_certify_fields(server):
+    server["body"] = json.dumps({**OK_BODY, "certifiable": False, "certify_note": "bad nonce"}).encode()
+    o = upload(RESULT, server["url"])
+    assert o.certifiable is False and o.certify_note == "bad nonce"
+    server["body"] = json.dumps({**OK_BODY, "certifiable": "yes", "certify_note": 5}).encode()
+    o = upload(RESULT, server["url"])
+    assert o.certifiable is None and o.certify_note is None
+
+
 def test_upload_happy_path(server):
     o = upload(RESULT, server["url"])
     assert o == UploadOutcome(True, OK_BODY["url"], OK_BODY["grade"], "tok123", None, 12)

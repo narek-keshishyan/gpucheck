@@ -25,7 +25,7 @@ gpucheck --dry-run       # print exactly what would be uploaded, upload nothing
 gpucheck --yes-upload    # upload without the prompt
 gpucheck --server URL    # upload server (http or https); default https://gpucheck-api.fly.dev
 gpucheck --json PATH     # where to write result.json (default ./gpucheck-result.json)
-gpucheck --certify       # run the server-prescribed workload so the result can earn a certificate
+gpucheck --certify       # use a one-time server challenge so the result can earn a certificate
 ```
 
 The result is always written locally to `result.json` first. The tool only reads from the GPU; it does not change any settings. Ctrl-C stops a run at any time; an interrupted run writes no result.json and uploads nothing.
@@ -56,17 +56,19 @@ What you need:
 - Working PyTorch with CUDA. Without it, `--certify` stops with exit code 1 instead of falling back to a run with no load.
 - The normal upload prompt still applies. A certificate can only be made from an uploaded result, so answer yes, or pass `--yes-upload` in a script.
 
-`--certify` cannot be combined with `--offline` or `--dry-run`; the argument parser rejects the combination at startup.
+`--certify` cannot be combined with `--offline`, `--dry-run`, or `--quick`; the argument parser rejects the combination at startup. Certificates need a full-length run (at least 600 s of load), so a quick run could never earn one.
+
+If the challenge expires before the run finishes (challenges are valid for 2 hours), gpucheck prints one warning, `challenge expired before upload; run again to certify — result saved locally`, does not upload, and exits normally. The result is still written to the `--json` path.
 
 Fake mode: `--fake` with `--certify` runs mechanically, but a real server rejects it with "upload arrived too soon after challenge", because the simulated run finishes instantly. This is intended: fakes cannot earn certificates.
 
-If the server refuses to certify a run, the upload still succeeds and the result is still stored; the run simply gets no purchase button. The reason is recorded in the server's upload response (`certify_note`), but the result page and the terminal do not show it yet.
+After a `--certify` upload, gpucheck prints the server's verdict: `Certifiable: yes`, or `Not certifiable: <reason>` with the reason the server gave (`certify_note`). If the server refuses to certify a run, the upload still succeeds and the result is still stored; the run simply gets no purchase button. A certifiable run also needs a grade, a complete (not aborted, not quarantined) load phase, and a card identity before the result page offers a certificate.
 
 ### What a certificate proves
 
 A certificate raises the cost of lying about a GPU. It is not proof of anything on its own.
 
-- The run used a challenge the server issued, executed the workload the server prescribed, and was uploaded only after it should have taken to finish.
+- The run used a fresh one-time server challenge and could not be uploaded before the full run time had passed. The uploaded result echoes the challenge's workload parameters, but the server cannot see whether that workload actually ran.
 - The signed payload binds that certificate to one stored result (by its SHA-256), one card (its salted-hash identifier, the same one in the uploaded result), one grade, and one run.
 - Certificates issued while the server is in payment test mode carry a TEST banner and `livemode: false` in the signed payload. They are not real purchases.
 
@@ -77,7 +79,7 @@ A certificate raises the cost of lying about a GPU. It is not proof of anything 
 - It does not stop re-running. A card owner can keep running until a run looks good and then buy a certificate for that one. When a newer certificate is issued for the same card, the older one is marked as superseded, which makes this visible, but it is not prevented.
 - Revocation is not part of the signature. A revoked certificate still verifies offline; only the live verify endpoint knows about revocation.
 
-Verifying a certificate offline needs the certificate payload, its signature, and the public key from `/v1/pubkey`. The exact steps and a one-line Python check are in the server's README.
+Verifying a certificate offline needs the certificate payload, its signature, and the public key from `/v1/pubkey`. The exact steps and a one-line Python check are on the server's `/verify` page and in the server's README.
 
 ## Exit codes
 

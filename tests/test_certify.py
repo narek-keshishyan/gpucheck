@@ -14,13 +14,15 @@ CHALLENGE = {
     "challenge_id": "ch1",
     "nonce": "n0nce",
     "workload": {"gemm_n_offsets": [-64, 0, 16, 128], "order_seed": 77},
-    "expires_at": "2026-11-07T00:00:00Z",
+    "expires_at": "2999-01-01T00:00:00+00:00",
 }
 
 
 @pytest.fixture
 def server():
-    state = {"status": 200, "challenge": CHALLENGE, "requests": []}
+    state = {"status": 200, "challenge": CHALLENGE, "requests": [],
+             "upload": {"url": "https://x.test/r/1", "grade": {"letter": "A"}, "n": 3,
+                        "certifiable": True, "certify_note": None}}
 
     class H(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -30,7 +32,7 @@ def server():
             if self.path == "/v1/challenges":
                 status, out = state["status"], state["challenge"]
             else:
-                status, out = 200, {"url": "https://x.test/r/1", "grade": {"letter": "A"}, "n": 3}
+                status, out = 200, state["upload"]
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -121,9 +123,10 @@ def test_build_result_without_challenge_is_v1_identical():
 
 
 def test_certify_fake_posts_challenge_and_workload(server, tmp_path, capsys):
-    rc = main(["--fake", "healthy", "--quick", "--certify", "--yes-upload",
+    rc = main(["--fake", "healthy", "--certify", "--yes-upload",
                "--server", server["url"], "--json", str(tmp_path / "r.json")])
     assert rc == 0
+    assert "Certifiable: yes" in capsys.readouterr().out
     posts = [b for p, b in server["requests"] if p == "/v1/runs"]
     assert len(posts) == 1
     body = json.loads(posts[0])
@@ -270,3 +273,67 @@ def test_torchgemmload_no_workload_unchanged(monkeypatch):
         g.tick()
     n = pick_gemm_size(1024**3)
     assert calls == [(n, n)] * 3
+
+
+def test_certify_quick_is_argparse_error(capsys):
+    with pytest.raises(SystemExit) as ei:
+        main(["--fake", "healthy", "--certify", "--quick"])
+    assert ei.value.code == 2
+    assert "--quick" in capsys.readouterr().err
+
+
+def test_certify_prints_not_certifiable_note(server, tmp_path, capsys):
+    server["upload"] = {**server["upload"], "certifiable": False,
+                        "certify_note": "upload arrived too soon after challenge"}
+    rc = main(["--fake", "healthy", "--certify", "--yes-upload",
+               "--server", server["url"], "--json", str(tmp_path / "r.json")])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Not certifiable: upload arrived too soon after challenge" in out
+    assert "Certifiable: yes" not in out
+
+
+def test_plain_upload_prints_no_certify_line(server, tmp_path, capsys):
+    rc = main(["--fake", "healthy", "--quick", "--yes-upload",
+               "--server", server["url"], "--json", str(tmp_path / "r.json")])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ertifiable" not in out
+
+
+def test_expired_challenge_skips_upload(server, tmp_path, capsys):
+    server["challenge"] = {**CHALLENGE, "expires_at": "2000-01-01T00:00:00Z"}
+    rc = main(["--fake", "healthy", "--certify", "--yes-upload",
+               "--server", server["url"], "--json", str(tmp_path / "r.json")])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.count("challenge expired before upload; run again to certify") == 1
+    assert [p for p, _ in server["requests"] if p == "/v1/runs"] == []
+    assert (tmp_path / "r.json").exists()
+
+
+def test_short_expiry_challenge_expires_during_run(server, tmp_path, capsys, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+    server["challenge"] = {**CHALLENGE, "expires_at": (t0 + timedelta(seconds=5)).isoformat()}
+    clock = iter([t0 + timedelta(seconds=700)])  # the run outlasted the 5 s challenge
+    monkeypatch.setattr(cli, "_now", lambda: next(clock))
+    rc = main(["--fake", "healthy", "--certify", "--yes-upload",
+               "--server", server["url"], "--json", str(tmp_path / "r.json")])
+    assert rc == 0
+    assert "challenge expired before upload" in capsys.readouterr().out
+    assert [p for p, _ in server["requests"] if p == "/v1/runs"] == []
+
+
+@pytest.mark.parametrize("exp,expired", [
+    ("2026-11-07T12:00:00Z", True),
+    ("2026-11-07T12:00:00+00:00", True),
+    ("2026-11-07T14:00:01+00:00", False),
+    ("2026-11-07T12:00:00", True),  # naive treated as UTC
+    ("garbage", False),
+    (None, False),
+])
+def test_challenge_expired_parsing(exp, expired):
+    from datetime import datetime, timezone
+    now = datetime(2026, 11, 7, 14, 0, tzinfo=timezone.utc)
+    assert cli.challenge_expired({"expires_at": exp}, now) is expired

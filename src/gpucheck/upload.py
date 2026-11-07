@@ -19,6 +19,8 @@ class UploadOutcome:
     error: str | None
     n: int | None = None
     reason: str | None = None  # server's explanation when grade is None
+    certifiable: bool | None = None  # server's verdict on a --certify upload (None: not said)
+    certify_note: str | None = None  # why the server refused to certify
 
 
 def _fail(e: BaseException) -> UploadOutcome:
@@ -86,6 +88,8 @@ def upload(result: dict, server: str, timeout_s: float = 20) -> UploadOutcome:
             None,
             body.get("n") if isinstance(body.get("n"), int) else None,
             body.get("reason") if isinstance(body.get("reason"), str) else None,
+            body.get("certifiable") if isinstance(body.get("certifiable"), bool) else None,
+            body.get("certify_note") if isinstance(body.get("certify_note"), str) else None,
         )
     except Exception as e:  # noqa: BLE001 - upload must never break the local run
         return _fail(e)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .adapter import AdapterUnavailable, NvmlAdapter
@@ -29,7 +30,7 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--quick", action="store_true", help="shorter run (30s baseline, 150s load)")
     g.add_argument("--long", action="store_true", help="longer run (60s baseline, 1800s load)")
     p.add_argument("--offline", action="store_true", help="never upload; report locally only")
-    p.add_argument("--certify", action="store_true", help="request a server challenge and run its prescribed workload (requires a server; excludes --offline/--dry-run)")
+    p.add_argument("--certify", action="store_true", help="request a one-time server challenge so the result can earn a certificate (requires a server; excludes --offline/--dry-run/--quick)")
     p.add_argument("--yes-upload", action="store_true", help="upload without prompting")
     p.add_argument("--dry-run", action="store_true", help="show what would be uploaded")
     p.add_argument("--json", metavar="PATH", default="./gpucheck-result.json", help="where to write result.json")
@@ -45,7 +46,38 @@ def _parse(argv):
         p.error("--certify cannot be combined with --offline")
     if args.certify and args.dry_run:
         p.error("--certify cannot be combined with --dry-run")
+    if args.certify and args.quick:
+        p.error("--certify cannot be combined with --quick")
     return args
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def challenge_expired(challenge: dict, now: datetime | None = None) -> bool:
+    """True when the challenge's expires_at (ISO 8601) is in the past.
+
+    An unparseable or missing expiry is not treated as expired: the server decides."""
+    raw = challenge.get("expires_at")
+    if not isinstance(raw, str):
+        return False
+    try:
+        exp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return (now or _now()) > exp
+
+
+def format_certify(out: UploadOutcome) -> str | None:
+    """The server's certification verdict for a --certify upload, or None if it said nothing."""
+    if out.certifiable is True:
+        return "Certifiable: yes"
+    if out.certifiable is False:
+        return f"Not certifiable: {out.certify_note or 'no reason given'}"
+    return None
 
 
 def _make_adapter(args):
@@ -119,7 +151,7 @@ def _confirm(server: str) -> bool:
         return False
 
 
-def _maybe_upload(result: dict, args) -> None:
+def _maybe_upload(result: dict, args, challenge: dict | None = None) -> None:
     if args.dry_run:
         print(canonical_dumps(result))
         return
@@ -139,6 +171,10 @@ def _maybe_upload(result: dict, args) -> None:
     line = format_grade(out, (result.get("inventory") or {}).get("model_name"))
     if line:
         print(line)
+    if challenge is not None:
+        cline = format_certify(out)
+        if cline:
+            print(cline)
     if out.delete_token:
         print(f"Delete token: {out.delete_token}")
         print("(save this token to delete the page later)")
@@ -194,6 +230,8 @@ def main(argv: list[str] | None = None) -> int:
     Path(args.json).write_text(canonical_dumps(result))  # before any upload consideration
     print(render_report(result))
     print(f"Result written to {args.json}")
-    if not args.offline:
-        _maybe_upload(result, args)
+    if challenge is not None and challenge_expired(challenge):
+        print("warning: challenge expired before upload; run again to certify — result saved locally")
+    elif not args.offline:
+        _maybe_upload(result, args, challenge)
     return EXIT_ABORTED if run.aborted else EXIT_OK
