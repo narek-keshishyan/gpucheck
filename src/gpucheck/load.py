@@ -24,12 +24,25 @@ def pick_gemm_size(free_mem_bytes: int) -> int:
     return max(MIN_N, min(MAX_N, n))
 
 
+def apply_workload(base_n: int, offsets: list[int]) -> list[int]:
+    """Resolve prescribed gemm_n offsets against an auto-sized base N.
+
+    The base is first clamped into [MIN_N - min(offsets), MAX_N - max(offsets)]
+    so that base + offset never needs clamping: the server verifies pairwise
+    differences between the sizes, which clamping an individual value would break.
+    """
+    lo = MIN_N - min(offsets)
+    hi = MAX_N - max(offsets)
+    base = max(lo, min(hi, base_n))
+    return [base + o for o in offsets]
+
+
 def tflops(n: int, iters: int, elapsed_s: float) -> float:
     return 2 * n**3 * iters / elapsed_s / 1e12
 
 
 class TorchGemmLoad:
-    def __init__(self) -> None:
+    def __init__(self, workload: dict | None = None) -> None:
         # Make torch's cuda:0 the same physical card NVML index 0 reads; CUDA's
         # default "fastest first" order can differ from NVML's PCI bus order.
         # Must be set before torch initialises CUDA, so before the import.
@@ -46,24 +59,51 @@ class TorchGemmLoad:
             raise LoadUnavailable(f"CUDA probe failed: {e}") from e
         self._torch = torch
         self._n = pick_gemm_size(free)
+        self._ns = [self._n]
+        self._tick_i = 0
+        self.resolved_workload: dict | None = None
+        if workload is not None:
+            self._ns = apply_workload(self._n, list(workload["gemm_n_offsets"]))
+            self.resolved_workload = {
+                "gemm_n": list(self._ns),
+                "order_seed": workload["order_seed"],
+            }
         self._a = self._b = self._c = None
 
     def start(self) -> None:
         t = self._torch
-        n = self._n
-        self._a = t.randn(n, n, device="cuda", dtype=t.bfloat16)
-        self._b = t.randn(n, n, device="cuda", dtype=t.bfloat16)
-        self._c = t.empty(n, n, device="cuda", dtype=t.bfloat16)
-        t.matmul(self._a, self._b, out=self._c)  # warmup
+        # One flat buffer at the largest size; each tick views the first n*n
+        # elements as a contiguous n x n matrix (no per-size reallocation).
+        # Without a workload this is the plain single-size n x n path.
+        m = max(self._ns)
+        shape = (m * m,) if self.resolved_workload else (m, m)
+        self._a = t.randn(*shape, device="cuda", dtype=t.bfloat16)
+        self._b = t.randn(*shape, device="cuda", dtype=t.bfloat16)
+        self._c = t.empty(*shape, device="cuda", dtype=t.bfloat16)
+        a, b, c = self._views(self._ns[0])
+        t.matmul(a, b, out=c)  # warmup
         t.cuda.synchronize()
+
+    def _views(self, n: int):
+        if not self.resolved_workload:
+            return self._a, self._b, self._c
+        k = n * n
+        return (
+            self._a[:k].view(n, n),
+            self._b[:k].view(n, n),
+            self._c[:k].view(n, n),
+        )
 
     def tick(self) -> float | None:
         t = self._torch
+        n = self._ns[self._tick_i % len(self._ns)]  # cycle prescribed sizes per tick
+        self._tick_i += 1
+        a, b, c = self._views(n)
         iters = 0
         t.cuda.synchronize()
         t0 = time.perf_counter()
         while time.perf_counter() - t0 < TICK_S:
-            t.matmul(self._a, self._b, out=self._c)
+            t.matmul(a, b, out=c)
             # Wait for each kernel: matmul only enqueues, so without this the loop
             # would queue thousands of kernels in 0.8 s and the tick (and the
             # watchdog sampling between ticks) would stall for minutes.
@@ -71,7 +111,7 @@ class TorchGemmLoad:
             iters += 1
         t.cuda.synchronize()
         elapsed = time.perf_counter() - t0
-        return tflops(self._n, iters, elapsed) if iters else None
+        return tflops(n, iters, elapsed) if iters else None
 
     def stop(self) -> None:
         self._a = self._b = self._c = None

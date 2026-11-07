@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
@@ -23,6 +24,39 @@ class UploadOutcome:
 def _fail(e: BaseException) -> UploadOutcome:
     msg = " ".join(f"{type(e).__name__}: {e}".split())
     return UploadOutcome(False, None, None, None, msg)
+
+
+class ChallengeUnavailable(Exception):
+    """The server could not issue a certification challenge."""
+
+
+def fetch_challenge(server: str, timeout_s: float = 20) -> dict:
+    """POST /v1/challenges; raises ChallengeUnavailable with a one-line message."""
+    try:
+        req = urllib.request.Request(
+            f"{server.rstrip('/')}/v1/challenges",
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = json.loads(resp.read().decode())
+        if not isinstance(body, dict) or not isinstance(body.get("workload"), dict):
+            raise ValueError("unexpected challenge response shape")
+        for k in ("challenge_id", "nonce"):
+            if not isinstance(body.get(k), str):
+                raise ValueError(f"challenge missing {k}")
+        w = body["workload"]
+        if not isinstance(w.get("gemm_n_offsets"), list) or not w["gemm_n_offsets"] or not isinstance(w.get("order_seed"), int):
+            raise ValueError("challenge workload malformed")
+        return body
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise ChallengeUnavailable("server has certification disabled") from e
+        raise ChallengeUnavailable(f"challenge request failed (HTTP {e.code})") from e
+    except Exception as e:  # noqa: BLE001
+        msg = " ".join(f"{type(e).__name__}: {e}".split())
+        raise ChallengeUnavailable(f"could not fetch challenge ({msg})") from e
 
 
 def upload(result: dict, server: str, timeout_s: float = 20) -> UploadOutcome:

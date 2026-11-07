@@ -16,7 +16,7 @@ from .report import render_report
 from .resultjson import build_result, canonical_dumps
 from .run import NullLoad, RunConfig, execute_run
 from .specs import lookup
-from .upload import UploadOutcome, upload
+from .upload import ChallengeUnavailable, UploadOutcome, fetch_challenge, upload
 
 DEFAULT_SERVER = "https://gpucheck-api.fly.dev"
 
@@ -29,6 +29,7 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--quick", action="store_true", help="shorter run (30s baseline, 150s load)")
     g.add_argument("--long", action="store_true", help="longer run (60s baseline, 1800s load)")
     p.add_argument("--offline", action="store_true", help="never upload; report locally only")
+    p.add_argument("--certify", action="store_true", help="request a server challenge and run its prescribed workload (requires upload)")
     p.add_argument("--yes-upload", action="store_true", help="upload without prompting")
     p.add_argument("--dry-run", action="store_true", help="show what would be uploaded")
     p.add_argument("--json", metavar="PATH", default="./gpucheck-result.json", help="where to write result.json")
@@ -37,13 +38,24 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _parse(argv):
+    p = _parser()
+    args = p.parse_args(argv)
+    if args.certify and args.offline:
+        p.error("--certify cannot be combined with --offline")
+    return args
+
+
 def _make_adapter(args):
     return make_fake(args.fake) if args.fake else NvmlAdapter()
 
 
-def _make_load(args):
+def _make_load(args, challenge=None):
     if args.fake:  # fake adapters supply their own achieved_tflops
         return NullLoad()
+    if challenge is not None:
+        # Certification requires the real load generator; LoadUnavailable propagates.
+        return TorchGemmLoad(challenge["workload"])
     try:
         return TorchGemmLoad()
     except LoadUnavailable:
@@ -62,8 +74,9 @@ def _config(args) -> RunConfig:
     return RunConfig(baseline_s=60, load_s=600, hz=1.0)
 
 
-def _execute(adapter, args):
+def _execute(adapter, args, challenge=None):
     spec = lookup(adapter.inventory().model_name)
+    load = _make_load(args, challenge)
     kwargs = {}
     if args.fake:  # simulated hardware: use a virtual clock instead of real waiting
         t = [0.0]
@@ -75,7 +88,7 @@ def _execute(adapter, args):
             t[0] += s
 
         kwargs = {"clock": clock, "sleep": sleep}
-    return spec, execute_run(adapter, _make_load(args), _config(args), spec, **kwargs)
+    return spec, load, execute_run(adapter, load, _config(args), spec, **kwargs)
 
 
 def format_grade(out: UploadOutcome, model: str | None) -> str | None:
@@ -130,7 +143,7 @@ def _maybe_upload(result: dict, args) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    args = _parse(argv)
     try:
         adapter = _make_adapter(args)
     except AdapterUnavailable as e:
@@ -139,8 +152,18 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:  # only _make_adapter resolves --fake, so this is a bad profile name
         print(f"gpucheck: {e}", file=sys.stderr)
         return EXIT_NO_GPU
+    challenge = None
+    if args.certify:
+        try:
+            challenge = fetch_challenge(args.server or DEFAULT_SERVER)
+        except ChallengeUnavailable as e:
+            print(f"gpucheck: certification unavailable: {e}", file=sys.stderr)
+            return EXIT_REFUSED
     try:
-        spec, run = _execute(adapter, args)
+        spec, load, run = _execute(adapter, args, challenge)
+    except LoadUnavailable as e:
+        print(f"gpucheck: certification requires the GPU load generator ({e}).", file=sys.stderr)
+        return EXIT_REFUSED
     except AdapterUnavailable as e:
         print(f"gpucheck: no NVIDIA GPU or driver available ({e}).", file=sys.stderr)
         return EXIT_NO_GPU
@@ -153,7 +176,19 @@ def main(argv: list[str] | None = None) -> int:
 
     metrics = derive(run, spec)
     findings = diagnose(metrics, run.preflight, run.inventory, spec)
-    result = build_result(run, metrics, findings)
+    challenge_workload = None
+    if challenge is not None:
+        challenge_workload = getattr(load, "resolved_workload", None)
+        if challenge_workload is None:
+            # Test/demo-only path (--fake): no real load ran, so synthesize the
+            # echo straight from the prescription. Real runs always echo what
+            # TorchGemmLoad actually resolved.
+            w = challenge["workload"]
+            challenge_workload = {
+                "gemm_n": [8192 + o for o in w["gemm_n_offsets"]],
+                "order_seed": w["order_seed"],
+            }
+    result = build_result(run, metrics, findings, challenge, challenge_workload)
     Path(args.json).write_text(canonical_dumps(result))  # before any upload consideration
     print(render_report(result))
     print(f"Result written to {args.json}")

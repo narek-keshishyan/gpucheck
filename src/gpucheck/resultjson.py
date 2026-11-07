@@ -36,8 +36,14 @@ def _normalize(obj: Any) -> Any:
     return obj
 
 
-def build_result(run: RawRun, metrics: Metrics, findings: list[Finding]) -> dict:
-    return _normalize(
+def build_result(
+    run: RawRun,
+    metrics: Metrics,
+    findings: list[Finding],
+    challenge: dict | None = None,
+    challenge_workload: dict | None = None,
+) -> dict:
+    result = _normalize(
         {
             "schema_version": SCHEMA_VERSION,
             "inventory": run.inventory,
@@ -49,6 +55,14 @@ def build_result(run: RawRun, metrics: Metrics, findings: list[Finding]) -> dict
             "aborted": run.aborted,
         }
     )
+    # Both omitted -> output is byte-identical to v1 (run_ids must not shift).
+    if challenge is not None:
+        result["challenge"] = _normalize(
+            {"challenge_id": challenge["challenge_id"], "nonce": challenge["nonce"]}
+        )
+    if challenge_workload is not None:
+        result["config"]["challenge_workload"] = _normalize(challenge_workload)
+    return result
 
 
 def canonical_dumps(d: dict) -> str:
