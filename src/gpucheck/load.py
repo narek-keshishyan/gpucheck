@@ -54,24 +54,32 @@ class TorchGemmLoad:
         try:
             if not torch.cuda.is_available():
                 raise LoadUnavailable("CUDA is not available")
-            free, _total = torch.cuda.mem_get_info()
         except RuntimeError as e:
             raise LoadUnavailable(f"CUDA probe failed: {e}") from e
         self._torch = torch
-        self._n = pick_gemm_size(free)
-        self._ns = [self._n]
+        self._workload = dict(workload) if workload is not None else None
+        self._ns: list[int] = []
         self._tick_i = 0
         self.resolved_workload: dict | None = None
-        if workload is not None:
-            self._ns = apply_workload(self._n, list(workload["gemm_n_offsets"]))
-            self.resolved_workload = {
-                "gemm_n": list(self._ns),
-                "order_seed": workload["order_seed"],
-            }
         self._a = self._b = self._c = None
 
     def start(self) -> None:
         t = self._torch
+        # Memory sizing creates this process's CUDA context, so it must not
+        # happen in __init__: preflight reads the GPU's process list after the
+        # load is constructed, and a context of our own makes the card look busy.
+        try:
+            free, _total = t.cuda.mem_get_info()
+        except RuntimeError as e:
+            raise LoadUnavailable(f"CUDA probe failed: {e}") from e
+        n = pick_gemm_size(free)
+        self._ns = [n]
+        if self._workload is not None:
+            self._ns = apply_workload(n, list(self._workload["gemm_n_offsets"]))
+            self.resolved_workload = {
+                "gemm_n": list(self._ns),
+                "order_seed": self._workload["order_seed"],
+            }
         # One flat buffer at the largest size; each tick views the first n*n
         # elements as a contiguous n x n matrix (no per-size reallocation).
         # Without a workload this is the plain single-size n x n path.

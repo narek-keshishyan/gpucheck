@@ -64,8 +64,34 @@ def test_load_unavailable_when_cuda_broken(monkeypatch):
         raise RuntimeError("CUDA error")
 
     _stub_torch(monkeypatch, mem_info=boom)
+    g = TorchGemmLoad()  # constructing must not probe CUDA
     with pytest.raises(LoadUnavailable):
-        TorchGemmLoad()
+        g.start()
+
+
+def test_init_touches_no_cuda_memory_api(monkeypatch):
+    # Regression: sizing in __init__ created a CUDA context, so preflight
+    # (which runs after the load is constructed) saw gpucheck's own process
+    # and refused every real run as "GPU busy".
+    calls = []
+    cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        mem_get_info=lambda: calls.append("mem") or (1024**3, 1024**3),
+        synchronize=lambda: None,
+        empty_cache=lambda: None,
+    )
+    fake = types.SimpleNamespace(
+        cuda=cuda,
+        bfloat16="bf16",
+        randn=lambda *a, **k: object(),
+        empty=lambda *a, **k: object(),
+        matmul=lambda *a, **k: None,
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    g = TorchGemmLoad()
+    assert calls == []
+    g.start()
+    assert calls == ["mem"]
 
 
 def test_make_load_warns_and_falls_back(monkeypatch, capsys):
