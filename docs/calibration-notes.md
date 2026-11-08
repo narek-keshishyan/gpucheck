@@ -44,3 +44,17 @@ with the datasheet peak kept only as the spoof ceiling (quarantine > 1.15).
 - Record `nvidia-smi -q -d TEMPERATURE` slowdown/shutdown values per card.
 - Record one tick's wall time and the achieved TFLOPS for the rented card;
   compare against the table above.
+
+## 2026-11-08: first real-hardware data (rented H100 SXM, Vast.ai)
+
+NVIDIA H100 80GB HBM3, driver 580.173.02, CUDA 13.0, 700 W limit, ECC on, healthy card:
+
+- quick run (150 s load): 721.95 TFLOPS sustained = 0.730x dense datasheet (989)
+- full run (600 s load): 724.69 TFLOPS = 0.733x — squarely inside the predicted 60-81% band; the 0.50 eligibility gate and the calibration above hold on real hardware
+- certify run (server-prescribed GEMM sizes, same card, same session): 0.677x of the same reference median, about 7-10% below the plain run
+
+The certify gap is structural: cycling prescribed sizes costs throughput vs one
+auto-sized GEMM. Grading certify runs against plain-run references therefore
+reads systematically low. Before grades on certify runs are sold, either build
+the reference set per workload type or apply a measured certify adjustment.
+Raw result.json files: local gpucheck-results/2026-11-08-h100-vast/.
