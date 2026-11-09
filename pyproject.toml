@@ -1,5 +1,5 @@
 [project]
-name = "gpucheck"
+name = "gpucheck-cli"
 version = "0.1.0"
 description = "Open-source CLI that health-checks NVIDIA GPUs"
 readme = "README.md"
@@ -14,6 +14,10 @@ dependencies = ["pynvml"]
 [project.optional-dependencies]
 load = ["torch"]
 
+[project.urls]
+Homepage = "https://gpucheck.dev"
+Repository = "https://github.com/narek-keshishyan/gpucheck"
+
 [project.scripts]
 gpucheck = "gpucheck.cli:main"
 
@@ -23,3 +27,7 @@ dev = ["pytest"]
 [build-system]
 requires = ["uv_build>=0.11.6,<0.12.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# Distribution is gpucheck-cli (the bare name is taken on PyPI); import package stays gpucheck.
+module-name = "gpucheck"

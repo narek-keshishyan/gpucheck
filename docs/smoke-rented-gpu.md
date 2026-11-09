@@ -11,14 +11,14 @@ Manual gate before any launch. Unit tests use a fake adapter; this checks the re
 ## 2. Install
 
 ```
-git clone <repo-url> gpucheck   # placeholder: use the real repo URL
+git clone https://github.com/narek-keshishyan/gpucheck.git gpucheck
 cd gpucheck
 pip install -e .
 python -c "import torch; print(torch.cuda.is_available())"   # must print True
 pip install torch                                            # only if the line above fails
 ```
 
-Alternative without a clone: `pip install git+<repo-url>` (placeholder URL).
+Alternative without a clone: `pip install git+https://github.com/narek-keshishyan/gpucheck.git`, or `pip install "gpucheck-cli[load]"` once the PyPI release is out.
 
 ## 3. Quick offline run
 

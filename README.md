@@ -2,17 +2,19 @@
 
 One command that stress-tests an NVIDIA GPU and tells you whether it is healthy, throttling, or degraded.
 
+Website: [gpucheck.dev](https://gpucheck.dev) — includes the optional $29 signed certificate for used-GPU listings.
+
 It records a short idle baseline, runs a sustained matrix-multiply load, and samples temperature, clocks, power, and throttle reasons the whole time. It then explains what it saw in plain language: thermal throttling, power-limit throttling, memory problems, or throughput well below what that model should deliver.
 
 ## Install
 
 ```
-uvx --from "gpucheck[load]" gpucheck --quick
+uvx --from "gpucheck-cli[load]" gpucheck --quick
 # or
-pip install "gpucheck[load]"
+pip install "gpucheck-cli[load]"
 ```
 
-The load generator needs PyTorch with CUDA. It is an optional extra (`[load]`) because torch is large; if you already have a CUDA build of torch installed, plain `pip install gpucheck` is enough. Without torch/CUDA the tool still runs but generates no load (it prints a warning), so performance metrics are left blank.
+The load generator needs PyTorch with CUDA. It is an optional extra (`[load]`) because torch is large; if you already have a CUDA build of torch installed, plain `pip install gpucheck-cli` is enough. (The PyPI package is `gpucheck-cli`; the installed command is `gpucheck`.) Without torch/CUDA the tool still runs but generates no load (it prints a warning), so performance metrics are left blank.
 
 ## Usage
 

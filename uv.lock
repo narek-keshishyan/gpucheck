@@ -245,7 +245,7 @@ wheels = [
 ]
 
 [[package]]
-name = "gpucheck"
+name = "gpucheck-cli"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
