@@ -232,3 +232,30 @@ def test_tick_stays_on_selected_device(monkeypatch):
     seen.clear()
     assert g.tick() is not None
     assert seen and set(seen) == {"cuda:2"}
+
+
+def test_device_order_is_overridden_with_a_note(monkeypatch, capsys):
+    import os
+
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "FASTEST_FIRST")
+    _stub_torch(monkeypatch, available=False)
+    with pytest.raises(LoadUnavailable):
+        TorchGemmLoad()
+    assert os.environ["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    assert capsys.readouterr().err == (
+        "gpucheck: overriding CUDA_DEVICE_ORDER=FASTEST_FIRST with PCI_BUS_ID so GPU numbering matches NVML\n"
+    )
+
+
+@pytest.mark.parametrize("value", [None, "PCI_BUS_ID"])
+def test_device_order_is_set_silently_when_unset_or_already_right(monkeypatch, capsys, value):
+    import os
+
+    if value is not None:
+        monkeypatch.setenv("CUDA_DEVICE_ORDER", value)
+    _stub_torch(monkeypatch, available=False)
+    with pytest.raises(LoadUnavailable):
+        TorchGemmLoad()
+    assert os.environ["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    c = capsys.readouterr()
+    assert c.out + c.err == ""

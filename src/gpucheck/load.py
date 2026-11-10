@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import time
 
 MIN_N = 2048
@@ -41,12 +42,23 @@ def tflops(n: int, iters: int, elapsed_s: float) -> float:
     return 2 * n**3 * iters / elapsed_s / 1e12
 
 
+def pin_device_order() -> None:
+    """Make torch's cuda:N the same physical card NVML index N reads.
+
+    CUDA's default "fastest first" order can differ from NVML's PCI bus order.
+    Must run before torch initialises CUDA, so before torch is imported."""
+    old = os.environ.get("CUDA_DEVICE_ORDER")
+    if old is not None and old != "PCI_BUS_ID":
+        print(
+            f"gpucheck: overriding CUDA_DEVICE_ORDER={old} with PCI_BUS_ID so GPU numbering matches NVML",
+            file=sys.stderr,
+        )
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+
+
 class TorchGemmLoad:
     def __init__(self, workload: dict | None = None, device_index: int = 0) -> None:
-        # Make torch's cuda:N the same physical card NVML index N reads; CUDA's
-        # default "fastest first" order can differ from NVML's PCI bus order.
-        # Must be set before torch initialises CUDA, so before the import.
-        os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+        pin_device_order()
         try:
             import torch
         except ImportError as e:

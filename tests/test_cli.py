@@ -229,3 +229,40 @@ def test_make_adapter_builds_fakes_itself_when_main_did_not():
 
     adapter = cli._make_adapter(argparse.Namespace(fake="healthy"))
     assert adapter.inventory().model_name == "NVIDIA H100 80GB HBM3"
+
+
+VISIBLE_REFUSAL = (
+    "gpucheck: CUDA_VISIBLE_DEVICES is set, so PyTorch and NVML would number the GPUs differently; "
+    "unset it and choose cards with --gpus"
+)
+
+
+def _no_torch_construct(monkeypatch, made):
+    monkeypatch.setattr(cli, "TorchGemmLoad", lambda *a, **k: made.append("torch") or NullLoad())
+    monkeypatch.setattr(cli, "settle", lambda adapter, **kw: 0.0)
+
+
+@pytest.mark.parametrize("flags", [["--gpus", "all"], ["--gpus", "1"], []])
+def test_cuda_visible_devices_is_refused_on_a_multi_gpu_machine(monkeypatch, tmp_path, capsys, flags):
+    made = _real_path(monkeypatch, 4)
+    _no_torch_construct(monkeypatch, made)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
+    out = tmp_path / "r.json"
+    rc = main([*flags, "--offline", "--json", str(out), "--lot-dir", str(tmp_path / "lot")])
+    assert rc == 1 and made == []
+    assert capsys.readouterr().err.strip() == VISIBLE_REFUSAL
+    assert not out.exists() and not (tmp_path / "lot").exists()
+
+
+def test_cuda_visible_devices_is_fine_on_a_single_gpu_machine(monkeypatch, tmp_path, capsys):
+    made = _real_path(monkeypatch, 1)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    assert main(["--offline", "--json", str(tmp_path / "r.json")]) == 0
+    assert made == [(0, False), ("load", 0)]
+    assert "CUDA_VISIBLE_DEVICES" not in capsys.readouterr().err
+
+
+def test_empty_cuda_visible_devices_is_not_refused(monkeypatch, tmp_path):
+    _real_path(monkeypatch, 4)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    assert main(["--gpus", "1", "--offline", "--json", str(tmp_path / "r.json")]) == 0

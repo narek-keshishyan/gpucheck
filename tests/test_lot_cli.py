@@ -129,7 +129,7 @@ def test_label_longer_than_80_is_rejected():
         main(["--fake", "healthy,healthy", "--offline", "--label", "x" * 81])
 
 
-def _real_lot(monkeypatch, count, *, lost=(), reports=lambda index: index):
+def _real_lot(monkeypatch, count, *, lost=()):
     """Stub the real-hardware path; returns the log of adapters, loads and settles made."""
     made = []
 
@@ -138,7 +138,7 @@ def _real_lot(monkeypatch, count, *, lost=(), reports=lambda index: index):
         if index in lost:
             raise AdapterUnavailable("NVML unavailable: GPU is lost")
         card = make_fake("healthy")
-        card._inventory = replace(card._inventory, gpu_index=reports(index))
+        card._inventory = replace(card._inventory, gpu_index=index)
         return card
 
     monkeypatch.setattr(cli, "gpu_count", lambda: count)
@@ -147,6 +147,7 @@ def _real_lot(monkeypatch, count, *, lost=(), reports=lambda index: index):
                         lambda args, challenge=None, device_index=0: made.append(("load", device_index)) or NullLoad())
     monkeypatch.setattr(cli, "_config", lambda args: RunConfig(baseline_s=2, load_s=2, hz=1000.0))
     monkeypatch.setattr(cli, "settle", lambda adapter, **kw: made.append("settle") or 12.0)
+    monkeypatch.setattr(cli, "TorchGemmLoad", lambda *a, **k: NullLoad())  # the multi-GPU load check
     return made
 
 
@@ -171,16 +172,6 @@ def test_real_path_records_an_adapter_that_cannot_be_created(tmp_path, monkeypat
     lost = s["cards"][1]
     assert "GPU is lost" in lost["reason"] and lost["uuid_hash"] is None and lost["gpu_index"] == 1
     assert [m for m in made if m[0] != "adapter"] == [("load", 0), "settle", ("load", 2)]
-
-
-def test_real_path_card_reporting_another_index_is_not_loaded(tmp_path, monkeypatch):
-    made = _real_lot(monkeypatch, 2, reports=lambda index: {0: 0, 1: 0}[index])
-    d = tmp_path / "lot"
-    assert main(["--gpus", "all", "--offline", "--lot-dir", str(d)]) == 3
-    s = json.loads((d / "lot.json").read_text())
-    assert s["cards"][1]["outcome"] == "not_tested"
-    assert s["cards"][1]["reason"] == "card index mismatch: selected 1, adapter reports 0"
-    assert [m for m in made if m[0] == "load"] == [("load", 0)]
 
 
 def _execute_run_failing_on_second_call(monkeypatch, exc):
@@ -225,3 +216,37 @@ def test_lot_that_cannot_be_saved_still_prints_and_exits_1(tmp_path, capsys, mon
     c = capsys.readouterr()
     assert rc == 1 and "Lot summary" in c.out and "Lot written" not in c.out
     assert "could not write the lot to" in c.err and "No space left on device" in c.err
+
+
+LOAD_REFUSAL = (
+    'gpucheck: a multi-GPU run needs the load generator (PyTorch with CUDA); '
+    'install it with: pip install "gpucheck-cli[load]"'
+)
+
+
+def _no_torch(monkeypatch):
+    from gpucheck.load import LoadUnavailable
+
+    def unavailable(*a, **k):
+        raise LoadUnavailable("torch is not installed")
+
+    monkeypatch.setattr(cli, "TorchGemmLoad", unavailable)
+
+
+def test_real_path_lot_without_a_load_generator_is_refused(tmp_path, monkeypatch, capsys):
+    made = _real_lot(monkeypatch, 3)
+    _no_torch(monkeypatch)
+    runs = _count_runs(monkeypatch)
+    d = tmp_path / "lot"
+    assert main(["--gpus", "all", "--offline", "--lot-dir", str(d)]) == 1
+    assert capsys.readouterr().err.strip() == LOAD_REFUSAL
+    assert runs == [] and made == [] and not d.exists()
+
+
+def test_real_path_single_card_without_a_load_generator_still_runs(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "gpu_count", lambda: 3)  # the real _make_load, so its fallback runs
+    monkeypatch.setattr(cli, "NvmlAdapter", lambda index=0, include_serial=False: make_fake("healthy"))
+    monkeypatch.setattr(cli, "_config", lambda args: RunConfig(baseline_s=2, load_s=2, hz=1000.0))
+    _no_torch(monkeypatch)
+    assert main(["--gpus", "1", "--offline", "--json", str(tmp_path / "r.json")]) == 0
+    assert "no torch/CUDA — running without load" in capsys.readouterr().err

@@ -150,6 +150,16 @@ def _make_load(args, challenge=None, device_index: int = 0):
         return NullLoad()
 
 
+def _load_available() -> bool:
+    """Whether the load generator can be built. Constructing it only imports torch and asks
+    whether CUDA is available; it creates no CUDA context (that happens in start())."""
+    try:
+        TorchGemmLoad()
+    except LoadUnavailable:
+        return False
+    return True
+
+
 def _config(args) -> RunConfig:
     if args.quick:
         return RunConfig(baseline_s=30, load_s=150, hz=1.0)
@@ -223,12 +233,6 @@ def _run_card(
         inventory = adapter.inventory()
     except Exception as e:
         return outcome(None, NOT_TESTED, f"could not read the card: {e}")
-    # Fake cards carry synthetic indices; on real hardware the load must go to the card that was selected.
-    if not args.fake and inventory.gpu_index is not None and inventory.gpu_index != gpu_index:
-        return outcome(
-            inventory, NOT_TESTED,
-            f"card index mismatch: selected {gpu_index}, adapter reports {inventory.gpu_index}",
-        )
     timer = _timer(args)
     started = _now()
     try:
@@ -484,6 +488,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.fake:
             count = gpu_count()
+            if count > 1 and os.environ.get("CUDA_VISIBLE_DEVICES"):
+                # torch would number only the visible cards, NVML numbers all of them:
+                # the load would run on a different card from the one measured.
+                print(
+                    "gpucheck: CUDA_VISIBLE_DEVICES is set, so PyTorch and NVML would number the GPUs "
+                    "differently; unset it and choose cards with --gpus",
+                    file=sys.stderr,
+                )
+                return EXIT_REFUSED
             gpus_spec = args.gpus
         else:
             args.fake_cards = make_fakes(args.fake)  # unknown profile: handled below
@@ -495,6 +508,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"gpucheck: --gpus: {e}", file=sys.stderr)
             return EXIT_REFUSED
         if len(selected) > 1:
+            if not args.fake and not _load_available():
+                print(
+                    'gpucheck: a multi-GPU run needs the load generator (PyTorch with CUDA); '
+                    'install it with: pip install "gpucheck-cli[load]"',
+                    file=sys.stderr,
+                )
+                return EXIT_REFUSED
             lot_adapters = _lot_adapters(args, selected)
         else:
             args.gpu_index = selected[0]
