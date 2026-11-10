@@ -1,6 +1,8 @@
 import json
 from dataclasses import replace
 
+import pytest
+
 from gpucheck import cli
 from gpucheck.adapter import AdapterUnavailable
 from gpucheck.cli import main
@@ -213,3 +215,15 @@ def test_fake_list_with_gpus_runs_the_selected_card(tmp_path):
 def test_fake_list_selecting_several_cards_is_not_available_yet(capsys):
     assert main(["--fake", "healthy,healthy", "--offline"]) == 1
     assert "gpucheck: multi-GPU runs are not available yet" in capsys.readouterr().err
+
+
+def test_fake_list_with_unknown_profile_names_it(capsys):
+    assert main(["--fake", "healthy,nope", "--offline"]) == 2
+    err = capsys.readouterr().err
+    assert "nope" in err and len(err.strip().splitlines()) == 1
+
+
+@pytest.mark.parametrize("value", ["5", "", "fake profile"])
+def test_fake_list_bad_gpus_value_is_a_gpus_error(value, capsys):
+    assert main(["--fake", "healthy,healthy", "--gpus", value, "--offline"]) == 1
+    assert capsys.readouterr().err.startswith("gpucheck: --gpus:")

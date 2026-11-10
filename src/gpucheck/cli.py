@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .adapter import AdapterUnavailable, NvmlAdapter, gpu_count
 from .diagnose import diagnose
-from .fakes import make_fake, make_fakes
+from .fakes import make_fakes
 from .lot import parse_gpus
 from .load import LoadUnavailable, TorchGemmLoad
 from .metrics import derive
@@ -89,7 +89,7 @@ def format_certify(out: UploadOutcome) -> str | None:
 
 def _make_adapter(args):
     if args.fake:
-        return make_fakes(args.fake)[getattr(args, "gpu_index", 0)]
+        return args.fake_cards[getattr(args, "gpu_index", 0)]
     return NvmlAdapter(index=getattr(args, "gpu_index", 0), include_serial=args.include_serial)
 
 
@@ -209,11 +209,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.gpus is None and count > 1:
                 print(f"{count} GPUs detected; testing GPU 0 only. Use --gpus all to test every card.")
         else:
+            args.fake_cards = make_fakes(args.fake)  # unknown profile: handled below
             try:
-                selected = parse_gpus(args.gpus or "all", len(make_fakes(args.fake)))
+                selected = parse_gpus("all" if args.gpus is None else args.gpus, len(args.fake_cards))
             except ValueError as e:
-                if "fake profile" in str(e):
-                    raise
                 print(f"gpucheck: --gpus: {e}", file=sys.stderr)
                 return EXIT_REFUSED
             if len(selected) > 1:
