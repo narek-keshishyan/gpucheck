@@ -2,7 +2,7 @@
 
 One command that stress-tests an NVIDIA GPU and reports throttling, power capping, recorded memory errors and below-reference throughput.
 
-Website: [gpucheck.dev](https://gpucheck.dev) — includes the optional $29 signed certificate for used-GPU listings.
+Website: [gpucheck.dev](https://gpucheck.dev).
 
 It records a short idle baseline, runs a sustained matrix-multiply load, and samples temperature, clocks, power, and throttle reasons the whole time. It then explains what it saw in plain language: thermal throttling, power-limit throttling, memory problems, or throughput well below what that model should deliver.
 
@@ -14,7 +14,7 @@ uvx --from "gpucheck-cli[load]" gpucheck --quick
 pip install "gpucheck-cli[load]"
 ```
 
-The load generator needs PyTorch with CUDA. It is an optional extra (`[load]`) because torch is large; if you already have a CUDA build of torch installed, plain `pip install gpucheck-cli` is enough. (The PyPI package is `gpucheck-cli`; the installed command is `gpucheck`.) Without torch/CUDA the tool still runs but generates no load (it prints a warning), so performance metrics are left blank.
+The load generator needs PyTorch with CUDA. It is an optional extra (`[load]`) because torch is large; if you already have a CUDA build of torch installed, plain `pip install gpucheck-cli` is enough. (The PyPI package is `gpucheck-cli`; the installed command is `gpucheck`.) Without torch/CUDA a single-card run still runs but generates no load (it prints a warning), so performance metrics are left blank. A multi-GPU run needs the load generator and refuses to start without it.
 
 ## Usage
 
@@ -25,9 +25,9 @@ gpucheck --long          # 60 s baseline, 30 min load
 gpucheck --offline       # never contacts a server
 gpucheck --dry-run       # print exactly what would be uploaded, upload nothing
 gpucheck --yes-upload    # upload without the prompt
-gpucheck --server URL    # upload server (http or https); default https://gpucheck-api.fly.dev
+gpucheck --server URL    # upload server; default https://gpucheck-api.fly.dev (an API key is only sent over https)
 gpucheck --json PATH     # where to write result.json (default ./gpucheck-result.json)
-gpucheck --certify       # use a one-time server challenge so the result can earn a certificate
+gpucheck --certify       # use a one-time server challenge so the result can earn a certificate (off on the default server)
 gpucheck --gpus all      # test every GPU in the machine, one after another (a "lot")
 gpucheck --gpus 0,2      # test only these GPU indices
 gpucheck --label "Rack 4"        # name a multi-GPU run (at most 80 characters)
@@ -39,7 +39,7 @@ gpucheck --upload-saved PATH     # upload a saved result file or lot directory; 
 
 Without `--gpus`, gpucheck tests GPU 0 only and says so when the machine has more than one card.
 
-The result is always written locally to `result.json` first. The tool only reads from the GPU; it does not change any settings. Ctrl-C stops a run at any time; an interrupted run writes no result.json and uploads nothing.
+A single-card result is always written locally to `result.json` first, before any upload; a multi-GPU run writes its lot directory card by card as each card finishes. The tool only reads from the GPU; it does not change any settings. Ctrl-C stops a run at any time. For a single-card run, an interrupted run writes no result.json and uploads nothing. An interrupted or killed multi-GPU run keeps the cards that finished: see below.
 
 ### Upload flow
 
@@ -55,11 +55,17 @@ curl -X DELETE -H "X-Delete-Token: <token>" <server>/v1/runs/<run_id>
 
 A lot writes a directory (`--lot-dir`, default `./gpucheck-lot-<id>`) containing `gpu<position>.json` for each card that produced a result, and `lot.json`, which summarises every card, including those that were not tested and why. gpucheck checks that the directory is writable before the first card runs, and refuses to start if it already holds a `lot.json`, so an earlier lot is never overwritten. In a lot run `--json` is not used.
 
-A card that is busy, cannot be read, or fails does not stop the lot; it is recorded as not tested with the reason, and the remaining cards still run. Ctrl-C during a lot keeps the cards already finished, writes the lot, uploads nothing, and exits 130.
+Results are saved card by card: as soon as a card finishes, its `gpu<position>.json` is written and `lot.json` is rewritten (each through a temporary file and a rename, so a file is never left half-written). While the lot is running, `lot.json` has `"finished": false` and lists the cards not yet reached as not tested ("not reached: the run stopped before this card"). If the process is killed, the SSH session drops or the machine crashes, the cards that finished are on disk, and `gpucheck --upload-saved DIR` uploads them, with the cards not reached recorded as not tested. A long lot can take hours, so run it inside `tmux` or `screen`, or with `nohup`, so that a dropped connection does not stop it. If a card's files cannot be saved partway through, gpucheck prints a warning, keeps going and tries again at the end.
+
+A card that is busy, cannot be read, or fails does not stop the lot; it is recorded as not tested with the reason, and the remaining cards still run. Ctrl-C during a lot keeps the cards already finished, writes `lot.json` with `"finished": true` (the remaining cards are recorded as interrupted), uploads nothing, and exits 130.
+
+A multi-GPU run needs the load generator (PyTorch with CUDA, the `[load]` extra): without it every card would sit idle, so gpucheck refuses to start and names the install command.
+
+GPU numbering: PyTorch and NVML must agree on which card is GPU N, or the tool would load one card while measuring another. gpucheck therefore sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before loading PyTorch (if it was set to something else, it says it is overriding it), and on a machine with more than one GPU it refuses to run while `CUDA_VISIBLE_DEVICES` is set, because PyTorch would then number only the visible cards. Unset it and choose cards with `--gpus` instead. This also applies to a single-card run on a multi-GPU machine. MIG-enabled machines are not supported for multi-GPU runs, because the device numbering is not guaranteed there.
 
 `--certify` cannot be used with several cards. A machine with one GPU and `--gpus all` is an ordinary single run.
 
-After a lot, gpucheck asks once whether to upload (or uses `--yes-upload`; with `--dry-run` it prints the request instead). In a non-interactive shell it prints how to upload later with `--upload-saved`.
+After a lot, gpucheck asks once whether to upload (or uses `--yes-upload`; with `--dry-run` it prints the request instead). In a non-interactive shell it prints how to upload later with `--upload-saved`. Ctrl-C during the upload stops it and prints the same retry command. Uploading a lot needs a server deployed with lot support; an older server answers 404, the upload is reported as failed, and the lot stays saved for `--upload-saved`.
 
 ## What gets uploaded
 
@@ -75,19 +81,21 @@ A lot is uploaded in one request. The upload tool does not follow HTTP redirects
 
 Result pages are public to anyone with the link, and the server also serves back the full uploaded JSON (every field above, including the sample time series) at `/v1/runs/<run_id>`. The run ID is derived from the content. Without an API key the server returns a delete token (stored only as a hash) for each run that lets you remove that page. A lot upload saves its tokens in the `uploaded` section of `lot.json`, so anyone who has that file can delete those result pages; keep it private.
 
-With an API key (`--api-key`, or better the `GPUCHECK_API_KEY` environment variable, since command-line arguments are visible to other users of the machine) the upload is attributed to your account and gets no delete token: the uploader cannot delete it. The key is never written to a file, printed, or put in a URL.
+With an API key (`--api-key`, or better the `GPUCHECK_API_KEY` environment variable, since command-line arguments are visible to other users of the machine) the upload is attributed to your account and gets no delete token: the uploader cannot delete it. The key is never written to a file, printed, or put in a URL, and it is only sent over https: with a key set, gpucheck refuses to upload to a plain `http://` server unless the host is `localhost`, `127.0.0.1` or `[::1]`, and treats that as a failed upload (the files are kept). An anonymous upload that comes back without a delete token was already uploaded before, and gpucheck says so.
 
 ### Uploading later (`--upload-saved`)
 
-`gpucheck --upload-saved PATH` uploads a saved result file or a lot directory without touching a GPU, and without a prompt. It uses `--server`, `--api-key` and `GPUCHECK_API_KEY` as usual, and cannot be combined with flags that run a test (`--gpus`, `--quick`, `--long`, `--label`, `--lot-dir`, `--include-serial`, `--offline`, `--dry-run`, `--certify`). It refuses a lot whose card files were changed after the run. After a successful lot upload it records the URLs and delete tokens in `lot.json`; uploading the same lot again does not create duplicates and keeps tokens recorded earlier, and tokens from an upload to a different server are kept under `previous_uploads`. A single result file's delete token is printed, not saved.
+`gpucheck --upload-saved PATH` uploads a saved result file or a lot directory without touching a GPU, and without a prompt. It uses `--server`, `--api-key` and `GPUCHECK_API_KEY` as usual, and cannot be combined with flags that run a test (`--gpus`, `--quick`, `--long`, `--label`, `--lot-dir`, `--include-serial`, `--offline`, `--dry-run`, `--certify`). It refuses a lot whose card files were changed after the run, and a single `gpu<N>.json` from a lot (upload its directory instead). A lot that did not finish (its run was killed) is uploaded with a note that the cards not reached are recorded as not tested. After a successful lot upload it records the URLs and delete tokens in `lot.json`; uploading the same lot again does not create duplicates and keeps tokens recorded earlier, and tokens from an upload to a different server are kept under `previous_uploads`. A single result file's delete token is printed, not saved.
 
 ## Certificates (`--certify`)
 
-`gpucheck --certify` asks the server for a one-time challenge, runs the workload the server prescribes (a set of matrix sizes and an execution order) instead of the default one, and uploads the result with the challenge attached. If the run qualifies, the result page offers a signed certificate for it. Certifying a run is a separate purchase, made on the result page.
+Certification is switched off on the default server and certificates are not currently offered. Against the default server, gpucheck --certify stops before the run with "certification unavailable: server has certification disabled" (exit code 1). The rest of this section describes the feature for a server that has it turned on.
+
+`gpucheck --certify` asks the server for a one-time challenge, runs the workload the server prescribes (a set of matrix sizes and an execution order) instead of the default one, and uploads the result with the challenge attached. If the run qualifies, the result page offers a signed certificate for it. On a server that offers certificates, one can be requested from the result page.
 
 What you need:
 
-- A server that has certification turned on. The default server is `https://gpucheck-api.fly.dev`; pass `--server URL` for another one. If the challenge cannot be fetched (the server has certification turned off, or cannot be reached), gpucheck stops before the run with a message and exit code 1.
+- A server that has certification turned on. The default server, `https://gpucheck-api.fly.dev`, has it turned off; pass `--server URL` for a server that has it on. If the challenge cannot be fetched (the server has certification turned off, or cannot be reached), gpucheck stops before the run with a message and exit code 1.
 - Working PyTorch with CUDA. Without it, `--certify` stops with exit code 1 instead of falling back to a run with no load.
 - The normal upload prompt still applies. A certificate can only be made from an uploaded result, so answer yes, or pass `--yes-upload` in a script.
 
@@ -118,7 +126,7 @@ Verifying a certificate offline needs the certificate payload, its signature, an
 
 ## Findings
 
-The report lists plain-language findings, each with a severity and a confidence. Besides the thermal, power and throughput findings (`THERMAL_THROTTLING`, `POWER_CAPPED`, `HOT_ENVIRONMENT`, `UNDERPERFORMING_UNKNOWN`, `INSUFFICIENT_EVIDENCE`), it can report `HOT_UNDER_LOAD` (the card throttled quickly and ran near its temperature limit even though it idled cool), `MEMORY_ERRORS` (errors or remapped memory rows recorded by the card), `MEMORY_NOT_CHECKED` (the card exposes no memory-error counters, so memory health was not checked) and `PCIE_LINK_DEGRADED`. Every report ends with a "Not covered" note listing what the test does not examine.
+The report lists plain-language findings, each with a severity and a confidence. Besides the thermal, power and throughput findings (`THERMAL_THROTTLING`, `POWER_CAPPED`, `HOT_ENVIRONMENT`, `UNDERPERFORMING_UNKNOWN`, `INSUFFICIENT_EVIDENCE`), it can report `HOT_UNDER_LOAD` (the card throttled quickly and ran near its temperature limit even though it idled cool), `MEMORY_ERRORS` (errors during the run, remapped memory rows, or uncorrected memory errors over the card's lifetime, recorded by the card), `MEMORY_NOT_CHECKED` (the card exposes no memory-error counters, so memory health was not checked) and `PCIE_LINK_DEGRADED`. Every report ends with a "Not covered" note listing what the test does not examine.
 
 ## Exit codes
 
@@ -144,7 +152,7 @@ This is a pre-flight check, not proof of health. It does not test memory cells, 
 - It refuses to run on a GPU that is already busy.
 - Grades depend on a reference set of comparable runs; for new or rare models you will see "insufficient reference".
 - A single run is a snapshot. A run with no findings is a snapshot of one test, not a guarantee.
-- Multi-GPU runs have been tested only with simulated cards and have not yet been run on real multi-GPU hardware. Until the procedure in `docs/smoke-rented-gpu.md` has been carried out, treat them as unverified.
+- Multi-GPU runs have been tested only with simulated cards and have not yet been run on real multi-GPU hardware. The manifest queries (VBIOS, PCIe link, lifetime memory-error counts, serial) and `--gpus N` on a multi-GPU machine are also unverified on real hardware. Until the procedure in `docs/smoke-rented-gpu.md` has been carried out, treat them as unverified.
 
 ## License
 
