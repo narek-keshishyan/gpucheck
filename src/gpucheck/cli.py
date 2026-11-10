@@ -89,7 +89,8 @@ def format_certify(out: UploadOutcome) -> str | None:
 
 def _make_adapter(args):
     if args.fake:
-        return args.fake_cards[getattr(args, "gpu_index", 0)]
+        cards = getattr(args, "fake_cards", None) or make_fakes(args.fake)
+        return cards[getattr(args, "gpu_index", 0)]
     return NvmlAdapter(index=getattr(args, "gpu_index", 0), include_serial=args.include_serial)
 
 
@@ -223,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     except AdapterUnavailable as e:
         print(f"gpucheck: no NVIDIA GPU or driver available ({e}).", file=sys.stderr)
         return EXIT_NO_GPU
-    except ValueError as e:  # only _make_adapter resolves --fake, so this is a bad profile name
+    except ValueError as e:  # a bad --fake profile name (make_fakes) or an unusable adapter
         print(f"gpucheck: {e}", file=sys.stderr)
         return EXIT_NO_GPU
     challenge = None

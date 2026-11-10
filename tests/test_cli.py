@@ -227,3 +227,10 @@ def test_fake_list_with_unknown_profile_names_it(capsys):
 def test_fake_list_bad_gpus_value_is_a_gpus_error(value, capsys):
     assert main(["--fake", "healthy,healthy", "--gpus", value, "--offline"]) == 1
     assert capsys.readouterr().err.startswith("gpucheck: --gpus:")
+
+
+def test_make_adapter_builds_fakes_itself_when_main_did_not():
+    import argparse
+
+    adapter = cli._make_adapter(argparse.Namespace(fake="healthy"))
+    assert adapter.inventory().model_name == "NVIDIA H100 80GB HBM3"
