@@ -10,7 +10,7 @@ import types
 
 import pytest
 
-from gpucheck.adapter import NvmlAdapter
+from gpucheck.adapter import NvmlAdapter, clean_serial
 from gpucheck.diagnose import diagnose
 from gpucheck.metrics import derive
 from gpucheck.preflight import Preflight, run_preflight
@@ -170,3 +170,53 @@ def test_busy_none_when_process_query_fails(monkeypatch):
 
     nv.nvmlDeviceGetComputeRunningProcesses = boom
     assert adapter(monkeypatch, nv).busy() is None
+
+
+def _with_manifest(nv):
+    nv.nvmlDeviceGetVbiosVersion = lambda h: b"96.00.89.00.01"
+    nv.nvmlDeviceGetCurrPcieLinkGeneration = lambda h: 4
+    nv.nvmlDeviceGetMaxPcieLinkGeneration = lambda h: 5
+    nv.nvmlDeviceGetCurrPcieLinkWidth = lambda h: 8
+    nv.nvmlDeviceGetMaxPcieLinkWidth = lambda h: 16
+    nv.nvmlDeviceGetSerial = lambda h: b" 1650123456789 "
+    nv.NVML_AGGREGATE_ECC = 1
+    nv.NVML_MEMORY_ERROR_TYPE_CORRECTED = 0
+    nv.nvmlDeviceGetTotalEccErrors = lambda h, kind, counter: {(0, 1): 7, (1, 1): 2}.get((kind, counter), 0)
+    return nv
+
+
+def test_manifest_fields_collected(monkeypatch):
+    monkeypatch.setitem(sys.modules, "pynvml", _with_manifest(modern()))
+    inv = NvmlAdapter(index=3).inventory()
+    assert inv.gpu_index == 3 and inv.vbios_version == "96.00.89.00.01"
+    assert (inv.pcie_gen_current, inv.pcie_gen_max, inv.pcie_width_current, inv.pcie_width_max) == (4, 5, 8, 16)
+    assert (inv.ecc_aggregate_corrected, inv.ecc_aggregate_uncorrected) == (7, 2)
+    assert inv.serial is None
+
+
+def test_serial_read_only_on_opt_in(monkeypatch):
+    nv = _with_manifest(modern())
+    monkeypatch.setitem(sys.modules, "pynvml", nv)
+    assert NvmlAdapter(include_serial=True).inventory().serial == "1650123456789"
+
+    def forbidden(h):
+        raise AssertionError("serial queried without opt-in")
+
+    nv.nvmlDeviceGetSerial = forbidden
+    assert NvmlAdapter().inventory().serial is None
+
+
+def test_manifest_unknown_when_unsupported(monkeypatch):
+    nv = missing()
+    del nv.nvmlDeviceGetTotalEccErrors
+    inv = adapter(monkeypatch, nv).inventory()
+    assert inv.vbios_version is None and inv.pcie_width_current is None
+    assert inv.ecc_aggregate_uncorrected is None and inv.gpu_index == 0
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (b"0", None), ("N/A", None), ("  ", None), ("to be filled by o.e.m.", None), (None, None),
+    ("x" * 100, "x" * 64), (" 165012 ", "165012"),
+])
+def test_clean_serial(raw, expected):
+    assert clean_serial(raw) == expected

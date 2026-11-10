@@ -31,6 +31,15 @@ class GpuInventory:
     remapped_rows: int | None  # correctable + uncorrectable
     row_remap_pending: bool | None = None
     row_remap_failure: bool | None = None
+    gpu_index: int | None = None
+    vbios_version: str | None = None
+    pcie_gen_current: int | None = None
+    pcie_gen_max: int | None = None
+    pcie_width_current: int | None = None
+    pcie_width_max: int | None = None
+    ecc_aggregate_corrected: int | None = None  # lifetime counts
+    ecc_aggregate_uncorrected: int | None = None
+    serial: str | None = None  # read only on explicit opt-in
 
 
 @dataclass(frozen=True)
@@ -59,6 +68,22 @@ def hash_uuid(uuid: str) -> str:
 
 def _text(value: object) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
+
+
+PLACEHOLDER_SERIALS = frozenset(
+    {"0", "N/A", "NA", "NONE", "UNKNOWN", "NOT SPECIFIED", "TO BE FILLED BY O.E.M."}
+)
+_MAX_TEXT = 64
+
+
+def clean_serial(raw: object) -> str | None:
+    """Serial text, or None when empty or a known placeholder; at most 64 characters."""
+    if raw is None:
+        return None
+    text = _text(raw).strip()
+    if not text or text.upper() in PLACEHOLDER_SERIALS:
+        return None
+    return text[:_MAX_TEXT]
 
 
 def _try(fn, *args):
@@ -99,9 +124,11 @@ def _reason_bit(nv, suffix: str) -> int:
 
 
 class NvmlAdapter(TelemetryAdapter):
-    """Reads GPU 0 through NVML (pynvml)."""
+    """Reads one GPU (default index 0) through NVML (pynvml)."""
 
-    def __init__(self, index: int = 0) -> None:
+    def __init__(self, index: int = 0, include_serial: bool = False) -> None:
+        self._index = index
+        self._include_serial = include_serial
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", FutureWarning)  # pynvml deprecation notice
@@ -133,6 +160,27 @@ class NvmlAdapter(TelemetryAdapter):
         # (correctable rows, uncorrectable rows, remap pending, remap failure occurred)
         remap = self._q("nvmlDeviceGetRemappedRows", h)
         remap_ok = isinstance(remap, (tuple, list)) and len(remap) >= 4
+        vbios = self._q("nvmlDeviceGetVbiosVersion", h)
+        serial = clean_serial(self._q("nvmlDeviceGetSerial", h)) if self._include_serial else None
+        aggregate = _const(nv, "NVML_AGGREGATE_ECC", default=1)
+        ecc_corrected = self._q(
+            "nvmlDeviceGetTotalEccErrors", h,
+            _const(nv, "NVML_MEMORY_ERROR_TYPE_CORRECTED", default=0), aggregate,
+        )
+        ecc_uncorrected = self._q(
+            "nvmlDeviceGetTotalEccErrors", h,
+            _const(nv, "NVML_MEMORY_ERROR_TYPE_UNCORRECTED", default=1), aggregate,
+        )
+        link = {
+            key: self._q(fn, h)
+            for key, fn in (
+                ("gen_cur", "nvmlDeviceGetCurrPcieLinkGeneration"),
+                ("gen_max", "nvmlDeviceGetMaxPcieLinkGeneration"),
+                ("width_cur", "nvmlDeviceGetCurrPcieLinkWidth"),
+                ("width_max", "nvmlDeviceGetMaxPcieLinkWidth"),
+            )
+        }
+        link = {k: int(v) if v is not None else None for k, v in link.items()}
         return GpuInventory(
             model_name=_text(nv.nvmlDeviceGetName(h)),
             uuid_hash=hash_uuid(uuid),
@@ -147,6 +195,15 @@ class NvmlAdapter(TelemetryAdapter):
             remapped_rows=int(remap[0]) + int(remap[1]) if remap_ok else None,
             row_remap_pending=bool(remap[2]) if remap_ok else None,
             row_remap_failure=bool(remap[3]) if remap_ok else None,
+            gpu_index=self._index,
+            vbios_version=_text(vbios).strip()[:_MAX_TEXT] if vbios is not None else None,
+            pcie_gen_current=link["gen_cur"],
+            pcie_gen_max=link["gen_max"],
+            pcie_width_current=link["width_cur"],
+            pcie_width_max=link["width_max"],
+            ecc_aggregate_corrected=int(ecc_corrected) if ecc_corrected is not None else None,
+            ecc_aggregate_uncorrected=int(ecc_uncorrected) if ecc_uncorrected is not None else None,
+            serial=serial,
         )
 
     def _throttle_mask(self) -> int | None:

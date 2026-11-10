@@ -39,6 +39,16 @@ def _fmt(value: Any, unit: str) -> str:
     return f"{text} {unit}".rstrip()
 
 
+def _pcie_link(inv: dict) -> str | None:
+    keys = ("pcie_gen_current", "pcie_width_current", "pcie_gen_max", "pcie_width_max")
+    if any(inv.get(k) is None for k in keys):
+        return None
+    return (
+        f"gen {inv['pcie_gen_current']} x{inv['pcie_width_current']} "
+        f"(max gen {inv['pcie_gen_max']} x{inv['pcie_width_max']})"
+    )
+
+
 def render_report(result: dict) -> str:
     inv = result.get("inventory") or {}
     pre = result.get("preflight") or {}
@@ -67,7 +77,11 @@ def render_report(result: dict) -> str:
         ("Fractional sharing", inv.get("fractional")),
         ("Retired pages", inv.get("retired_pages")),
         ("Remapped rows", inv.get("remapped_rows")),
+        ("VBIOS", inv.get("vbios_version")),
+        ("PCIe link", _pcie_link(inv)),
     ]
+    if inv.get("serial"):
+        rows.append(("Serial", inv["serial"]))
     out += [f"  {k + ':':<22}{'n/a' if v is None else v}" for k, v in rows]
     for reason in pre.get("reasons") or []:
         out.append(f"  preflight: {reason}")

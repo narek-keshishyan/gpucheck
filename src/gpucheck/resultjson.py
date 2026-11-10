@@ -36,6 +36,21 @@ def _normalize(obj: Any) -> Any:
     return obj
 
 
+# Per-card manifest fields: written to the inventory only when known, so a result
+# without them stays byte-identical to one built before they existed.
+MANIFEST_FIELDS = (
+    "gpu_index",
+    "vbios_version",
+    "pcie_gen_current",
+    "pcie_gen_max",
+    "pcie_width_current",
+    "pcie_width_max",
+    "ecc_aggregate_corrected",
+    "ecc_aggregate_uncorrected",
+    "serial",
+)
+
+
 def build_result(
     run: RawRun,
     metrics: Metrics,
@@ -55,6 +70,9 @@ def build_result(
             "aborted": run.aborted,
         }
     )
+    for key in MANIFEST_FIELDS:
+        if result["inventory"].get(key) is None:
+            result["inventory"].pop(key, None)
     # Both omitted -> output is byte-identical to v1 (run_ids must not shift).
     if challenge is not None:
         result["challenge"] = _normalize(
