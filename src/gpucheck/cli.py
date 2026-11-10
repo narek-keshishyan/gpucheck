@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -204,13 +205,18 @@ def _run_card(
         inventory = adapter.inventory()
     except Exception as e:
         return outcome(None, NOT_TESTED, f"could not read the card: {e}")
+    # Fake cards carry synthetic indices; on real hardware the load must go to the card that was selected.
+    if not args.fake and inventory.gpu_index is not None and inventory.gpu_index != gpu_index:
+        return outcome(
+            inventory, NOT_TESTED,
+            f"card index mismatch: selected {gpu_index}, adapter reports {inventory.gpu_index}",
+        )
     timer = _timer(args)
     started = _now()
     try:
         settle_s = settle(adapter, sleep=timer.get("sleep", time.sleep)) if settle_first else None
         spec = lookup(inventory.model_name)
-        device = inventory.gpu_index if inventory.gpu_index is not None else 0
-        load = _make_load(args, None, device_index=device)
+        load = _make_load(args, None, device_index=gpu_index)
         run = execute_run(adapter, load, _config(args), spec, **timer)
     except KeyboardInterrupt:
         raise _CardInterrupted(outcome(inventory, NOT_TESTED, INTERRUPTED)) from None
@@ -241,6 +247,16 @@ def _main_lot(adapters, args, gpu_indices: list[int]) -> int:
     if (directory / "lot.json").exists():
         print(f"gpucheck: {directory} already contains a lot; choose another --lot-dir", file=sys.stderr)
         return EXIT_REFUSED
+    if directory.exists() and not directory.is_dir():
+        print(f"gpucheck: {directory} is not a directory", file=sys.stderr)
+        return EXIT_REFUSED
+    try:  # find out now, not after every card has run, that the lot cannot be saved
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=directory):
+            pass
+    except OSError as e:
+        print(f"gpucheck: cannot write to {directory}: {e}", file=sys.stderr)
+        return EXIT_REFUSED
     created = _iso(_now())
     lot_ref = {"lot_id": lot_id, "size": len(adapters), "label": args.label}
     cards: list[CardOutcome] = []
@@ -263,14 +279,17 @@ def _main_lot(adapters, args, gpu_indices: list[int]) -> int:
     summary = lot_summary(lot_id, args.label, created, cards)
     try:
         write_lot(directory, summary, cards)
-    except FileExistsError:
-        print(f"gpucheck: {directory} already contains a lot; choose another --lot-dir", file=sys.stderr)
-        return EXIT_REFUSED
+        write_error = None
+    except OSError as e:
+        write_error = e
     for card in cards:
         if card.result is not None:
             print(render_report(card.result))
     print(render_lot_table(summary))
     print(NOT_COVERED)
+    if write_error is not None:  # nothing saved to upload from
+        print(f"gpucheck: could not write the lot to {directory}: {write_error}", file=sys.stderr)
+        return EXIT_REFUSED
     print(f"Lot written to {directory}")
     if interrupted:  # an interrupted lot is never uploaded
         return EXIT_INTERRUPTED
@@ -340,30 +359,24 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.fake:
             count = gpu_count()
-            try:
-                selected = parse_gpus(args.gpus, count)
-            except ValueError as e:
-                print(f"gpucheck: --gpus: {e}", file=sys.stderr)
-                return EXIT_REFUSED
-            if len(selected) > 1:
-                lot_adapters = _lot_adapters(args, selected)
-            else:
-                index = selected[0]
-                args.gpu_index = index
-                if args.gpus is None and count > 1:
-                    print(f"{count} GPUs detected; testing GPU 0 only. Use --gpus all to test every card.")
+            gpus_spec = args.gpus
         else:
             args.fake_cards = make_fakes(args.fake)  # unknown profile: handled below
-            try:
-                selected = parse_gpus("all" if args.gpus is None else args.gpus, len(args.fake_cards))
-            except ValueError as e:
-                print(f"gpucheck: --gpus: {e}", file=sys.stderr)
-                return EXIT_REFUSED
-            if len(selected) > 1:
-                lot_adapters = _lot_adapters(args, selected)
-            else:
-                args.gpu_index = selected[0]
-        if lot_adapters is None:
+            count = len(args.fake_cards)
+            gpus_spec = "all" if args.gpus is None else args.gpus
+        try:
+            selected = parse_gpus(gpus_spec, count)
+        except ValueError as e:
+            print(f"gpucheck: --gpus: {e}", file=sys.stderr)
+            return EXIT_REFUSED
+        if len(selected) > 1:
+            lot_adapters = _lot_adapters(args, selected)
+        else:
+            args.gpu_index = selected[0]
+            if not args.fake:
+                index = selected[0]
+                if args.gpus is None and count > 1:
+                    print(f"{count} GPUs detected; testing GPU 0 only. Use --gpus all to test every card.")
             adapter = _make_adapter(args)
     except AdapterUnavailable as e:
         print(f"gpucheck: no NVIDIA GPU or driver available ({e}).", file=sys.stderr)

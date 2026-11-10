@@ -45,7 +45,7 @@ def lot_summary(lot_id: str, label: str | None, created_utc: str, cards: list[Ca
         entries.append(
             {
                 "position": c.position,
-                "gpu_index": inv.gpu_index if inv and inv.gpu_index is not None else c.gpu_index,
+                "gpu_index": c.gpu_index,
                 "model_name": inv.model_name if inv else None,
                 "uuid_hash": inv.uuid_hash if inv else None,
                 "serial": inv.serial if inv else None,
@@ -70,7 +70,7 @@ def write_lot(directory: Path, summary: dict, cards: list[CardOutcome]) -> None:
     """Write gpu<position>.json for every card with a result, then lot.json. Never overwrites a lot."""
     directory = Path(directory)
     if (directory / "lot.json").exists():
-        raise FileExistsError(directory / "lot.json")
+        raise FileExistsError(f"{directory / 'lot.json'} already exists")
     directory.mkdir(parents=True, exist_ok=True)
     for c in cards:
         if c.result is not None:

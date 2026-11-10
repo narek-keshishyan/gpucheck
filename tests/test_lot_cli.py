@@ -1,13 +1,18 @@
 import json
 import re
 
+import os
+from dataclasses import replace
+
 import pytest
 
 from gpucheck import cli
+from gpucheck.adapter import AdapterUnavailable
 from gpucheck.cli import main
-from gpucheck.fakes import make_fakes
+from gpucheck.fakes import make_fake, make_fakes
 from gpucheck.report import NOT_COVERED
 from gpucheck.resultjson import run_id
+from gpucheck.run import NullLoad, RunConfig
 
 
 def lot(tmp_path, fake, *flags):
@@ -76,12 +81,42 @@ def test_card_that_cannot_be_read_is_recorded_and_skipped(tmp_path, monkeypatch)
     assert dead["gpu_index"] == 1
 
 
-def test_existing_lot_directory_is_not_overwritten(tmp_path, capsys):
+def _count_runs(monkeypatch):
+    calls = []
+    real = cli.execute_run
+    monkeypatch.setattr(cli, "execute_run", lambda *a, **kw: calls.append(1) or real(*a, **kw))
+    return calls
+
+
+def test_existing_lot_directory_is_not_overwritten(tmp_path, capsys, monkeypatch):
     lot(tmp_path, "healthy,healthy")
     before = (tmp_path / "lot" / "lot.json").read_text()
+    runs = _count_runs(monkeypatch)
     rc, _, _ = lot(tmp_path, "healthy,healthy")
     assert rc == 1 and (tmp_path / "lot" / "lot.json").read_text() == before
     assert "already contains a lot" in capsys.readouterr().err
+    assert runs == []
+
+
+def test_lot_dir_that_is_a_file_is_refused_before_any_card_runs(tmp_path, capsys, monkeypatch):
+    runs = _count_runs(monkeypatch)
+    f = tmp_path / "lot"
+    f.write_text("not a lot")
+    assert main(["--fake", "healthy,healthy", "--offline", "--quick", "--lot-dir", str(f)]) == 1
+    assert "is not a directory" in capsys.readouterr().err and runs == []
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can write anywhere")
+def test_unwritable_lot_dir_is_refused_before_any_card_runs(tmp_path, capsys, monkeypatch):
+    runs = _count_runs(monkeypatch)
+    d = tmp_path / "lot"
+    d.mkdir()
+    d.chmod(0o555)
+    try:
+        assert main(["--fake", "healthy,healthy", "--offline", "--quick", "--lot-dir", str(d)]) == 1
+    finally:
+        d.chmod(0o755)
+    assert "cannot write to" in capsys.readouterr().err and runs == []
 
 
 def test_certify_cannot_be_combined_with_several_cards(capsys):
@@ -94,36 +129,58 @@ def test_label_longer_than_80_is_rejected():
         main(["--fake", "healthy,healthy", "--offline", "--label", "x" * 81])
 
 
-def test_real_path_records_an_adapter_that_cannot_be_created(tmp_path, monkeypatch):
-    from dataclasses import replace
-
-    from gpucheck.adapter import AdapterUnavailable
-    from gpucheck.fakes import make_fake
-    from gpucheck.run import NullLoad, RunConfig
-
+def _real_lot(monkeypatch, count, *, lost=(), reports=lambda index: index):
+    """Stub the real-hardware path; returns the log of adapters, loads and settles made."""
     made = []
 
     def nvml(index=0, include_serial=False):
-        if index == 1:
+        made.append(("adapter", index))
+        if index in lost:
             raise AdapterUnavailable("NVML unavailable: GPU is lost")
         card = make_fake("healthy")
-        card._inventory = replace(card._inventory, gpu_index=index)
+        card._inventory = replace(card._inventory, gpu_index=reports(index))
         return card
 
-    monkeypatch.setattr(cli, "gpu_count", lambda: 3)
+    monkeypatch.setattr(cli, "gpu_count", lambda: count)
     monkeypatch.setattr(cli, "NvmlAdapter", nvml)
     monkeypatch.setattr(cli, "_make_load",
                         lambda args, challenge=None, device_index=0: made.append(("load", device_index)) or NullLoad())
     monkeypatch.setattr(cli, "_config", lambda args: RunConfig(baseline_s=2, load_s=2, hz=1000.0))
     monkeypatch.setattr(cli, "settle", lambda adapter, **kw: made.append("settle") or 12.0)
+    return made
+
+
+def test_real_path_pins_each_card_to_its_selected_index(tmp_path, monkeypatch):
+    made = _real_lot(monkeypatch, 3)
+    d = tmp_path / "lot"
+    assert main(["--gpus", "0,2", "--offline", "--lot-dir", str(d)]) == 0
+    assert [m for m in made if m[0] == "adapter"] == [("adapter", 0), ("adapter", 2)]
+    assert [m for m in made if m[0] == "load"] == [("load", 0), ("load", 2)]
+    s = json.loads((d / "lot.json").read_text())
+    assert [c["position"] for c in s["cards"]] == [0, 1] and [c["gpu_index"] for c in s["cards"]] == [0, 2]
+    assert json.loads((d / "gpu1.json").read_text())["timing"]["settle_s"] == 12.0
+
+
+def test_real_path_records_an_adapter_that_cannot_be_created(tmp_path, monkeypatch):
+    made = _real_lot(monkeypatch, 3, lost={1})
     d = tmp_path / "lot"
     rc = main(["--gpus", "all", "--offline", "--lot-dir", str(d)])
     s = json.loads((d / "lot.json").read_text())
     assert rc == 3
     assert [c["outcome"] for c in s["cards"]] == ["tested", "not_tested", "tested"]
-    assert "GPU is lost" in s["cards"][1]["reason"] and s["cards"][1]["uuid_hash"] is None
-    assert made == [("load", 0), "settle", ("load", 2)]
-    assert json.loads((d / "gpu2.json").read_text())["timing"]["settle_s"] == 12.0
+    lost = s["cards"][1]
+    assert "GPU is lost" in lost["reason"] and lost["uuid_hash"] is None and lost["gpu_index"] == 1
+    assert [m for m in made if m[0] != "adapter"] == [("load", 0), "settle", ("load", 2)]
+
+
+def test_real_path_card_reporting_another_index_is_not_loaded(tmp_path, monkeypatch):
+    made = _real_lot(monkeypatch, 2, reports=lambda index: {0: 0, 1: 0}[index])
+    d = tmp_path / "lot"
+    assert main(["--gpus", "all", "--offline", "--lot-dir", str(d)]) == 3
+    s = json.loads((d / "lot.json").read_text())
+    assert s["cards"][1]["outcome"] == "not_tested"
+    assert s["cards"][1]["reason"] == "card index mismatch: selected 1, adapter reports 0"
+    assert [m for m in made if m[0] == "load"] == [("load", 0)]
 
 
 def _execute_run_failing_on_second_call(monkeypatch, exc):
@@ -157,3 +214,14 @@ def test_ctrl_c_keeps_the_cards_already_tested(tmp_path, monkeypatch, capsys):
     assert [c["gpu_index"] for c in s["cards"]] == [0, 1, 2]
     assert (d / "gpu0.json").exists() and not (d / "gpu1.json").exists()
     assert "Lot summary" in capsys.readouterr().out
+
+
+def test_lot_that_cannot_be_saved_still_prints_and_exits_1(tmp_path, capsys, monkeypatch):
+    def full(directory, summary, cards):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(cli, "write_lot", full)
+    rc, _, _ = lot(tmp_path, "healthy,healthy")
+    c = capsys.readouterr()
+    assert rc == 1 and "Lot summary" in c.out and "Lot written" not in c.out
+    assert "could not write the lot to" in c.err and "No space left on device" in c.err
