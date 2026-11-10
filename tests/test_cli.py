@@ -266,3 +266,44 @@ def test_empty_cuda_visible_devices_is_not_refused(monkeypatch, tmp_path):
     _real_path(monkeypatch, 4)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     assert main(["--gpus", "1", "--offline", "--json", str(tmp_path / "r.json")]) == 0
+
+
+def test_report_shows_lifetime_memory_error_counts():
+    from gpucheck.report import render_report
+
+    known = render_report({"inventory": {"ecc_aggregate_corrected": 7, "ecc_aggregate_uncorrected": 0}})
+    lines = [line.split() for line in known.splitlines()]
+    assert ["Lifetime", "ECC", "errors", "(corrected):", "7"] in lines
+    assert ["Lifetime", "ECC", "errors", "(uncorrected):", "0"] in lines
+    unknown = [line.split() for line in render_report({"inventory": {}}).splitlines()]
+    assert ["Lifetime", "ECC", "errors", "(corrected):", "n/a"] in unknown
+    assert ["Lifetime", "ECC", "errors", "(uncorrected):", "n/a"] in unknown
+
+
+def test_description_says_what_the_tool_does():
+    assert cli._parser().description == "Stress-test an NVIDIA GPU and report what was observed"
+
+
+class _LoadThatCannotStart(NullLoad):
+    def start(self):
+        from gpucheck.load import LoadUnavailable
+
+        raise LoadUnavailable("CUDA probe failed: out of memory")
+
+
+def test_load_that_fails_to_start_is_named_for_a_plain_run(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "_make_load", lambda args, challenge=None, device_index=0: _LoadThatCannotStart())
+    rc = main(["--fake", "healthy", "--offline", "--quick", "--json", str(tmp_path / "r.json")])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert err.strip() == "gpucheck: the GPU load generator failed to start (CUDA probe failed: out of memory)."
+
+
+def test_load_that_fails_to_start_under_certify_names_certification(monkeypatch, tmp_path, capsys):
+    challenge = {"challenge_id": "c", "nonce": "n", "workload": {"gemm_n_offsets": [0], "order_seed": 1}}
+    monkeypatch.setattr(cli, "fetch_challenge", lambda server: challenge)
+    monkeypatch.setattr(cli, "_make_load", lambda args, challenge=None, device_index=0: _LoadThatCannotStart())
+    rc = main(["--fake", "healthy", "--certify", "--json", str(tmp_path / "r.json")])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert err.strip() == "gpucheck: certification requires the GPU load generator (CUDA probe failed: out of memory)."

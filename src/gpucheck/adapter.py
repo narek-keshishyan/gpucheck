@@ -86,6 +86,16 @@ def clean_serial(raw: object) -> str | None:
     return text[:_MAX_TEXT]
 
 
+def _int(value: object) -> int | None:
+    """An NVML count as an int; None when it is missing or cannot be converted."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _try(fn, *args):
     """Call an NVML query; None if the GPU does not support it."""
     try:
@@ -194,7 +204,7 @@ class NvmlAdapter(TelemetryAdapter):
                 ("width_max", "nvmlDeviceGetMaxPcieLinkWidth"),
             )
         }
-        link = {k: int(v) if v is not None else None for k, v in link.items()}
+        link = {k: _int(v) for k, v in link.items()}
         return GpuInventory(
             model_name=_text(nv.nvmlDeviceGetName(h)),
             uuid_hash=hash_uuid(uuid),
@@ -215,8 +225,8 @@ class NvmlAdapter(TelemetryAdapter):
             pcie_gen_max=link["gen_max"],
             pcie_width_current=link["width_cur"],
             pcie_width_max=link["width_max"],
-            ecc_aggregate_corrected=int(ecc_corrected) if ecc_corrected is not None else None,
-            ecc_aggregate_uncorrected=int(ecc_uncorrected) if ecc_uncorrected is not None else None,
+            ecc_aggregate_corrected=_int(ecc_corrected),
+            ecc_aggregate_uncorrected=_int(ecc_uncorrected),
             serial=serial,
         )
 

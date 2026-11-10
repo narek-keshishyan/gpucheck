@@ -1,5 +1,7 @@
 from dataclasses import replace
 
+import pytest
+
 from gpucheck.adapter import GpuInventory
 from gpucheck.diagnose import Finding, diagnose
 from gpucheck.metrics import Metrics
@@ -399,7 +401,7 @@ def test_pcie_link_degraded_on_narrow_width():
     f = find(diagnose(healthy(), PF, _pcie(4, 4, 8, 16), SPEC), "PCIE_LINK_DEGRADED")
     assert f.severity == "info" and f.confidence == "high"
     assert f.message == (
-        "PCIe link is running at gen 4 x8; the card supports gen 4 x16. Check seating, riser "
+        "PCIe link is running at gen 4 x8; the card and slot support gen 4 x16. Check seating, riser "
         "and slot. A lower generation at idle can be normal power saving."
     )
 
@@ -412,3 +414,26 @@ def test_pcie_link_full_or_unknown_is_silent():
     assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, _pcie(4, 4, 16, 16), SPEC))
     assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, _pcie(None, 4, 8, 16), SPEC))
     assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, inv(), SPEC))
+
+
+def test_lifetime_uncorrected_errors_are_memory_errors():
+    card = replace(inv(), ecc_aggregate_corrected=0, ecc_aggregate_uncorrected=2)
+    f = find(diagnose(healthy(), PF, card, SPEC), "MEMORY_ERRORS")
+    assert f.message == (
+        "2 uncorrected memory error(s) recorded over the card's lifetime. The card has recorded memory errors."
+    )
+    both = replace(card, remapped_rows=1)
+    assert find(diagnose(healthy(), PF, both, SPEC), "MEMORY_ERRORS").message.startswith(
+        "1 memory row(s) were remapped and 2 uncorrected memory error(s) recorded over the card's lifetime."
+    )
+
+
+def test_lifetime_corrected_errors_alone_are_not_a_finding():
+    card = replace(inv(), ecc_aggregate_corrected=5000, ecc_aggregate_uncorrected=0)
+    assert "MEMORY_ERRORS" not in codes(diagnose(healthy(), PF, card, SPEC))
+
+
+@pytest.mark.parametrize("field", ["ecc_aggregate_corrected", "ecc_aggregate_uncorrected"])
+def test_memory_not_checked_absent_when_a_lifetime_count_is_known(field):
+    m = healthy(ecc_delta=None, telemetry_gaps=["ecc_volatile"])
+    assert "MEMORY_NOT_CHECKED" not in codes(diagnose(m, PF, _bare(**{field: 0}), SPEC))

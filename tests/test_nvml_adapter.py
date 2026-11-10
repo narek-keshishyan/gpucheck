@@ -226,3 +226,15 @@ def test_manifest_unknown_when_unsupported(monkeypatch):
 ])
 def test_clean_serial(raw, expected):
     assert clean_serial(raw) == expected
+
+
+def test_non_numeric_link_and_ecc_values_are_unknown(monkeypatch):
+    nv = _with_manifest(modern())
+    nv.nvmlDeviceGetCurrPcieLinkWidth = lambda h: "x16"
+    nv.nvmlDeviceGetMaxPcieLinkGeneration = lambda h: object()
+    nv.nvmlDeviceGetTotalEccErrors = lambda h, kind, counter: "N/A"
+    monkeypatch.setitem(sys.modules, "pynvml", nv)
+    inv = NvmlAdapter().inventory()
+    assert inv.pcie_width_current is None and inv.pcie_gen_max is None
+    assert (inv.pcie_gen_current, inv.pcie_width_max) == (4, 16)
+    assert inv.ecc_aggregate_corrected is None and inv.ecc_aggregate_uncorrected is None

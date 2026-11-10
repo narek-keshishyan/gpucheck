@@ -263,6 +263,8 @@ def parse_gpus(spec: str | None, count: int) -> list[int]:
                 raise ValueError(f"expected 'all' or comma-separated GPU indices, got {spec!r}")
             i = int(part)
             if i >= count:
+                if count < 1:
+                    raise ValueError(f"GPU {i} does not exist; this machine reports no GPUs")
                 raise ValueError(f"GPU {i} does not exist; this machine has {count} (indices 0-{count - 1})")
             indices.append(i)
         indices = sorted(set(indices))

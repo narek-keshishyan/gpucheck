@@ -65,3 +65,8 @@ def test_settle_survives_a_failing_sample():
             raise RuntimeError("fell off the bus")
 
     assert settle(Dead(), sleep=lambda s: None) == 0.0
+
+
+def test_parse_gpus_on_a_machine_without_gpus_says_so():
+    with pytest.raises(ValueError, match="^GPU 0 does not exist; this machine reports no GPUs$"):
+        parse_gpus("0", 0)

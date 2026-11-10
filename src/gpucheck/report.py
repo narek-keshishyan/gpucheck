@@ -79,10 +79,12 @@ def render_report(result: dict) -> str:
         ("Remapped rows", inv.get("remapped_rows")),
         ("VBIOS", inv.get("vbios_version")),
         ("PCIe link", _pcie_link(inv)),
+        ("Lifetime ECC errors (corrected)", inv.get("ecc_aggregate_corrected")),
+        ("Lifetime ECC errors (uncorrected)", inv.get("ecc_aggregate_uncorrected")),
     ]
     if inv.get("serial"):
         rows.append(("Serial", inv["serial"]))
-    out += [f"  {k + ':':<22}{'n/a' if v is None else v}" for k, v in rows]
+    out += [f"  {k + ':':<36}{'n/a' if v is None else v}" for k, v in rows]
     for reason in pre.get("reasons") or []:
         out.append(f"  preflight: {reason}")
     out.append("")

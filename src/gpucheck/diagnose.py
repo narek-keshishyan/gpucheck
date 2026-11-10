@@ -55,6 +55,8 @@ def _memory_errors(m: Metrics, inv: GpuInventory) -> Finding | None:
         parts.append(f"{inv.remapped_rows} memory row(s) were remapped")
     if inv.row_remap_failure:
         parts.append("memory row remapping has failed")
+    if inv.ecc_aggregate_uncorrected is not None and inv.ecc_aggregate_uncorrected > 0:
+        parts.append(f"{inv.ecc_aggregate_uncorrected} uncorrected memory error(s) recorded over the card's lifetime")
     if not parts:
         return None
     sentence = " and ".join(parts)
@@ -70,7 +72,8 @@ def _memory_not_checked(m: Metrics, inv: GpuInventory) -> Finding | None:
     """Say so when the card exposes no memory-error counters at all."""
     if "ecc_volatile" not in m.telemetry_gaps:
         return None
-    if inv.remapped_rows is not None or inv.retired_pages is not None:
+    known = (inv.remapped_rows, inv.retired_pages, inv.ecc_aggregate_corrected, inv.ecc_aggregate_uncorrected)
+    if any(v is not None for v in known):
         return None
     if _memory_errors(m, inv) is not None:
         return None
@@ -93,7 +96,7 @@ def _pcie_link(inv: GpuInventory) -> Finding | None:
         "PCIE_LINK_DEGRADED",
         "info",
         "high",
-        f"PCIe link is running at gen {gc} x{wc}; the card supports gen {gm} x{wm}. "
+        f"PCIe link is running at gen {gc} x{wc}; the card and slot support gen {gm} x{wm}. "
         "Check seating, riser and slot. A lower generation at idle can be normal power saving.",
     )
 
@@ -219,7 +222,7 @@ def diagnose(
     inventory: GpuInventory,
     spec: GpuSpec | None,
 ) -> list[Finding]:
-    """Return the findings for one card, in fixed rule order; empty means healthy."""
+    """Return the findings for one card, in fixed rule order; empty means no findings."""
     del preflight  # the v1 rule table does not consult preflight
     tim = _hot_under_load(metrics, spec)
     insufficient = _insufficient_evidence(metrics, spec)

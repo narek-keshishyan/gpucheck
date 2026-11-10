@@ -63,7 +63,7 @@ NO_TOKENS_NOTE = "The server returned no delete tokens: this was already uploade
 
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="gpucheck", description="GPU health report card")
+    p = argparse.ArgumentParser(prog="gpucheck", description="Stress-test an NVIDIA GPU and report what was observed")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--quick", action="store_true", help="shorter run (30s baseline, 150s load)")
     g.add_argument("--long", action="store_true", help="longer run (60s baseline, 1800s load)")
@@ -608,7 +608,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         spec, load, run = _execute(adapter, args, challenge, device_index=index)
     except LoadUnavailable as e:
-        print(f"gpucheck: certification requires the GPU load generator ({e}).", file=sys.stderr)
+        if args.certify:
+            print(f"gpucheck: certification requires the GPU load generator ({e}).", file=sys.stderr)
+        else:
+            print(f"gpucheck: the GPU load generator failed to start ({e}).", file=sys.stderr)
         return EXIT_REFUSED
     except AdapterUnavailable as e:
         print(f"gpucheck: no NVIDIA GPU or driver available ({e}).", file=sys.stderr)
