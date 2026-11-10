@@ -2,7 +2,7 @@
 
 Rules are evaluated in a fixed order (MEMORY_ERRORS, MEMORY_NOT_CHECKED, HOT_UNDER_LOAD,
 HOT_ENVIRONMENT, THERMAL_THROTTLING, POWER_CAPPED, UNDERPERFORMING_UNKNOWN,
-INSUFFICIENT_EVIDENCE) and each rule fires at most once. Unknown throttle data
+INSUFFICIENT_EVIDENCE, PCIE_LINK_DEGRADED) and each rule fires at most once. Unknown throttle data
 ("throttle_reasons" in telemetry_gaps) is treated as unknown, never as "none". A rule whose required inputs are None does
 not fire. Rules that compare against the datasheet need `spec`; they are
 skipped when it is None.
@@ -79,6 +79,22 @@ def _memory_not_checked(m: Metrics, inv: GpuInventory) -> Finding | None:
         "info",
         "high",
         "This card exposes no memory-error counters, so memory health was not checked.",
+    )
+
+
+def _pcie_link(inv: GpuInventory) -> Finding | None:
+    vals = (inv.pcie_gen_current, inv.pcie_gen_max, inv.pcie_width_current, inv.pcie_width_max)
+    if any(v is None for v in vals):
+        return None
+    gc, gm, wc, wm = vals
+    if wc >= wm and gc >= gm:
+        return None
+    return Finding(
+        "PCIE_LINK_DEGRADED",
+        "info",
+        "high",
+        f"PCIe link is running at gen {gc} x{wc}; the card supports gen {gm} x{wm}. "
+        "Check seating, riser and slot. A lower generation at idle can be normal power saving.",
     )
 
 
@@ -217,5 +233,6 @@ def diagnose(
         _power_capped(metrics, inventory, spec),
         _underperforming(metrics, spec),
         insufficient,
+        _pcie_link(inventory),
     )
     return [f for f in rules if f is not None]

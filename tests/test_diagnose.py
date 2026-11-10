@@ -389,3 +389,26 @@ def test_memory_errors_wins_over_not_checked():
     failed = replace(_bare(), row_remap_failure=True)
     found = codes(diagnose(m, PF, failed, SPEC))
     assert "MEMORY_ERRORS" in found and "MEMORY_NOT_CHECKED" not in found
+
+
+def _pcie(gc, gm, wc, wm):
+    return replace(inv(), pcie_gen_current=gc, pcie_gen_max=gm, pcie_width_current=wc, pcie_width_max=wm)
+
+
+def test_pcie_link_degraded_on_narrow_width():
+    f = find(diagnose(healthy(), PF, _pcie(4, 4, 8, 16), SPEC), "PCIE_LINK_DEGRADED")
+    assert f.severity == "info" and f.confidence == "high"
+    assert f.message == (
+        "PCIe link is running at gen 4 x8; the card supports gen 4 x16. Check seating, riser "
+        "and slot. A lower generation at idle can be normal power saving."
+    )
+
+
+def test_pcie_link_degraded_on_lower_generation():
+    assert "PCIE_LINK_DEGRADED" in codes(diagnose(healthy(), PF, _pcie(3, 4, 16, 16), SPEC))
+
+
+def test_pcie_link_full_or_unknown_is_silent():
+    assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, _pcie(4, 4, 16, 16), SPEC))
+    assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, _pcie(None, 4, 8, 16), SPEC))
+    assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, inv(), SPEC))
