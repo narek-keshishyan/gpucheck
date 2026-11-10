@@ -200,6 +200,7 @@ def test_symlinked_card_file_is_refused(server, tmp_path, capsys):
     lambda s: s.__setitem__("size", "2"),
     lambda s: s["cards"][0].pop("outcome"),
     lambda s: s["cards"].append("x"),
+    lambda s: s.__setitem__("finished", "no"),
 ])
 def test_damaged_lot_json_is_refused_clearly(server, tmp_path, capsys, damage):
     d = _offline_lot(tmp_path)
@@ -220,3 +221,47 @@ def test_failed_run_upload_then_upload_saved_records_tokens(server, tmp_path):
     assert main(["--upload-saved", str(d), "--server", server["url"]]) == 0
     runs = json.loads((d / "lot.json").read_text())["uploaded"]["runs"]
     assert runs[0]["delete_token"] == "tok0"
+
+
+class _Killed(BaseException):
+    pass
+
+
+def test_killed_lot_can_be_uploaded_with_the_cards_it_reached(server, tmp_path, monkeypatch, capsys):
+    real = cli.execute_run
+    calls = []
+
+    def dies_on_second_card(*a, **kw):
+        calls.append(1)
+        if len(calls) == 2:
+            raise _Killed()
+        return real(*a, **kw)
+
+    monkeypatch.setattr(cli, "execute_run", dies_on_second_card)
+    d = tmp_path / "lot"
+    with pytest.raises(_Killed):
+        main(["--fake", "healthy,healthy,healthy", "--offline", "--quick", "--lot-dir", str(d)])
+    capsys.readouterr()
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 0
+    body = json.loads(server["requests"][0][2])
+    assert [r["lot"]["position"] for r in body["results"]] == [0]
+    assert [u["position"] for u in body["untested"]] == [1, 2] and body["lot"]["size"] == 3
+    assert "finished" not in body["lot"]
+    out = capsys.readouterr().out
+    assert "note: this lot did not finish; cards that were not reached are recorded as not tested" in out
+    assert sorted(p.name for p in d.iterdir()) == ["gpu0.json", "lot.json"]
+
+
+def test_lot_json_without_finished_is_a_finished_lot(server, tmp_path, capsys):
+    d = _offline_lot(tmp_path)
+    _edit_lot(d, lambda s: s.pop("finished"))
+    capsys.readouterr()
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 0
+    assert "did not finish" not in capsys.readouterr().out
+
+
+def test_finished_lot_has_no_note(server, tmp_path, capsys):
+    d = _offline_lot(tmp_path)
+    capsys.readouterr()
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 0
+    assert "did not finish" not in capsys.readouterr().out

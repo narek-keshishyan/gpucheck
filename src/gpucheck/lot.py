@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
 import secrets
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -41,7 +44,10 @@ def _card_file(position: int) -> str:
     return f"gpu{position}.json"
 
 
-def lot_summary(lot_id: str, label: str | None, created_utc: str, cards: list[CardOutcome]) -> dict:
+def lot_summary(
+    lot_id: str, label: str | None, created_utc: str, cards: list[CardOutcome], *, finished: bool = True
+) -> dict:
+    """lot.json's content. `finished` is False while the lot is still running (or was killed)."""
     entries = []
     for c in cards:
         inv = c.inventory
@@ -66,19 +72,35 @@ def lot_summary(lot_id: str, label: str | None, created_utc: str, cards: list[Ca
         "created_utc": created_utc,
         "cards": entries,
         "uploaded": None,
+        "finished": finished,
     }
 
 
-def write_lot(directory: Path, summary: dict, cards: list[CardOutcome]) -> None:
-    """Write gpu<position>.json for every card with a result, then lot.json. Never overwrites a lot."""
-    directory = Path(directory)
-    if (directory / "lot.json").exists():
-        raise FileExistsError(f"{directory / 'lot.json'} already exists")
-    directory.mkdir(parents=True, exist_ok=True)
-    for c in cards:
-        if c.result is not None:
-            (directory / _card_file(c.position)).write_text(canonical_dumps(c.result))
-    (directory / "lot.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+def _write_atomic(path: Path, text: str) -> None:
+    """Write via a temporary file in the same directory and an atomic rename, so a crash
+    or kill leaves either the old file or the new one, never a partial one."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def write_card(directory: Path, card: CardOutcome) -> None:
+    """Write gpu<position>.json for a card that has a result."""
+    if card.result is not None:
+        _write_atomic(Path(directory) / _card_file(card.position), canonical_dumps(card.result))
+
+
+def write_summary(directory: Path, summary: dict) -> None:
+    """Write (or rewrite) this run's own lot.json. The caller refuses an existing lot before the run."""
+    _write_atomic(Path(directory) / "lot.json", json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
 
 def untested_entries(summary: dict) -> list[dict]:
@@ -115,6 +137,8 @@ def read_lot(directory: Path) -> tuple[dict, list[dict]]:
         raise invalid
     if type(summary.get("size")) is not int:
         raise invalid
+    if not isinstance(summary.get("finished", True), bool):  # absent (older lots): finished
+        raise invalid
     cards = summary["cards"]
     if not all(
         isinstance(c, dict) and type(c.get("position")) is int and isinstance(c.get("outcome"), str)
@@ -144,7 +168,7 @@ def read_lot(directory: Path) -> tuple[dict, list[dict]]:
 
 
 def mark_uploaded(directory: Path, server: str, outcome) -> None:
-    """Record a successful lot upload in lot.json (format as write_lot writes it).
+    """Record a successful lot upload in lot.json (format as write_summary writes it).
 
     A retry of an upload the server already holds returns no delete tokens; the ones recorded earlier are kept."""
     path = Path(directory) / "lot.json"
@@ -169,7 +193,12 @@ def mark_uploaded(directory: Path, server: str, outcome) -> None:
         "url": outcome.url,
         "runs": sorted(record.values(), key=lambda e: (e.get("position") is None, e.get("position") or 0)),
     }
-    path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    write_summary(directory, summary)
+
+
+def lot_finished(summary: dict) -> bool:
+    """False only for a lot.json written while its run was still going (a killed run)."""
+    return summary.get("finished", True) is not False
 
 
 def _same_server(a, b) -> bool:

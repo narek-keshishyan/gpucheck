@@ -135,5 +135,10 @@ class TorchGemmLoad:
         return tflops(n, iters, elapsed) if iters else None
 
     def stop(self) -> None:
-        self._a = self._b = self._c = None
-        self._torch.cuda.empty_cache()
+        """Release the buffers. Never raises: it runs in a finally, and empty_cache() sweeps every
+        device, so after a fatal CUDA error on one card it can fail on every later card."""
+        try:
+            self._a = self._b = self._c = None
+            self._torch.cuda.empty_cache()
+        except Exception:
+            pass

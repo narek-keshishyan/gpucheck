@@ -259,3 +259,14 @@ def test_device_order_is_set_silently_when_unset_or_already_right(monkeypatch, c
     assert os.environ["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
     c = capsys.readouterr()
     assert c.out + c.err == ""
+
+
+def test_stop_never_raises_even_when_empty_cache_does(monkeypatch):
+    # After a fatal CUDA error on one card, empty_cache() (which sweeps every device)
+    # can raise during every later card's cleanup; that must not replace a finished run.
+    def broken():
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    cuda = types.SimpleNamespace(is_available=lambda: True, empty_cache=broken)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+    TorchGemmLoad().stop()

@@ -151,5 +151,8 @@ def execute_run(
         load.start()
         aborted = phase(round(config.load_s * config.hz), loaded, _Watchdog(spec), tick=True)
     finally:
-        load.stop()
+        try:
+            load.stop()
+        except Exception:  # a failed cleanup must not replace the samples already taken
+            pass
     return result(aborted)

@@ -27,6 +27,7 @@ def test_lot_writes_per_card_results_and_a_summary(tmp_path, capsys):
     assert rc == 0
     assert re.fullmatch(r"[0-9a-f]{32}", s["lot_id"])
     assert s["label"] == "Rack 4 / chassis 2" and s["size"] == 2 and s["uploaded"] is None
+    assert s["finished"] is True
     assert [c["outcome"] for c in s["cards"]] == ["tested", "tested"]
     assert [c["file"] for c in s["cards"]] == ["gpu0.json", "gpu1.json"]
     r0, r1 = (json.loads((d / f).read_text()) for f in ("gpu0.json", "gpu1.json"))
@@ -205,17 +206,86 @@ def test_ctrl_c_keeps_the_cards_already_tested(tmp_path, monkeypatch, capsys):
     assert [c["gpu_index"] for c in s["cards"]] == [0, 1, 2]
     assert (d / "gpu0.json").exists() and not (d / "gpu1.json").exists()
     assert "Lot summary" in capsys.readouterr().out
+    assert s["finished"] is True and sorted(p.name for p in d.iterdir()) == ["gpu0.json", "lot.json"]
 
 
 def test_lot_that_cannot_be_saved_still_prints_and_exits_1(tmp_path, capsys, monkeypatch):
-    def full(directory, summary, cards):
+    def full(directory, summary):
         raise OSError("No space left on device")
 
-    monkeypatch.setattr(cli, "write_lot", full)
-    rc, _, _ = lot(tmp_path, "healthy,healthy")
+    monkeypatch.setattr(cli, "write_summary", full)
+    rc, d, _ = lot(tmp_path, "healthy,healthy")
     c = capsys.readouterr()
     assert rc == 1 and "Lot summary" in c.out and "Lot written" not in c.out
     assert "could not write the lot to" in c.err and "No space left on device" in c.err
+    assert f"warning: could not save GPU 0 to {d}: No space left on device" in c.err
+
+
+NOT_REACHED = "not reached: the run stopped before this card"
+
+
+def _files(d):
+    return sorted(p.name for p in d.iterdir())
+
+
+def test_each_card_reaches_disk_before_the_next_one_runs(tmp_path, monkeypatch):
+    d = tmp_path / "lot"
+    real = cli.execute_run
+    seen = []
+
+    def spy(*a, **kw):
+        if seen == [None]:  # the second card is about to run
+            seen.append((_files(d), json.loads((d / "lot.json").read_text())))
+        else:
+            seen.append(None)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(cli, "execute_run", spy)
+    rc, _, final = lot(tmp_path, "healthy,healthy,healthy")
+    files, mid = seen[1]
+    assert files == ["gpu0.json", "lot.json"]
+    assert mid["finished"] is False and mid["size"] == 3
+    assert [c["outcome"] for c in mid["cards"]] == ["tested", "not_tested", "not_tested"]
+    assert [c["reason"] for c in mid["cards"]] == [None, NOT_REACHED, NOT_REACHED]
+    assert [c["gpu_index"] for c in mid["cards"]] == [0, 1, 2]
+    assert mid["cards"][0]["file"] == "gpu0.json" and mid["cards"][0]["run_id"]
+    assert rc == 0 and final["finished"] is True
+    assert [c["outcome"] for c in final["cards"]] == ["tested"] * 3
+    assert _files(d) == ["gpu0.json", "gpu1.json", "gpu2.json", "lot.json"]
+
+
+class _Killed(BaseException):
+    """Stands in for the process dying mid-card (a signal, a crash)."""
+
+
+def test_killed_lot_leaves_the_finished_cards_on_disk(tmp_path, monkeypatch):
+    _execute_run_failing_on_second_call(monkeypatch, _Killed())
+    d = tmp_path / "lot"
+    with pytest.raises(_Killed):
+        main(["--fake", "healthy,healthy,healthy", "--offline", "--quick", "--lot-dir", str(d)])
+    s = json.loads((d / "lot.json").read_text())
+    assert _files(d) == ["gpu0.json", "lot.json"]
+    assert s["finished"] is False
+    assert [c["reason"] for c in s["cards"][1:]] == [NOT_REACHED, NOT_REACHED]
+
+
+def test_a_card_that_could_not_be_saved_is_saved_at_the_end(tmp_path, monkeypatch, capsys):
+    real = cli.write_card
+    calls = []
+
+    def flaky(directory, card):
+        calls.append(card.position)
+        if len(calls) == 1:
+            raise OSError("No space left on device")
+        return real(directory, card)
+
+    monkeypatch.setattr(cli, "write_card", flaky)
+    rc, d, s = lot(tmp_path, "healthy,healthy")
+    err = capsys.readouterr().err
+    assert f"warning: could not save GPU 0 to {d}: No space left on device" in err
+    assert rc == 0 and s["finished"] is True
+    assert [c["file"] for c in s["cards"]] == ["gpu0.json", "gpu1.json"]
+    assert _files(d) == ["gpu0.json", "gpu1.json", "lot.json"]
 
 
 LOAD_REFUSAL = (
@@ -250,3 +320,26 @@ def test_real_path_single_card_without_a_load_generator_still_runs(tmp_path, mon
     _no_torch(monkeypatch)
     assert main(["--gpus", "1", "--offline", "--json", str(tmp_path / "r.json")]) == 0
     assert "no torch/CUDA — running without load" in capsys.readouterr().err
+
+
+def test_a_load_whose_cleanup_fails_does_not_lose_the_cards(tmp_path, monkeypatch):
+    class BadStop(NullLoad):
+        def stop(self):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    monkeypatch.setattr(cli, "_make_load", lambda args, challenge=None, device_index=0: BadStop())
+    rc, _, s = lot(tmp_path, "healthy,healthy")
+    assert rc == 0 and [c["outcome"] for c in s["cards"]] == ["tested", "tested"]
+
+
+def test_a_long_multi_line_error_becomes_a_short_one_line_reason(tmp_path, monkeypatch):
+    class Dead:
+        def inventory(self):
+            raise RuntimeError(("line of driver output\n\t  " * 60)[:1000])
+
+    good = make_fakes("healthy")
+    monkeypatch.setattr(cli, "make_fakes", lambda spec: [good[0], Dead()])
+    _, _, s = lot(tmp_path, "healthy,healthy")
+    reason = s["cards"][1]["reason"]
+    assert reason.startswith("could not read the card: line of driver output line of")
+    assert len(reason) <= 300 and "\n" not in reason and "\t" not in reason and "  " not in reason

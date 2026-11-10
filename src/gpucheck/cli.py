@@ -30,8 +30,10 @@ from .lot import (
     previous_upload_with_tokens,
     read_lot,
     render_lot_table,
+    lot_finished,
     settle,
-    write_lot,
+    write_card,
+    write_summary,
 )
 from .load import LoadUnavailable, TorchGemmLoad
 from .metrics import derive
@@ -47,6 +49,7 @@ EXIT_OK, EXIT_REFUSED, EXIT_NO_GPU, EXIT_ABORTED = 0, 1, 2, 3
 EXIT_INTERRUPTED = 130
 
 INTERRUPTED = "interrupted"
+NOT_REACHED = "not reached: the run stopped before this card"
 ACCOUNT_NOTE = "Account uploads cannot be self-deleted."
 
 
@@ -189,6 +192,14 @@ def _execute(adapter, args, challenge=None, device_index: int = 0):
     return spec, load, execute_run(adapter, load, _config(args), spec, **_timer(args))
 
 
+MAX_REASON_LEN = 300
+
+
+def _one_line(text: str) -> str:
+    """An exception's text as a card reason: whitespace runs collapsed, at most 300 characters."""
+    return " ".join(text.split())[:MAX_REASON_LEN]
+
+
 class _Unreachable:
     """Stands in for a card whose adapter could not be created, so the lot records it and moves on."""
 
@@ -232,7 +243,7 @@ def _run_card(
     try:
         inventory = adapter.inventory()
     except Exception as e:
-        return outcome(None, NOT_TESTED, f"could not read the card: {e}")
+        return outcome(None, NOT_TESTED, _one_line(f"could not read the card: {e}"))
     timer = _timer(args)
     started = _now()
     try:
@@ -243,7 +254,7 @@ def _run_card(
     except KeyboardInterrupt:
         raise _CardInterrupted(outcome(inventory, NOT_TESTED, INTERRUPTED)) from None
     except Exception as e:  # one card's failure must not lose the rest of the lot
-        return outcome(inventory, NOT_TESTED, f"run failed: {type(e).__name__}: {e}")
+        return outcome(inventory, NOT_TESTED, _one_line(f"run failed: {type(e).__name__}: {e}"))
     ended = _now()
     if run.aborted == "preflight_refused":
         return outcome(run.inventory, NOT_TESTED, "; ".join(run.preflight.reasons))
@@ -282,6 +293,18 @@ def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None
     created = _iso(_now())
     lot_ref = {"lot_id": lot_id, "size": len(adapters), "label": args.label}
     cards: list[CardOutcome] = []
+    saved: set[int] = set()  # positions whose gpu<position>.json is on disk
+
+    def save(finished: bool, rest_reason: str) -> None:
+        """Write the card files not yet on disk, then lot.json; positions not reached get rest_reason."""
+        rest = [CardOutcome(p, gpu_indices[p], None, NOT_TESTED, rest_reason, None)
+                for p in range(len(cards), len(adapters))]
+        for card in cards:
+            if card.result is not None and card.position not in saved:
+                write_card(directory, card)
+                saved.add(card.position)
+        write_summary(directory, lot_summary(lot_id, args.label, created, cards + rest, finished=finished))
+
     interrupted = False
     for pos, adapter in enumerate(adapters):
         try:
@@ -289,10 +312,14 @@ def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None
                 adapter, args, position=pos, gpu_index=gpu_indices[pos],
                 lot={**lot_ref, "position": pos}, settle_first=pos > 0,
             ))
+            try:  # so a dropped session or a kill later in the lot keeps this card
+                save(False, NOT_REACHED)
+            except OSError as e:  # retried at the end; the result stays in memory
+                print(f"warning: could not save GPU {pos} to {directory}: {e}", file=sys.stderr)
         except _CardInterrupted as stop:
             cards.append(stop.outcome)
             interrupted = True
-        except KeyboardInterrupt:  # between cards or while reading the inventory
+        except KeyboardInterrupt:  # between cards, while reading the inventory, or while saving
             interrupted = True
         if interrupted:
             break
@@ -300,7 +327,7 @@ def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None
         cards.append(CardOutcome(pos, gpu_indices[pos], None, NOT_TESTED, INTERRUPTED, None))
     summary = lot_summary(lot_id, args.label, created, cards)
     try:
-        write_lot(directory, summary, cards)
+        save(True, INTERRUPTED)
         write_error = None
     except OSError as e:
         write_error = e
@@ -437,6 +464,8 @@ def _main_upload_saved(path_arg: str, args, api_key: str | None) -> int:
             if not results:
                 print(f"gpucheck: {path} has no tested card to upload", file=sys.stderr)
                 return EXIT_REFUSED
+            if not lot_finished(summary):
+                print("note: this lot did not finish; cards that were not reached are recorded as not tested")
             before = previous_upload_with_tokens(summary, server)
             if before:
                 print(
