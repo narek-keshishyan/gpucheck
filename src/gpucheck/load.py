@@ -42,8 +42,8 @@ def tflops(n: int, iters: int, elapsed_s: float) -> float:
 
 
 class TorchGemmLoad:
-    def __init__(self, workload: dict | None = None) -> None:
-        # Make torch's cuda:0 the same physical card NVML index 0 reads; CUDA's
+    def __init__(self, workload: dict | None = None, device_index: int = 0) -> None:
+        # Make torch's cuda:N the same physical card NVML index N reads; CUDA's
         # default "fastest first" order can differ from NVML's PCI bus order.
         # Must be set before torch initialises CUDA, so before the import.
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
@@ -57,6 +57,7 @@ class TorchGemmLoad:
         except RuntimeError as e:
             raise LoadUnavailable(f"CUDA probe failed: {e}") from e
         self._torch = torch
+        self._device = f"cuda:{device_index}"
         self._workload = dict(workload) if workload is not None else None
         self._ns: list[int] = []
         self._tick_i = 0
@@ -69,7 +70,7 @@ class TorchGemmLoad:
         # happen in __init__: preflight reads the GPU's process list after the
         # load is constructed, and a context of our own makes the card look busy.
         try:
-            free, _total = t.cuda.mem_get_info()
+            free, _total = t.cuda.mem_get_info(self._device)
         except RuntimeError as e:
             raise LoadUnavailable(f"CUDA probe failed: {e}") from e
         n = pick_gemm_size(free)
@@ -85,12 +86,12 @@ class TorchGemmLoad:
         # Without a workload this is the plain single-size n x n path.
         m = max(self._ns)
         shape = (m * m,) if self.resolved_workload else (m, m)
-        self._a = t.randn(*shape, device="cuda", dtype=t.bfloat16)
-        self._b = t.randn(*shape, device="cuda", dtype=t.bfloat16)
-        self._c = t.empty(*shape, device="cuda", dtype=t.bfloat16)
+        self._a = t.randn(*shape, device=self._device, dtype=t.bfloat16)
+        self._b = t.randn(*shape, device=self._device, dtype=t.bfloat16)
+        self._c = t.empty(*shape, device=self._device, dtype=t.bfloat16)
         a, b, c = self._views(self._ns[0])
         t.matmul(a, b, out=c)  # warmup
-        t.cuda.synchronize()
+        t.cuda.synchronize(self._device)
 
     def _views(self, n: int):
         if not self.resolved_workload:
@@ -108,16 +109,16 @@ class TorchGemmLoad:
         self._tick_i += 1
         a, b, c = self._views(n)
         iters = 0
-        t.cuda.synchronize()
+        t.cuda.synchronize(self._device)
         t0 = time.perf_counter()
         while time.perf_counter() - t0 < TICK_S:
             t.matmul(a, b, out=c)
             # Wait for each kernel: matmul only enqueues, so without this the loop
             # would queue thousands of kernels in 0.8 s and the tick (and the
             # watchdog sampling between ticks) would stall for minutes.
-            t.cuda.synchronize()
+            t.cuda.synchronize(self._device)
             iters += 1
-        t.cuda.synchronize()
+        t.cuda.synchronize(self._device)
         elapsed = time.perf_counter() - t0
         return tflops(n, iters, elapsed) if iters else None
 

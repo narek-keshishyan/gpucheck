@@ -8,9 +8,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .adapter import AdapterUnavailable, NvmlAdapter
+from .adapter import AdapterUnavailable, NvmlAdapter, gpu_count
 from .diagnose import diagnose
 from .fakes import make_fake
+from .lot import parse_gpus
 from .load import LoadUnavailable, TorchGemmLoad
 from .metrics import derive
 from .report import render_report
@@ -35,6 +36,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="show what would be uploaded")
     p.add_argument("--json", metavar="PATH", default="./gpucheck-result.json", help="where to write result.json")
     p.add_argument("--server", metavar="URL", default=None, help="upload server URL")
+    p.add_argument("--gpus", metavar="SPEC", default=None, help='which GPUs to test: "all" or indices such as "0,2" (default: 0)')
+    p.add_argument("--include-serial", action="store_true", help="also record the card's serial number in the result")
     p.add_argument("--fake", metavar="PROFILE", help=argparse.SUPPRESS)
     return p
 
@@ -85,17 +88,19 @@ def format_certify(out: UploadOutcome) -> str | None:
 
 
 def _make_adapter(args):
-    return make_fake(args.fake) if args.fake else NvmlAdapter()
+    if args.fake:
+        return make_fake(args.fake)
+    return NvmlAdapter(index=args.gpu_index, include_serial=args.include_serial)
 
 
-def _make_load(args, challenge=None):
+def _make_load(args, challenge=None, device_index: int = 0):
     if args.fake:  # fake adapters supply their own achieved_tflops
         return NullLoad()
     if challenge is not None:
         # Certification requires the real load generator; LoadUnavailable propagates.
-        return TorchGemmLoad(challenge["workload"])
+        return TorchGemmLoad(challenge["workload"], device_index=device_index)
     try:
-        return TorchGemmLoad()
+        return TorchGemmLoad(device_index=device_index)
     except LoadUnavailable:
         print(
             "no torch/CUDA — running without load; performance metrics will be gaps",
@@ -112,9 +117,9 @@ def _config(args) -> RunConfig:
     return RunConfig(baseline_s=60, load_s=600, hz=1.0)
 
 
-def _execute(adapter, args, challenge=None):
+def _execute(adapter, args, challenge=None, device_index: int = 0):
     spec = lookup(adapter.inventory().model_name)
-    load = _make_load(args, challenge)
+    load = _make_load(args, challenge, device_index=device_index)
     kwargs = {}
     if args.fake:  # simulated hardware: use a virtual clock instead of real waiting
         t = [0.0]
@@ -186,7 +191,21 @@ def _maybe_upload(result: dict, args, challenge: dict | None = None) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
+    args.gpu_index = index = 0
     try:
+        if not args.fake:
+            count = gpu_count()
+            try:
+                selected = parse_gpus(args.gpus, count)
+            except ValueError as e:
+                print(f"gpucheck: --gpus: {e}", file=sys.stderr)
+                return EXIT_REFUSED
+            if len(selected) > 1:
+                print("gpucheck: multi-GPU runs are not available yet", file=sys.stderr)
+                return EXIT_REFUSED
+            args.gpu_index = index = selected[0]
+            if args.gpus is None and count > 1:
+                print(f"{count} GPUs detected; testing GPU 0 only. Use --gpus all to test every card.")
         adapter = _make_adapter(args)
     except AdapterUnavailable as e:
         print(f"gpucheck: no NVIDIA GPU or driver available ({e}).", file=sys.stderr)
@@ -203,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_REFUSED
     started = _now()
     try:
-        spec, load, run = _execute(adapter, args, challenge)
+        spec, load, run = _execute(adapter, args, challenge, device_index=index)
     except LoadUnavailable as e:
         print(f"gpucheck: certification requires the GPU load generator ({e}).", file=sys.stderr)
         return EXIT_REFUSED

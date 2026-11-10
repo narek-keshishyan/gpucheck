@@ -123,6 +123,19 @@ def _reason_bit(nv, suffix: str) -> int:
     )
 
 
+def gpu_count() -> int:
+    """Number of NVIDIA GPUs NVML can see; raises AdapterUnavailable when NVML cannot be loaded."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)  # pynvml deprecation notice
+            import pynvml
+
+        pynvml.nvmlInit()
+        return int(pynvml.nvmlDeviceGetCount())
+    except Exception as exc:  # ImportError, NVMLError, missing library...
+        raise AdapterUnavailable(f"NVML unavailable: {exc}") from exc
+
+
 class NvmlAdapter(TelemetryAdapter):
     """Reads one GPU (default index 0) through NVML (pynvml)."""
 

@@ -5,6 +5,7 @@ from gpucheck import cli
 from gpucheck.cli import main
 from gpucheck.fakes import make_fake
 from gpucheck.report import NOT_COVERED
+from gpucheck.run import NullLoad, RunConfig
 from gpucheck.upload import UploadOutcome
 
 
@@ -150,3 +151,40 @@ def test_result_records_start_and_end_times(monkeypatch, tmp_path):
     main(["--fake", "healthy", "--offline", "--quick", "--json", str(out)])
     assert json.loads(out.read_text())["timing"] == {
         "started_utc": "2026-11-10T12:00:00Z", "ended_utc": "2026-11-10T12:11:00Z", "settle_s": None}
+
+
+def _real_path(monkeypatch, count):
+    made = []
+    monkeypatch.setattr(cli, "gpu_count", lambda: count)
+    monkeypatch.setattr(cli, "NvmlAdapter",
+                        lambda index=0, include_serial=False: made.append((index, include_serial)) or make_fake("healthy"))
+    monkeypatch.setattr(cli, "_make_load",
+                        lambda args, challenge=None, device_index=0: made.append(("load", device_index)) or NullLoad())
+    monkeypatch.setattr(cli, "_config", lambda args: RunConfig(baseline_s=2, load_s=2, hz=1000.0))
+    return made
+
+
+def test_gpus_flag_selects_index_and_device(monkeypatch, tmp_path):
+    made = _real_path(monkeypatch, 4)
+    rc = main(["--gpus", "1", "--include-serial", "--offline", "--json", str(tmp_path / "r.json")])
+    assert rc == 0 and made == [(1, True), ("load", 1)]
+
+
+def test_notice_when_more_gpus_exist(monkeypatch, tmp_path, capsys):
+    _real_path(monkeypatch, 4)
+    main(["--offline", "--json", str(tmp_path / "r.json")])
+    assert "4 GPUs detected; testing GPU 0 only. Use --gpus all to test every card." in capsys.readouterr().out
+
+
+def test_gpus_all_on_one_gpu_is_a_single_run(monkeypatch, tmp_path):
+    made = _real_path(monkeypatch, 1)
+    out = tmp_path / "r.json"
+    assert main(["--gpus", "all", "--offline", "--json", str(out)]) == 0
+    assert out.exists() and made == [(0, False), ("load", 0)]
+
+
+def test_bad_gpus_value_is_friendly(monkeypatch, capsys):
+    _real_path(monkeypatch, 4)
+    assert main(["--gpus", "9", "--offline"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("gpucheck: --gpus:") and "Traceback" not in err

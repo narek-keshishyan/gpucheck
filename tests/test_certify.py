@@ -154,6 +154,7 @@ def test_certify_challenge_failure_exit_1(server, tmp_path, capsys):
 
 
 def test_certify_real_adapter_without_torch_exits_1(server, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "gpu_count", lambda: 1)
     monkeypatch.setattr(cli, "_make_adapter", lambda args: make_fake("healthy"))
 
     def boom(*a, **k):
@@ -224,8 +225,8 @@ def _stub_torch_calls(monkeypatch):
 
     cuda = types.SimpleNamespace(
         is_available=lambda: True,
-        mem_get_info=lambda: (1024**3, 1024**3),
-        synchronize=lambda: None,
+        mem_get_info=lambda dev: (1024**3, 1024**3),
+        synchronize=lambda dev: None,
         empty_cache=lambda: None,
     )
     fake = types.SimpleNamespace(

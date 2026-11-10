@@ -60,7 +60,7 @@ def test_load_unavailable_when_cuda_unavailable(monkeypatch):
 
 
 def test_load_unavailable_when_cuda_broken(monkeypatch):
-    def boom():
+    def boom(dev):
         raise RuntimeError("CUDA error")
 
     _stub_torch(monkeypatch, mem_info=boom)
@@ -76,8 +76,8 @@ def test_init_touches_no_cuda_memory_api(monkeypatch):
     calls = []
     cuda = types.SimpleNamespace(
         is_available=lambda: True,
-        mem_get_info=lambda: calls.append("mem") or (1024**3, 1024**3),
-        synchronize=lambda: None,
+        mem_get_info=lambda dev: calls.append("mem") or (1024**3, 1024**3),
+        synchronize=lambda dev: None,
         empty_cache=lambda: None,
     )
     fake = types.SimpleNamespace(
@@ -95,7 +95,7 @@ def test_init_touches_no_cuda_memory_api(monkeypatch):
 
 
 def test_make_load_warns_and_falls_back(monkeypatch, capsys):
-    def boom():
+    def boom(*a, **k):
         raise LoadUnavailable("nope")
 
     monkeypatch.setattr(cli, "TorchGemmLoad", boom)
@@ -136,8 +136,8 @@ def test_tick_synchronizes_after_every_matmul(monkeypatch):
     events = []
     cuda = types.SimpleNamespace(
         is_available=lambda: True,
-        mem_get_info=lambda: (1024**3, 1024**3),
-        synchronize=lambda: events.append("sync"),
+        mem_get_info=lambda dev: (1024**3, 1024**3),
+        synchronize=lambda dev: events.append("sync"),
         empty_cache=lambda: None,
     )
     fake = types.SimpleNamespace(
@@ -161,3 +161,24 @@ def test_tick_synchronizes_after_every_matmul(monkeypatch):
     body = events[1:]
     assert body.count("mm") == 3
     assert all(body[i + 1] == "sync" for i, e in enumerate(body) if e == "mm")
+
+
+def test_load_targets_selected_device(monkeypatch):
+    seen = []
+
+    def mem(dev):
+        seen.append(dev)
+        return (1024**3, 1024**3)
+
+    cuda = types.SimpleNamespace(is_available=lambda: True, mem_get_info=mem,
+                                 synchronize=lambda dev: seen.append(dev), empty_cache=lambda: None)
+    fake = types.SimpleNamespace(
+        cuda=cuda, bfloat16="bf16",
+        randn=lambda *a, **k: seen.append(k["device"]) or object(),
+        empty=lambda *a, **k: seen.append(k["device"]) or object(),
+        matmul=lambda *a, **k: None,
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    g = TorchGemmLoad(device_index=2)
+    g.start()
+    assert seen and set(seen) == {"cuda:2"}
