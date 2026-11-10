@@ -1,6 +1,6 @@
 """Diagnosis rule table: turn derived metrics into plain-language findings.
 
-Rules are evaluated in a fixed order (MEMORY_WEAR, TIM_DEGRADATION,
+Rules are evaluated in a fixed order (MEMORY_ERRORS, HOT_UNDER_LOAD,
 HOT_ENVIRONMENT, THERMAL_THROTTLING, POWER_CAPPED, UNDERPERFORMING_UNKNOWN,
 INSUFFICIENT_EVIDENCE) and each rule fires at most once. Unknown throttle data
 ("throttle_reasons" in telemetry_gaps) is treated as unknown, never as "none". A rule whose required inputs are None does
@@ -47,7 +47,7 @@ def _throttled(m: Metrics) -> bool:
     return m.time_to_throttle_s is not None or THERMAL_REASON in m.throttle_reasons_seen
 
 
-def _memory_wear(m: Metrics, inv: GpuInventory) -> Finding | None:
+def _memory_errors(m: Metrics, inv: GpuInventory) -> Finding | None:
     parts: list[str] = []
     if m.ecc_delta is not None and m.ecc_delta > 0:
         parts.append(f"ECC error count rose by {m.ecc_delta} during the run")
@@ -59,14 +59,14 @@ def _memory_wear(m: Metrics, inv: GpuInventory) -> Finding | None:
         return None
     sentence = " and ".join(parts)
     return Finding(
-        "MEMORY_WEAR",
+        "MEMORY_ERRORS",
         "bad",
         "high",
-        sentence[0].upper() + sentence[1:] + ", which points to memory wear.",
+        sentence[0].upper() + sentence[1:] + ". The card has recorded memory errors.",
     )
 
 
-def _tim_degradation(m: Metrics, spec: GpuSpec | None) -> Finding | None:
+def _hot_under_load(m: Metrics, spec: GpuSpec | None) -> Finding | None:
     if spec is None or m.time_to_throttle_s is None or m.steady_temp_c is None or m.idle_temp_c is None:
         return None
     if m.idle_temp_c > TIM_IDLE_MAX_C:
@@ -77,12 +77,13 @@ def _tim_degradation(m: Metrics, spec: GpuSpec | None) -> Finding | None:
         return None
     confidence: Confidence = "high" if m.idle_temp_c <= TIM_HIGH_CONFIDENCE_IDLE_C else "medium"
     return Finding(
-        "TIM_DEGRADATION",
-        "bad",
+        "HOT_UNDER_LOAD",
+        "warn",
         confidence,
-        f"Throttled after {_g(m.time_to_throttle_s)} s; steady {_g(m.steady_temp_c)} °C vs "
-        f"{_g(spec.max_temp_c)} °C limit; idle was {_g(m.idle_temp_c)} °C, which suggests the "
-        "thermal paste or cooler contact has degraded.",
+        f"Throttled after {_g(m.time_to_throttle_s)} s of load and ran at {_g(m.steady_temp_c)} °C "
+        f"against a {_g(spec.max_temp_c)} °C limit, while idling at {_g(m.idle_temp_c)} °C. "
+        "The card runs hot under load. Possible causes: degraded thermal paste or cooler "
+        "contact, a failing fan, or restricted airflow.",
     )
 
 
@@ -132,7 +133,7 @@ def _power_capped(m: Metrics, inv: GpuInventory, spec: GpuSpec | None) -> Findin
 
 
 def _thermal_throttling(m: Metrics) -> Finding | None:
-    """Throttling that neither TIM_DEGRADATION nor INSUFFICIENT_EVIDENCE explains."""
+    """Throttling that neither HOT_UNDER_LOAD nor INSUFFICIENT_EVIDENCE explains."""
     if not _throttled(m):
         return None
     when = f" after {_g(m.time_to_throttle_s)} s of load" if m.time_to_throttle_s is not None else ""
@@ -188,11 +189,11 @@ def diagnose(
 ) -> list[Finding]:
     """Return the findings for one card, in fixed rule order; empty means healthy."""
     del preflight  # the v1 rule table does not consult preflight
-    tim = _tim_degradation(metrics, spec)
+    tim = _hot_under_load(metrics, spec)
     insufficient = _insufficient_evidence(metrics, spec)
     throttling = _thermal_throttling(metrics) if tim is None and insufficient is None else None
     rules = (
-        _memory_wear(metrics, inventory),
+        _memory_errors(metrics, inventory),
         tim,
         _hot_environment(metrics),
         throttling,

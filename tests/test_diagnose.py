@@ -72,83 +72,83 @@ def test_healthy_card_gives_no_findings():
     assert diagnose(healthy(), PF, inv(), SPEC) == []
 
 
-# --- MEMORY_WEAR (bad, high) ----------------------------------------------
+# --- MEMORY_ERRORS (bad, high) ----------------------------------------------
 
 
-def test_memory_wear_fires_on_ecc_delta_above_zero():
-    f = find(diagnose(healthy(ecc_delta=1), PF, inv(), SPEC), "MEMORY_WEAR")
+def test_memory_errors_fires_on_ecc_delta_above_zero():
+    f = find(diagnose(healthy(ecc_delta=1), PF, inv(), SPEC), "MEMORY_ERRORS")
     assert (f.severity, f.confidence) == ("bad", "high")
 
 
-def test_memory_wear_not_on_ecc_delta_zero():
-    assert "MEMORY_WEAR" not in codes(diagnose(healthy(ecc_delta=0), PF, inv(), SPEC))
+def test_memory_errors_not_on_ecc_delta_zero():
+    assert "MEMORY_ERRORS" not in codes(diagnose(healthy(ecc_delta=0), PF, inv(), SPEC))
 
 
-def test_memory_wear_fires_on_remapped_rows_above_zero():
-    f = find(diagnose(healthy(), PF, inv(remapped=1), SPEC), "MEMORY_WEAR")
+def test_memory_errors_fires_on_remapped_rows_above_zero():
+    f = find(diagnose(healthy(), PF, inv(remapped=1), SPEC), "MEMORY_ERRORS")
     assert (f.severity, f.confidence) == ("bad", "high")
 
 
-def test_memory_wear_not_on_remapped_rows_zero():
-    assert "MEMORY_WEAR" not in codes(diagnose(healthy(), PF, inv(remapped=0), SPEC))
+def test_memory_errors_not_on_remapped_rows_zero():
+    assert "MEMORY_ERRORS" not in codes(diagnose(healthy(), PF, inv(remapped=0), SPEC))
 
 
-def test_memory_wear_runs_without_spec():
-    assert "MEMORY_WEAR" in codes(diagnose(healthy(ecc_delta=2), PF, inv(), None))
+def test_memory_errors_runs_without_spec():
+    assert "MEMORY_ERRORS" in codes(diagnose(healthy(ecc_delta=2), PF, inv(), None))
 
 
-def test_memory_wear_not_when_inputs_none():
+def test_memory_errors_not_when_inputs_none():
     m = healthy(ecc_delta=None)
-    assert "MEMORY_WEAR" not in codes(diagnose(m, PF, inv(remapped=None), SPEC))
+    assert "MEMORY_ERRORS" not in codes(diagnose(m, PF, inv(remapped=None), SPEC))
 
 
-# --- TIM_DEGRADATION (bad) and its confidence ----------------------------
+# --- HOT_UNDER_LOAD (bad) and its confidence ----------------------------
 
 
 def test_tim_fires_at_boundaries_with_medium_confidence():
     # time 179.9 (< 180), steady 80.0 (= max - 3), idle 45.0 (<= 45)
     m = tim_metrics(time_to_throttle_s=179.9, steady_temp_c=80.0, idle_temp_c=45.0)
-    f = find(diagnose(m, PF, inv(), SPEC), "TIM_DEGRADATION")
-    assert (f.severity, f.confidence) == ("bad", "medium")
+    f = find(diagnose(m, PF, inv(), SPEC), "HOT_UNDER_LOAD")
+    assert (f.severity, f.confidence) == ("warn", "medium")
 
 
 def test_tim_high_confidence_at_idle_40():
     m = tim_metrics(idle_temp_c=40.0)
-    f = find(diagnose(m, PF, inv(), SPEC), "TIM_DEGRADATION")
+    f = find(diagnose(m, PF, inv(), SPEC), "HOT_UNDER_LOAD")
     assert f.confidence == "high"
 
 
 def test_tim_medium_confidence_just_above_idle_40():
     m = tim_metrics(idle_temp_c=40.1)
-    f = find(diagnose(m, PF, inv(), SPEC), "TIM_DEGRADATION")
+    f = find(diagnose(m, PF, inv(), SPEC), "HOT_UNDER_LOAD")
     assert f.confidence == "medium"
 
 
 def test_tim_not_at_time_to_throttle_180():
     m = tim_metrics(time_to_throttle_s=180.0)
-    assert "TIM_DEGRADATION" not in codes(diagnose(m, PF, inv(), SPEC))
+    assert "HOT_UNDER_LOAD" not in codes(diagnose(m, PF, inv(), SPEC))
 
 
 def test_tim_not_at_steady_just_below_max_minus_3():
     m = tim_metrics(steady_temp_c=79.9)
-    assert "TIM_DEGRADATION" not in codes(diagnose(m, PF, inv(), SPEC))
+    assert "HOT_UNDER_LOAD" not in codes(diagnose(m, PF, inv(), SPEC))
 
 
 def test_tim_not_at_idle_45_1_and_emits_insufficient_instead():
     m = tim_metrics(idle_temp_c=45.1)
     out = diagnose(m, PF, inv(), SPEC)
-    assert "TIM_DEGRADATION" not in codes(out)
+    assert "HOT_UNDER_LOAD" not in codes(out)
     f = find(out, "INSUFFICIENT_EVIDENCE")
     assert (f.severity, f.confidence) == ("info", "low")
 
 
 def test_tim_skipped_without_spec():
     m = tim_metrics()
-    assert "TIM_DEGRADATION" not in codes(diagnose(m, PF, inv(), None))
+    assert "HOT_UNDER_LOAD" not in codes(diagnose(m, PF, inv(), None))
 
 
 def test_tim_message_has_key_numbers():
-    f = find(diagnose(tim_metrics(), PF, inv(), SPEC), "TIM_DEGRADATION")
+    f = find(diagnose(tim_metrics(), PF, inv(), SPEC), "HOT_UNDER_LOAD")
     for token in ("120", "86.5", "83", "38"):
         assert token in f.message
 
@@ -156,7 +156,7 @@ def test_tim_message_has_key_numbers():
 def test_no_tim_claim_without_idle_baseline():
     m = tim_metrics(idle_temp_c=None)
     out = diagnose(m, PF, inv(), SPEC)
-    assert "TIM_DEGRADATION" not in codes(out)
+    assert "HOT_UNDER_LOAD" not in codes(out)
     assert "INSUFFICIENT_EVIDENCE" in codes(out)
 
 
@@ -210,7 +210,7 @@ def test_power_capped_limit_arm_runs_without_spec():
 def test_insufficient_emitted_without_spec_when_idle_missing():
     m = tim_metrics(idle_temp_c=None)
     out = diagnose(m, PF, inv(), None)
-    assert "TIM_DEGRADATION" not in codes(out)
+    assert "HOT_UNDER_LOAD" not in codes(out)
     f = find(out, "INSUFFICIENT_EVIDENCE")
     assert (f.severity, f.confidence) == ("info", "low")
 
@@ -218,7 +218,7 @@ def test_insufficient_emitted_without_spec_when_idle_missing():
 def test_insufficient_emitted_without_spec_when_idle_hot():
     m = tim_metrics(idle_temp_c=50.0)
     out = diagnose(m, PF, inv(), None)
-    assert "TIM_DEGRADATION" not in codes(out)
+    assert "HOT_UNDER_LOAD" not in codes(out)
     assert "INSUFFICIENT_EVIDENCE" in codes(out)
 
 
@@ -277,7 +277,7 @@ def test_underperforming_skipped_without_spec():
 def test_findings_emitted_in_deterministic_order():
     m = tim_metrics(ecc_delta=1, throttle_reasons_seen=["thermal", "power"], steady_temp_c=86.5)
     out = diagnose(m, PF, inv(power_limit=300.0, default=450.0), SPEC)
-    assert codes(out) == ["MEMORY_WEAR", "TIM_DEGRADATION", "POWER_CAPPED"]
+    assert codes(out) == ["MEMORY_ERRORS", "HOT_UNDER_LOAD", "POWER_CAPPED"]
 
 
 def test_insufficient_evidence_comes_last():
@@ -290,7 +290,7 @@ def test_insufficient_evidence_comes_last():
         tflops_ratio_vs_spec=0.5,
     )
     out = diagnose(m, PF, inv(), SPEC)
-    assert codes(out) == ["MEMORY_WEAR", "INSUFFICIENT_EVIDENCE"]
+    assert codes(out) == ["MEMORY_ERRORS", "INSUFFICIENT_EVIDENCE"]
 
 
 def test_findings_are_frozen_dataclass_instances():
@@ -305,14 +305,14 @@ def test_findings_are_frozen_dataclass_instances():
 def test_thermal_throttling_late_throttle_with_cool_idle():
     m = tim_metrics(time_to_throttle_s=360.0, idle_temp_c=40.0)
     out = diagnose(m, PF, inv(), SPEC)
-    assert "TIM_DEGRADATION" not in codes(out)
+    assert "HOT_UNDER_LOAD" not in codes(out)
     f = find(out, "THERMAL_THROTTLING")
     assert (f.severity, f.confidence) == ("warn", "medium")
 
 
 def test_thermal_throttling_not_when_tim_fires():
     out = diagnose(tim_metrics(), PF, inv(), SPEC)
-    assert "TIM_DEGRADATION" in codes(out) and "THERMAL_THROTTLING" not in codes(out)
+    assert "HOT_UNDER_LOAD" in codes(out) and "THERMAL_THROTTLING" not in codes(out)
 
 
 def test_thermal_throttling_not_when_insufficient_evidence_fires():
@@ -323,7 +323,7 @@ def test_thermal_throttling_not_when_insufficient_evidence_fires():
 def test_thermal_throttling_ordered_after_hot_environment():
     m = tim_metrics(time_to_throttle_s=360.0, idle_temp_c=40.0)
     out = diagnose(m, PF, inv(remapped=1), SPEC)
-    assert codes(out).index("THERMAL_THROTTLING") > codes(out).index("MEMORY_WEAR")
+    assert codes(out).index("THERMAL_THROTTLING") > codes(out).index("MEMORY_ERRORS")
 
 
 def test_thermal_throttling_without_spec():
@@ -343,3 +343,22 @@ def test_underperforming_with_unknown_throttle_data_does_not_claim_no_throttling
     f = find(diagnose(m, PF, inv(), SPEC), "UNDERPERFORMING_UNKNOWN")
     assert "no throttling seen" not in f.message
     assert "unavailable" in f.message
+
+
+def test_hot_under_load_replaces_tim_degradation():
+    found = diagnose(tim_metrics(), PF, inv(), SPEC)
+    f = find(found, "HOT_UNDER_LOAD")
+    assert f.severity == "warn" and f.confidence == "high"
+    assert "runs hot under load" in f.message
+    for cause in ("thermal paste", "fan", "airflow"):
+        assert cause in f.message
+    assert "has degraded" not in f.message
+    assert "TIM_DEGRADATION" not in codes(found)
+
+
+def test_memory_errors_states_what_was_recorded():
+    f = find(diagnose(healthy(ecc_delta=3), PF, inv(remapped=2), SPEC), "MEMORY_ERRORS")
+    assert f.severity == "bad" and f.confidence == "high"
+    assert "ECC error count rose by 3 during the run" in f.message
+    assert "2 memory row(s) were remapped" in f.message
+    assert "wear" not in f.message.lower()

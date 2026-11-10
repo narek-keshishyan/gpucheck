@@ -30,10 +30,10 @@ def test_mig_profile_prints_measurements_only_banner(tmp_path, capsys):
     assert "measurements only" in out.lower() and "no grade" in out.lower()
 
 
-def test_tim_profile_report_names_degraded_tim(tmp_path, capsys):
+def test_tim_profile_report_names_hot_under_load(tmp_path, capsys):
     main(["--fake", "tim_degraded", "--offline", "--quick", "--json", str(tmp_path / "r.json")])
     out = capsys.readouterr().out
-    assert "TIM_DEGRADATION" in out and "thermal paste" in out.lower()
+    assert "HOT_UNDER_LOAD" in out and "runs hot under load" in out
 
 
 class _Busy:

@@ -152,14 +152,14 @@ def test_remapped_rows_counts_correctable_and_uncorrectable(monkeypatch):
     assert inv.row_remap_pending is True and inv.row_remap_failure is False
 
 
-def test_uncorrectable_remaps_fire_memory_wear(monkeypatch):
+def test_uncorrectable_remaps_fire_memory_errors(monkeypatch):
     a = adapter(monkeypatch, modern(remap=(0, 2, False, False)))
     inv = a.inventory()
     spec = lookup(inv.model_name)
     load = [a.sample() for _ in range(5)]
     run = RawRun(inv, Preflight("full"), [a.sample()], load, RunConfig(), None)
     codes = [f.code for f in diagnose(derive(run, spec), run.preflight, inv, spec)]
-    assert "MEMORY_WEAR" in codes
+    assert "MEMORY_ERRORS" in codes
 
 
 def test_busy_none_when_process_query_fails(monkeypatch):
