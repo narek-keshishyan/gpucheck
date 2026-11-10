@@ -201,3 +201,15 @@ def test_zero_gpus_without_gpus_flag_exits_2(monkeypatch, capsys):
     c = capsys.readouterr()
     assert "Traceback" not in c.out + c.err
     assert len((c.out + c.err).strip().splitlines()) == 1
+
+
+def test_fake_list_with_gpus_runs_the_selected_card(tmp_path):
+    out = tmp_path / "r.json"
+    rc = main(["--fake", "healthy,tim_degraded", "--gpus", "1", "--offline", "--quick", "--json", str(out)])
+    assert rc == 0
+    assert json.loads(out.read_text())["inventory"]["gpu_index"] == 1
+
+
+def test_fake_list_selecting_several_cards_is_not_available_yet(capsys):
+    assert main(["--fake", "healthy,healthy", "--offline"]) == 1
+    assert "gpucheck: multi-GPU runs are not available yet" in capsys.readouterr().err

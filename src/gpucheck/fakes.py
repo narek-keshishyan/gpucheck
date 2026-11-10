@@ -7,6 +7,7 @@ generator keeps yielding the final steady state, so it can be sampled forever.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 
 from .adapter import GpuInventory, TelemetryAdapter, TelemetrySample, hash_uuid
 
@@ -108,19 +109,31 @@ def _power_capped() -> Iterator[TelemetrySample]:
         i += 1
 
 
+def _overheat() -> Iterator[TelemetrySample]:
+    for sample in _healthy():
+        yield replace(sample, temp_c=200.0)
+
+
 _PROFILES: dict[str, tuple[Callable[[], Iterator[TelemetrySample]], dict]] = {
     "healthy": (_healthy, {}),
     "tim_degraded": (_tim_degraded, {}),
     "hot_env": (_hot_env, {}),
     "power_capped": (_power_capped, {"power_limit_w": 400.0, "default_power_limit_w": 700.0}),
     "mig": (_healthy, {"mig_enabled": True}),
+    "busy": (_healthy, {}),
+    "overheat": (_overheat, {}),
 }
+
+_BUSY_PROFILES = frozenset({"busy"})
 
 
 class FakeAdapter:
-    def __init__(self, inventory: GpuInventory, samples: Iterator[TelemetrySample]) -> None:
+    def __init__(
+        self, inventory: GpuInventory, samples: Iterator[TelemetrySample], busy: bool = False
+    ) -> None:
         self._inventory = inventory
         self._samples = samples
+        self._busy = busy
 
     def inventory(self) -> GpuInventory:
         return self._inventory
@@ -129,7 +142,7 @@ class FakeAdapter:
         return next(self._samples)
 
     def busy(self) -> bool | None:
-        return False
+        return self._busy
 
 
 def make_fake(profile: str) -> TelemetryAdapter:
@@ -137,4 +150,22 @@ def make_fake(profile: str) -> TelemetryAdapter:
         factory, inv = _PROFILES[profile]
     except KeyError:
         raise ValueError(f"unknown fake profile {profile!r}; choose from {sorted(_PROFILES)}") from None
-    return FakeAdapter(_inventory(**inv), factory())
+    return FakeAdapter(_inventory(**inv), factory(), busy=profile in _BUSY_PROFILES)
+
+
+def make_fakes(spec: str) -> list[TelemetryAdapter]:
+    """One fake card per comma-separated profile name; several cards get distinct indices and UUIDs."""
+    profiles = [p.strip() for p in spec.split(",")]
+    if len(profiles) == 1:
+        return [make_fake(profiles[0])]
+    cards: list[TelemetryAdapter] = []
+    for i, profile in enumerate(profiles):
+        try:
+            factory, inv = _PROFILES[profile]
+        except KeyError:
+            raise ValueError(f"unknown fake profile {profile!r}; choose from {sorted(_PROFILES)}") from None
+        inventory = _inventory(
+            **{**inv, "gpu_index": i, "uuid_hash": hash_uuid(f"GPU-00000000-0000-0000-0000-{i:012d}")}
+        )
+        cards.append(FakeAdapter(inventory, factory(), busy=profile in _BUSY_PROFILES))
+    return cards
