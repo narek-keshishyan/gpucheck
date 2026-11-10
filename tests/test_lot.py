@@ -4,7 +4,7 @@ from gpucheck.lot import parse_gpus
 
 
 @pytest.mark.parametrize("spec,count,expected", [
-    (None, 4, [0]), ("all", 4, [0, 1, 2, 3]), ("2", 4, [2]), ("0,2", 4, [0, 2]), ("2,0,2", 4, [0, 2]),
+    (None, 4, [0]), (None, 0, [0]), ("all", 4, [0, 1, 2, 3]), ("2", 4, [2]), ("0,2", 4, [0, 2]), ("2,0,2", 4, [0, 2]),
     ("all", 1, [0]),
 ])
 def test_parse_gpus(spec, count, expected):

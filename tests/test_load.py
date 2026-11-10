@@ -182,3 +182,53 @@ def test_load_targets_selected_device(monkeypatch):
     g = TorchGemmLoad(device_index=2)
     g.start()
     assert seen and set(seen) == {"cuda:2"}
+
+
+def test_make_load_forwards_device_index(monkeypatch):
+    made = []
+    monkeypatch.setattr(cli, "TorchGemmLoad", lambda *a, **k: made.append((a, k)) or object())
+    cli._make_load(argparse.Namespace(fake=None), device_index=2)
+    assert made == [((), {"device_index": 2})]
+    made.clear()
+    w = {"gemm_n_offsets": [0], "order_seed": 1}
+    cli._make_load(argparse.Namespace(fake=None), challenge={"workload": w}, device_index=2)
+    assert made == [((w,), {"device_index": 2})]
+
+
+def test_tick_stays_on_selected_device(monkeypatch):
+    seen = []
+
+    class T:
+        def __getitem__(self, sl):
+            return self
+
+        def view(self, n, m):
+            return self
+
+    cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        mem_get_info=lambda dev: seen.append(dev) or (1024**3, 1024**3),
+        synchronize=lambda dev: seen.append(dev),
+        empty_cache=lambda: None,
+    )
+    fake = types.SimpleNamespace(
+        cuda=cuda, bfloat16="bf16",
+        randn=lambda *a, **k: seen.append(k["device"]) or T(),
+        empty=lambda *a, **k: seen.append(k["device"]) or T(),
+        matmul=lambda *a, **k: None,
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    import gpucheck.load as load_mod
+
+    clock = [0.0]
+
+    def pc():
+        clock[0] += 0.5
+        return clock[0]
+
+    monkeypatch.setattr(load_mod.time, "perf_counter", pc)
+    g = TorchGemmLoad(device_index=2)
+    g.start()
+    seen.clear()
+    assert g.tick() is not None
+    assert seen and set(seen) == {"cuda:2"}

@@ -90,7 +90,7 @@ def format_certify(out: UploadOutcome) -> str | None:
 def _make_adapter(args):
     if args.fake:
         return make_fake(args.fake)
-    return NvmlAdapter(index=args.gpu_index, include_serial=args.include_serial)
+    return NvmlAdapter(index=getattr(args, "gpu_index", 0), include_serial=args.include_serial)
 
 
 def _make_load(args, challenge=None, device_index: int = 0):
@@ -191,7 +191,8 @@ def _maybe_upload(result: dict, args, challenge: dict | None = None) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
-    args.gpu_index = index = 0
+    index = 0
+    args.gpu_index = 0
     try:
         if not args.fake:
             count = gpu_count()
@@ -203,7 +204,8 @@ def main(argv: list[str] | None = None) -> int:
             if len(selected) > 1:
                 print("gpucheck: multi-GPU runs are not available yet", file=sys.stderr)
                 return EXIT_REFUSED
-            args.gpu_index = index = selected[0]
+            index = selected[0]
+            args.gpu_index = index
             if args.gpus is None and count > 1:
                 print(f"{count} GPUs detected; testing GPU 0 only. Use --gpus all to test every card.")
         adapter = _make_adapter(args)

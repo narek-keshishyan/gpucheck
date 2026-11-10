@@ -2,6 +2,7 @@ import json
 from dataclasses import replace
 
 from gpucheck import cli
+from gpucheck.adapter import AdapterUnavailable
 from gpucheck.cli import main
 from gpucheck.fakes import make_fake
 from gpucheck.report import NOT_COVERED
@@ -188,3 +189,15 @@ def test_bad_gpus_value_is_friendly(monkeypatch, capsys):
     assert main(["--gpus", "9", "--offline"]) == 1
     err = capsys.readouterr().err
     assert err.startswith("gpucheck: --gpus:") and "Traceback" not in err
+
+
+def test_zero_gpus_without_gpus_flag_exits_2(monkeypatch, capsys):
+    def no_device(index=0, include_serial=False):
+        raise AdapterUnavailable("no device")
+
+    monkeypatch.setattr(cli, "gpu_count", lambda: 0)
+    monkeypatch.setattr(cli, "NvmlAdapter", no_device)
+    assert main(["--offline"]) == 2
+    c = capsys.readouterr()
+    assert "Traceback" not in c.out + c.err
+    assert len((c.out + c.err).strip().splitlines()) == 1

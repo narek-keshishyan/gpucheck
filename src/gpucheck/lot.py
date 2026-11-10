@@ -7,11 +7,11 @@ MAX_LOT_CARDS = 16
 
 def parse_gpus(spec: str | None, count: int) -> list[int]:
     """Resolve a --gpus value to sorted, unique GPU indices. Raises ValueError with a one-line message."""
-    if count < 1:
-        raise ValueError("no GPUs detected")
     if spec is None:
         return [0]
     if spec == "all":
+        if count < 1:
+            raise ValueError("no GPUs detected")
         indices = list(range(count))
     else:
         indices = []
