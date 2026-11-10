@@ -134,3 +134,19 @@ def test_grade_line_is_relative_to_reference_median():
     assert cli.format_grade(out, "NVIDIA H100") == (
         "Grade B — 94.1% of the median clean reference run for NVIDIA H100 (n=12, low confidence)"
     )
+
+
+def test_result_records_start_and_end_times(monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+
+    calls = []
+
+    def now():
+        calls.append(1)
+        return datetime(2026, 11, 10, 12, 0 if len(calls) == 1 else 11, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(cli, "_now", now)
+    out = tmp_path / "r.json"
+    main(["--fake", "healthy", "--offline", "--quick", "--json", str(out)])
+    assert json.loads(out.read_text())["timing"] == {
+        "started_utc": "2026-11-10T12:00:00Z", "ended_utc": "2026-11-10T12:11:00Z", "settle_s": None}

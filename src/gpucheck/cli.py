@@ -55,6 +55,10 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def challenge_expired(challenge: dict, now: datetime | None = None) -> bool:
     """True when the challenge's expires_at (ISO 8601) is in the past.
 
@@ -197,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
         except ChallengeUnavailable as e:
             print(f"gpucheck: certification unavailable: {e}", file=sys.stderr)
             return EXIT_REFUSED
+    started = _now()
     try:
         spec, load, run = _execute(adapter, args, challenge)
     except LoadUnavailable as e:
@@ -206,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"gpucheck: no NVIDIA GPU or driver available ({e}).", file=sys.stderr)
         return EXIT_NO_GPU
 
+    ended = _now()
     if run.aborted == "preflight_refused":
         print("gpucheck: preflight refused to run:")
         for reason in run.preflight.reasons:
@@ -226,7 +232,10 @@ def main(argv: list[str] | None = None) -> int:
                 "gemm_n": [8192 + o for o in w["gemm_n_offsets"]],
                 "order_seed": w["order_seed"],
             }
-    result = build_result(run, metrics, findings, challenge, challenge_workload)
+    result = build_result(
+        run, metrics, findings, challenge, challenge_workload,
+        timing={"started_utc": _iso(started), "ended_utc": _iso(ended), "settle_s": None},
+    )
     Path(args.json).write_text(canonical_dumps(result))  # before any upload consideration
     print(render_report(result))
     print(f"Result written to {args.json}")

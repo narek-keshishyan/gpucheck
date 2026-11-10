@@ -316,7 +316,8 @@ def test_short_expiry_challenge_expires_during_run(server, tmp_path, capsys, mon
     from datetime import datetime, timedelta, timezone
     t0 = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
     server["challenge"] = {**CHALLENGE, "expires_at": (t0 + timedelta(seconds=5)).isoformat()}
-    clock = iter([t0 + timedelta(seconds=700)])  # the run outlasted the 5 s challenge
+    # run start, run end, then the expiry check, which sees the run outlasted the 5 s challenge
+    clock = iter([t0, t0, t0 + timedelta(seconds=700)])
     monkeypatch.setattr(cli, "_now", lambda: next(clock))
     rc = main(["--fake", "healthy", "--certify", "--yes-upload",
                "--server", server["url"], "--json", str(tmp_path / "r.json")])

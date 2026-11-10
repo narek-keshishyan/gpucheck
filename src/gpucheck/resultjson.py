@@ -57,6 +57,8 @@ def build_result(
     findings: list[Finding],
     challenge: dict | None = None,
     challenge_workload: dict | None = None,
+    timing: dict | None = None,
+    lot: dict | None = None,
 ) -> dict:
     result = _normalize(
         {
@@ -80,6 +82,10 @@ def build_result(
         )
     if challenge_workload is not None:
         result["config"]["challenge_workload"] = _normalize(challenge_workload)
+    if timing is not None:
+        result["timing"] = _normalize(timing)
+    if lot is not None:
+        result["lot"] = _normalize(lot)
     return result
 
 
