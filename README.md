@@ -1,6 +1,6 @@
 # gpucheck
 
-One command that stress-tests an NVIDIA GPU and tells you whether it is healthy, throttling, or degraded.
+One command that stress-tests an NVIDIA GPU and reports throttling, power capping, recorded memory errors and below-reference throughput.
 
 Website: [gpucheck.dev](https://gpucheck.dev) — includes the optional $29 signed certificate for used-GPU listings.
 
@@ -34,7 +34,7 @@ The result is always written locally to `result.json` first. The tool only reads
 
 ### Upload flow
 
-After a run, unless you passed `--offline`, gpucheck asks whether to upload (to `https://gpucheck-api.fly.dev` unless you pass `--server URL`). If you say yes you get a result page URL, a grade such as `Grade B — delivers 94.1% of a healthy <model> (n=12, low confidence)` (or the reason there is none, for example "insufficient reference (n=X)" while too few comparable runs exist, or "measurements only" for MIG), and a delete token. Save the token: it is the only way to delete the page later.
+After a run, unless you passed `--offline`, gpucheck asks whether to upload (to `https://gpucheck-api.fly.dev` unless you pass `--server URL`). If you say yes you get a result page URL, a grade such as `Grade B — 94.1% of the median clean reference run for <model> (n=12, low confidence)` (or the reason there is none, for example "insufficient reference (n=X)" while too few comparable runs exist, or "measurements only" for MIG), and a delete token. Save the token: it is the only way to delete the page later.
 
 ```
 curl -X DELETE -H "X-Delete-Token: <token>" <server>/v1/runs/<run_id>
@@ -91,6 +91,10 @@ Verifying a certificate offline needs the certificate payload, its signature, an
 | 1 | Preflight refused to run (for example the GPU is busy) |
 | 2 | No NVIDIA GPU or driver available |
 | 3 | Run aborted partway (thermal limit, ECC errors, or lost telemetry); result.json is still written |
+
+## What this test does not cover
+
+This is a pre-flight check, not proof of health. It does not test memory cells, silent data corruption, faults that appear only after hours of use, links between GPUs, or physical damage.
 
 ## Limitations
 

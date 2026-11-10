@@ -173,14 +173,14 @@ MODEL = "NVIDIA H100 80GB HBM3"
 def test_format_graded_low_confidence():
     g = {"letter": "B", "ratio": 0.94123, "n": 12, "low_confidence": True}
     assert format_grade(UploadOutcome(True, None, g, None, None, 12), MODEL) == (
-        "Grade B — delivers 94.1% of a healthy NVIDIA H100 80GB HBM3 (n=12, low confidence)"
+        "Grade B — 94.1% of the median clean reference run for NVIDIA H100 80GB HBM3 (n=12, low confidence)"
     )
 
 
 def test_format_graded_confident():
     g = {"letter": "A", "ratio": 0.99, "n": 40, "low_confidence": False}
     assert format_grade(UploadOutcome(True, None, g, None, None, 40), MODEL) == (
-        "Grade A — delivers 99.0% of a healthy NVIDIA H100 80GB HBM3 (n=40)"
+        "Grade A — 99.0% of the median clean reference run for NVIDIA H100 80GB HBM3 (n=40)"
     )
 
 
@@ -212,7 +212,7 @@ def test_cli_prints_formatted_grade(server, tmp_path, capsys):
     g = {"letter": "B", "ratio": 0.941, "n": 12, "low_confidence": True}
     server["body"] = json.dumps({**OK_BODY, "grade": g}).encode()
     _run(tmp_path, "--yes-upload", "--server", server["url"])
-    assert "Grade B — delivers 94.1% of a healthy NVIDIA H100 80GB HBM3 (n=12, low confidence)" in (
+    assert "Grade B — 94.1% of the median clean reference run for NVIDIA H100 80GB HBM3 (n=12, low confidence)" in (
         capsys.readouterr().out
     )
 

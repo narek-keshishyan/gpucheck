@@ -1,6 +1,6 @@
 """Diagnosis rule table: turn derived metrics into plain-language findings.
 
-Rules are evaluated in a fixed order (MEMORY_ERRORS, HOT_UNDER_LOAD,
+Rules are evaluated in a fixed order (MEMORY_ERRORS, MEMORY_NOT_CHECKED, HOT_UNDER_LOAD,
 HOT_ENVIRONMENT, THERMAL_THROTTLING, POWER_CAPPED, UNDERPERFORMING_UNKNOWN,
 INSUFFICIENT_EVIDENCE) and each rule fires at most once. Unknown throttle data
 ("throttle_reasons" in telemetry_gaps) is treated as unknown, never as "none". A rule whose required inputs are None does
@@ -63,6 +63,22 @@ def _memory_errors(m: Metrics, inv: GpuInventory) -> Finding | None:
         "bad",
         "high",
         sentence[0].upper() + sentence[1:] + ". The card has recorded memory errors.",
+    )
+
+
+def _memory_not_checked(m: Metrics, inv: GpuInventory) -> Finding | None:
+    """Say so when the card exposes no memory-error counters at all."""
+    if "ecc_volatile" not in m.telemetry_gaps:
+        return None
+    if inv.remapped_rows is not None or inv.retired_pages is not None:
+        return None
+    if _memory_errors(m, inv) is not None:
+        return None
+    return Finding(
+        "MEMORY_NOT_CHECKED",
+        "info",
+        "high",
+        "This card exposes no memory-error counters, so memory health was not checked.",
     )
 
 
@@ -194,6 +210,7 @@ def diagnose(
     throttling = _thermal_throttling(metrics) if tim is None and insufficient is None else None
     rules = (
         _memory_errors(metrics, inventory),
+        _memory_not_checked(metrics, inventory),
         tim,
         _hot_environment(metrics),
         throttling,

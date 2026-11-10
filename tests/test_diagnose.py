@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from gpucheck.adapter import GpuInventory
 from gpucheck.diagnose import Finding, diagnose
 from gpucheck.metrics import Metrics
@@ -362,3 +364,28 @@ def test_memory_errors_states_what_was_recorded():
     assert "ECC error count rose by 3 during the run" in f.message
     assert "2 memory row(s) were remapped" in f.message
     assert "wear" not in f.message.lower()
+
+
+def _bare(**kw):
+    return replace(inv(), ecc_enabled=None, retired_pages=None, remapped_rows=None, **kw)
+
+
+def test_memory_not_checked_when_card_has_no_counters():
+    m = healthy(ecc_delta=None, telemetry_gaps=["ecc_volatile"])
+    f = find(diagnose(m, PF, _bare(), SPEC), "MEMORY_NOT_CHECKED")
+    assert f.severity == "info" and f.confidence == "high"
+    assert f.message == "This card exposes no memory-error counters, so memory health was not checked."
+
+
+def test_memory_not_checked_absent_when_any_counter_exists():
+    assert "MEMORY_NOT_CHECKED" not in codes(diagnose(healthy(), PF, inv(), SPEC))
+    m = healthy(ecc_delta=None, telemetry_gaps=["ecc_volatile"])
+    with_rows = replace(_bare(), ecc_enabled=False, remapped_rows=0)
+    assert "MEMORY_NOT_CHECKED" not in codes(diagnose(m, PF, with_rows, SPEC))
+
+
+def test_memory_errors_wins_over_not_checked():
+    m = healthy(ecc_delta=None, telemetry_gaps=["ecc_volatile"])
+    failed = replace(_bare(), row_remap_failure=True)
+    found = codes(diagnose(m, PF, failed, SPEC))
+    assert "MEMORY_ERRORS" in found and "MEMORY_NOT_CHECKED" not in found

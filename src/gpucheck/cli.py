@@ -135,7 +135,7 @@ def format_grade(out: UploadOutcome, model: str | None) -> str | None:
             return f"Grade {letter}"
         n = g.get("n", out.n)
         extra = f"n={n}" + (", low confidence" if g.get("low_confidence") else "")
-        return f"Grade {letter} — delivers {ratio * 100:.1f}% of a healthy {model or 'card of this model'} ({extra})"
+        return f"Grade {letter} — {ratio * 100:.1f}% of the median clean reference run for {model or 'this model'} ({extra})"
     if out.reason:
         return f"Grade: {out.reason}"
     if out.n is not None:

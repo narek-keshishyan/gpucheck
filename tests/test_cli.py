@@ -4,6 +4,8 @@ from dataclasses import replace
 from gpucheck import cli
 from gpucheck.cli import main
 from gpucheck.fakes import make_fake
+from gpucheck.report import NOT_COVERED
+from gpucheck.upload import UploadOutcome
 
 
 def test_offline_fake_run_writes_json_and_report(tmp_path, capsys):
@@ -110,3 +112,25 @@ def test_unrelated_value_error_propagates(monkeypatch):
     monkeypatch.setattr(cli, "execute_run", boom)
     with pytest.raises(ValueError):
         main(["--fake", "healthy", "--offline", "--quick"])
+
+
+def test_report_carries_not_covered_note(tmp_path, capsys):
+    main(["--fake", "healthy", "--offline", "--quick", "--json", str(tmp_path / "r.json")])
+    out = capsys.readouterr().out
+    assert NOT_COVERED in out
+    assert "none found by this test" in out
+
+
+def test_not_covered_text_is_exact():
+    assert NOT_COVERED == (
+        "This is a pre-flight check, not proof of health. It does not test memory cells, "
+        "silent data corruption, faults that appear only after hours of use, links between "
+        "GPUs, or physical damage."
+    )
+
+
+def test_grade_line_is_relative_to_reference_median():
+    out = UploadOutcome(True, None, {"letter": "B", "ratio": 0.941, "n": 12, "low_confidence": True}, None, None)
+    assert cli.format_grade(out, "NVIDIA H100") == (
+        "Grade B — 94.1% of the median clean reference run for NVIDIA H100 (n=12, low confidence)"
+    )

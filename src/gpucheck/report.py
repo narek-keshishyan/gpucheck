@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+NOT_COVERED = (
+    "This is a pre-flight check, not proof of health. It does not test memory cells, "
+    "silent data corruption, faults that appear only after hours of use, links between "
+    "GPUs, or physical damage."
+)
+
 _MEASUREMENTS: list[tuple[str, str, str]] = [
     ("idle_temp_c", "Idle temperature", "C"),
     ("steady_temp_c", "Steady-state temperature", "C"),
@@ -88,7 +94,7 @@ def render_report(result: dict) -> str:
             out.append(f"  [{f['severity'].upper()}] {f['code']} (confidence: {f['confidence']})")
             out.append(f"      {f['message']}")
     else:
-        out.append("  none")
+        out.append("  none found by this test")
     out.append("")
 
     out.append("Telemetry gaps")
@@ -98,4 +104,9 @@ def render_report(result: dict) -> str:
         if m not in gaps:
             gaps.append(m)
     out.append("  " + (", ".join(gaps) if gaps else "none"))
+    out.append("")
+
+    out.append("Not covered")
+    out.append("-----------")
+    out.append("  " + NOT_COVERED)
     return "\n".join(out) + "\n"
