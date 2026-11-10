@@ -161,6 +161,7 @@ class NvmlAdapter(TelemetryAdapter):
         remap = self._q("nvmlDeviceGetRemappedRows", h)
         remap_ok = isinstance(remap, (tuple, list)) and len(remap) >= 4
         vbios = self._q("nvmlDeviceGetVbiosVersion", h)
+        vbios = _text(vbios).strip()[:_MAX_TEXT] or None if vbios is not None else None
         serial = clean_serial(self._q("nvmlDeviceGetSerial", h)) if self._include_serial else None
         aggregate = _const(nv, "NVML_AGGREGATE_ECC", default=1)
         ecc_corrected = self._q(
@@ -196,7 +197,7 @@ class NvmlAdapter(TelemetryAdapter):
             row_remap_pending=bool(remap[2]) if remap_ok else None,
             row_remap_failure=bool(remap[3]) if remap_ok else None,
             gpu_index=self._index,
-            vbios_version=_text(vbios).strip()[:_MAX_TEXT] if vbios is not None else None,
+            vbios_version=vbios,
             pcie_gen_current=link["gen_cur"],
             pcie_gen_max=link["gen_max"],
             pcie_width_current=link["width_cur"],

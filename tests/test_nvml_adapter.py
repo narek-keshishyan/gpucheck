@@ -199,11 +199,17 @@ def test_serial_read_only_on_opt_in(monkeypatch):
     monkeypatch.setitem(sys.modules, "pynvml", nv)
     assert NvmlAdapter(include_serial=True).inventory().serial == "1650123456789"
 
-    def forbidden(h):
-        raise AssertionError("serial queried without opt-in")
-
-    nv.nvmlDeviceGetSerial = forbidden
+    calls = []
+    nv.nvmlDeviceGetSerial = lambda h: calls.append(h) or b"1650123456789"
     assert NvmlAdapter().inventory().serial is None
+    assert calls == []
+
+
+def test_blank_vbios_is_unknown(monkeypatch):
+    nv = _with_manifest(modern())
+    nv.nvmlDeviceGetVbiosVersion = lambda h: b"   "
+    monkeypatch.setitem(sys.modules, "pynvml", nv)
+    assert NvmlAdapter().inventory().vbios_version is None
 
 
 def test_manifest_unknown_when_unsupported(monkeypatch):
