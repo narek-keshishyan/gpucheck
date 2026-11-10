@@ -93,15 +93,60 @@ def lot_request(summary: dict, results: list[dict]) -> dict:
     }
 
 
+def read_lot(directory: Path) -> tuple[dict, list[dict]]:
+    """Read lot.json and the per-card results in position order. Raises ValueError with a one-line message."""
+    directory = Path(directory)
+    path = directory / "lot.json"
+
+    def load(p: Path, what: str):
+        try:
+            return json.loads(p.read_text())
+        except OSError as e:
+            raise ValueError(f"cannot read {what} {p}: {e.strerror or e}") from None
+        except ValueError:
+            raise ValueError(f"{what} {p} is not valid JSON") from None
+
+    summary = load(path, "lot")
+    if not isinstance(summary, dict) or not summary.get("lot_id") or not isinstance(summary.get("cards"), list):
+        raise ValueError(f"{path} is not a gpucheck lot")
+    cards = summary["cards"]
+    if not all(isinstance(c, dict) and isinstance(c.get("position"), int) for c in cards):
+        raise ValueError(f"{path} is not a gpucheck lot")
+    results = []
+    for card in sorted(cards, key=lambda c: c["position"]):
+        name = card.get("file")
+        if not name:
+            continue
+        if not isinstance(name, str) or Path(name).name != name:
+            raise ValueError(f"{path} names an unusable card file {name!r}")
+        result = load(directory / name, "card file")
+        if not isinstance(result, dict):
+            raise ValueError(f"card file {directory / name} is not a gpucheck result")
+        if run_id(result) != card.get("run_id"):
+            raise ValueError(f"card file {directory / name} was changed after the run; it will not be uploaded")
+        results.append(result)
+    return summary, results
+
+
 def mark_uploaded(directory: Path, server: str, outcome) -> None:
-    """Record a successful lot upload in lot.json (format as write_lot writes it)."""
+    """Record a successful lot upload in lot.json (format as write_lot writes it).
+
+    A retry of an upload the server already holds returns no delete tokens; the ones recorded earlier are kept."""
     path = Path(directory) / "lot.json"
     summary = json.loads(path.read_text())
+    previous = {
+        r.get("position"): r.get("delete_token")
+        for r in ((summary.get("uploaded") or {}).get("runs") or [])
+        if isinstance(r, dict) and r.get("delete_token")
+    }
     summary["uploaded"] = {
         "server": server,
         "url": outcome.url,
         "runs": [
-            {k: r.get(k) for k in ("position", "run_id", "url", "card_url", "delete_token")}
+            {
+                **{k: r.get(k) for k in ("position", "run_id", "url", "card_url", "delete_token")},
+                "delete_token": r.get("delete_token") or previous.get(r.get("position")),
+            }
             for r in outcome.runs
         ],
     }

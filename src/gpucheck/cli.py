@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import sys
 import tempfile
@@ -26,6 +27,7 @@ from .lot import (
     mark_uploaded,
     new_lot_id,
     parse_gpus,
+    read_lot,
     render_lot_table,
     settle,
     write_lot,
@@ -63,6 +65,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--include-serial", action="store_true", help="also record the card's serial number in the result")
     p.add_argument("--label", metavar="TEXT", default=None, help=f"a name for a multi-GPU lot, such as a rack or chassis (at most {MAX_LABEL_LEN} characters)")
     p.add_argument("--lot-dir", metavar="DIR", default=None, help="where a multi-GPU run writes its files (default: ./gpucheck-lot-<id>)")
+    p.add_argument("--upload-saved", metavar="PATH", default=None, help="upload a saved result file or lot directory without testing any GPU")
     p.add_argument("--fake", metavar="PROFILE", help=argparse.SUPPRESS)
     return p
 
@@ -76,6 +79,15 @@ def _parse(argv):
         p.error("--certify cannot be combined with --dry-run")
     if args.certify and args.quick:
         p.error("--certify cannot be combined with --quick")
+    if args.upload_saved is not None:
+        for flag, used in (
+            ("--offline", args.offline), ("--dry-run", args.dry_run), ("--certify", args.certify),
+            ("--fake", args.fake), ("--gpus", args.gpus is not None), ("--quick", args.quick),
+            ("--long", args.long), ("--label", args.label is not None),
+            ("--lot-dir", args.lot_dir is not None), ("--include-serial", args.include_serial),
+        ):
+            if used:
+                p.error(f"--upload-saved cannot be combined with {flag}")
     if args.label is not None and len(args.label) > MAX_LABEL_LEN:
         p.error(f"--label must be at most {MAX_LABEL_LEN} characters")
     return args
@@ -322,6 +334,11 @@ def _maybe_upload_lot(summary: dict, results: list[dict], directory: Path, args,
             f"Retry with: gpucheck --upload-saved {directory}"
         )
         return
+    _report_lot_upload(out, directory, server, api_key)
+
+
+def _report_lot_upload(out, directory: Path, server: str, api_key: str | None) -> None:
+    """Print a successful lot upload and record it in lot.json."""
     print(f"Lot page: {out.url}")
     for r in out.runs:
         print(f"GPU {r.get('position')}: {r.get('url')}")
@@ -382,6 +399,11 @@ def _maybe_upload(result: dict, args, challenge: dict | None = None, api_key: st
     if not out.ok:
         print(f"warning: upload failed ({out.error}); result.json is saved locally")
         return
+    _report_upload(out, result, challenge, api_key)
+
+
+def _report_upload(out: UploadOutcome, result: dict, challenge: dict | None, api_key: str | None) -> None:
+    """Print a successful single-result upload."""
     if out.url:
         print(f"Result page: {out.url}")
     if out.card_url:
@@ -400,6 +422,46 @@ def _maybe_upload(result: dict, args, challenge: dict | None = None, api_key: st
         print(ACCOUNT_NOTE)
 
 
+def _main_upload_saved(path_arg: str, args, api_key: str | None) -> int:
+    """Upload a saved result file or lot directory. No GPU, no prompt; 0 on success, 1 on any failure."""
+    path = Path(path_arg)
+    server = args.server or DEFAULT_SERVER
+    try:
+        if path.is_dir():
+            summary, results = read_lot(path)
+            if not results:
+                print(f"gpucheck: {path} has no tested card to upload", file=sys.stderr)
+                return EXIT_REFUSED
+            out = upload_lot(summary, results, server, api_key)
+            if not out.ok:
+                print(f"gpucheck: upload failed ({out.error}); {path} is unchanged", file=sys.stderr)
+                return EXIT_REFUSED
+            _report_lot_upload(out, path, server, api_key)
+            return EXIT_OK
+        result = _read_result(path)
+    except (OSError, ValueError) as e:
+        print(f"gpucheck: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    out = upload(result, server, api_key=api_key)
+    if not out.ok:
+        print(f"gpucheck: upload failed ({out.error}); {path} is unchanged", file=sys.stderr)
+        return EXIT_REFUSED
+    _report_upload(out, result, None, api_key)
+    return EXIT_OK
+
+
+def _read_result(path: Path) -> dict:
+    try:
+        result = json.loads(path.read_text())
+    except OSError as e:
+        raise ValueError(f"cannot read {path}: {e.strerror or e}") from None
+    except ValueError:
+        raise ValueError(f"{path} is not valid JSON") from None
+    if not isinstance(result, dict) or "schema_version" not in result:
+        raise ValueError(f"{path} is not a gpucheck result")
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
     api_key = next((k for k in (c.strip() for c in (args.api_key, os.environ.get("GPUCHECK_API_KEY")) if c) if k), None)
@@ -407,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
     if api_key and any(ch.isspace() or not ch.isprintable() for ch in api_key):
         print("gpucheck: the API key contains invalid characters", file=sys.stderr)
         return EXIT_REFUSED
+    if args.upload_saved is not None:
+        return _main_upload_saved(args.upload_saved, args, api_key)
     index = 0
     args.gpu_index = 0
     lot_adapters = None
