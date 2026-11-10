@@ -437,7 +437,7 @@ def _main_upload_saved(path_arg: str, args, api_key: str | None) -> int:
             if before:
                 print(
                     f"This lot was previously uploaded to {before}; its delete tokens for that server "
-                    f"stay in {path}/lot.json under previous_uploads."
+                    f"are kept in {path}/lot.json under previous_uploads."
                 )
             out = upload_lot(summary, results, server, api_key)
             if not out.ok:
