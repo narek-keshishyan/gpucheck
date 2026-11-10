@@ -78,6 +78,36 @@ def write_lot(directory: Path, summary: dict, cards: list[CardOutcome]) -> None:
     (directory / "lot.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
 
+def untested_entries(summary: dict) -> list[dict]:
+    """The cards that were not tested, in the shape the lot upload carries."""
+    keys = ("position", "gpu_index", "model_name", "uuid_hash", "serial", "reason")
+    return [{k: c[k] for k in keys} for c in summary["cards"] if c["outcome"] == NOT_TESTED]
+
+
+def lot_request(summary: dict, results: list[dict]) -> dict:
+    """The body of a lot upload: the lot, its per-card results and the cards that were not tested."""
+    return {
+        "lot": {"lot_id": summary["lot_id"], "size": summary["size"], "label": summary["label"]},
+        "results": results,
+        "untested": untested_entries(summary),
+    }
+
+
+def mark_uploaded(directory: Path, server: str, outcome) -> None:
+    """Record a successful lot upload in lot.json (format as write_lot writes it)."""
+    path = Path(directory) / "lot.json"
+    summary = json.loads(path.read_text())
+    summary["uploaded"] = {
+        "server": server,
+        "url": outcome.url,
+        "runs": [
+            {k: r.get(k) for k in ("position", "run_id", "url", "card_url", "delete_token")}
+            for r in outcome.runs
+        ],
+    }
+    path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+
+
 def render_lot_table(summary: dict) -> str:
     out = ["Lot summary", "=" * 11]
     if summary.get("label"):

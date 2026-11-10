@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import os
 import sys
 import tempfile
 import time
@@ -20,7 +21,9 @@ from .lot import (
     TESTED,
     CardOutcome,
     lot_exit_code,
+    lot_request,
     lot_summary,
+    mark_uploaded,
     new_lot_id,
     parse_gpus,
     render_lot_table,
@@ -33,7 +36,7 @@ from .report import NOT_COVERED, render_report
 from .resultjson import build_result, canonical_dumps
 from .run import NullLoad, RunConfig, execute_run
 from .specs import lookup
-from .upload import ChallengeUnavailable, UploadOutcome, fetch_challenge, upload
+from .upload import ChallengeUnavailable, UploadOutcome, fetch_challenge, upload, upload_lot
 
 DEFAULT_SERVER = "https://gpucheck-api.fly.dev"
 
@@ -41,6 +44,7 @@ EXIT_OK, EXIT_REFUSED, EXIT_NO_GPU, EXIT_ABORTED = 0, 1, 2, 3
 EXIT_INTERRUPTED = 130
 
 INTERRUPTED = "interrupted"
+ACCOUNT_NOTE = "Account uploads cannot be self-deleted."
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -54,6 +58,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="show what would be uploaded")
     p.add_argument("--json", metavar="PATH", default="./gpucheck-result.json", help="where to write result.json")
     p.add_argument("--server", metavar="URL", default=None, help="upload server URL")
+    p.add_argument("--api-key", metavar="KEY", default=None, help="send this API key with the upload (or set GPUCHECK_API_KEY); it is never saved or printed")
     p.add_argument("--gpus", metavar="SPEC", default=None, help='which GPUs to test: "all" or indices such as "0,2" (default: 0)')
     p.add_argument("--include-serial", action="store_true", help="also record the card's serial number in the result")
     p.add_argument("--label", metavar="TEXT", default=None, help=f"a name for a multi-GPU lot, such as a rack or chassis (at most {MAX_LABEL_LEN} characters)")
@@ -237,7 +242,7 @@ def _run_card(
     return outcome(run.inventory, TESTED, None, result)
 
 
-def _main_lot(adapters, args, gpu_indices: list[int]) -> int:
+def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None) -> int:
     """Test every card in turn and write the lot; gpu_indices[i] is the index adapters[i] was selected by."""
     if args.certify:
         print("gpucheck: --certify cannot be combined with a multi-GPU run", file=sys.stderr)
@@ -293,7 +298,44 @@ def _main_lot(adapters, args, gpu_indices: list[int]) -> int:
     print(f"Lot written to {directory}")
     if interrupted:  # an interrupted lot is never uploaded
         return EXIT_INTERRUPTED
+    results = [c.result for c in cards if c.result is not None]
+    if results and not args.offline:
+        _maybe_upload_lot(summary, results, directory, args, api_key)
     return lot_exit_code(cards)
+
+
+def _maybe_upload_lot(summary: dict, results: list[dict], directory: Path, args, api_key: str | None) -> None:
+    if args.dry_run:
+        print(canonical_dumps(lot_request(summary, results)))  # the key is a header, never in the body
+        return
+    server = args.server or DEFAULT_SERVER
+    if not args.yes_upload:
+        if not sys.stdin.isatty():
+            print("Not uploaded. To upload this lot, re-run with --yes-upload.")
+            return
+        if not _confirm(server, "lot"):
+            return
+    out = upload_lot(summary, results, server, api_key)
+    if not out.ok:
+        print(
+            f"warning: upload failed ({out.error}); the lot is saved in {directory}. "
+            f"Retry with: gpucheck --upload-saved {directory}"
+        )
+        return
+    print(f"Lot page: {out.url}")
+    for r in out.runs:
+        print(f"GPU {r.get('position')}: {r.get('url')}")
+        if r.get("card_url"):
+            print(f"  Card history: {r['card_url']}")
+    tokens = [r.get("delete_token") for r in out.runs]
+    if any(tokens):
+        print(f"Delete tokens were saved in {directory}/lot.json")
+    elif api_key:
+        print(ACCOUNT_NOTE)
+    try:
+        mark_uploaded(directory, server, out)
+    except (OSError, ValueError) as e:
+        print(f"warning: could not record the upload in {directory}/lot.json ({e})")
 
 
 def format_grade(out: UploadOutcome, model: str | None) -> str | None:
@@ -314,15 +356,15 @@ def format_grade(out: UploadOutcome, model: str | None) -> str | None:
     return None
 
 
-def _confirm(server: str) -> bool:
+def _confirm(server: str, what: str = "result") -> bool:
     try:
-        return input(f"Upload this result to {server}? [y/N] ").strip().lower() == "y"
+        return input(f"Upload this {what} to {server}? [y/N] ").strip().lower() == "y"
     except (EOFError, KeyboardInterrupt):  # closed stdin or Ctrl-C at the prompt means "no"
         print()
         return False
 
 
-def _maybe_upload(result: dict, args, challenge: dict | None = None) -> None:
+def _maybe_upload(result: dict, args, challenge: dict | None = None, api_key: str | None = None) -> None:
     if args.dry_run:
         print(canonical_dumps(result))
         return
@@ -333,12 +375,14 @@ def _maybe_upload(result: dict, args, challenge: dict | None = None) -> None:
             return
         if not _confirm(server):
             return
-    out = upload(result, server)
+    out = upload(result, server, api_key=api_key)
     if not out.ok:
         print(f"warning: upload failed ({out.error}); result.json is saved locally")
         return
     if out.url:
         print(f"Result page: {out.url}")
+    if out.card_url:
+        print(f"Card history: {out.card_url}")
     line = format_grade(out, (result.get("inventory") or {}).get("model_name"))
     if line:
         print(line)
@@ -349,10 +393,14 @@ def _maybe_upload(result: dict, args, challenge: dict | None = None) -> None:
     if out.delete_token:
         print(f"Delete token: {out.delete_token}")
         print("(save this token to delete the page later)")
+    elif api_key:
+        print(ACCOUNT_NOTE)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
+    api_key = args.api_key or os.environ.get("GPUCHECK_API_KEY") or None
+    args.api_key = None  # held only as an argument from here on
     index = 0
     args.gpu_index = 0
     lot_adapters = None
@@ -385,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"gpucheck: {e}", file=sys.stderr)
         return EXIT_NO_GPU
     if lot_adapters is not None:
-        return _main_lot(lot_adapters, args, selected)
+        return _main_lot(lot_adapters, args, selected, api_key)
     challenge = None
     if args.certify:
         try:
@@ -434,5 +482,5 @@ def main(argv: list[str] | None = None) -> int:
     if challenge is not None and challenge_expired(challenge):
         print("warning: challenge expired before upload; run again to certify — result saved locally")
     elif not args.offline:
-        _maybe_upload(result, args, challenge)
+        _maybe_upload(result, args, challenge, api_key)
     return EXIT_ABORTED if run.aborted else EXIT_OK

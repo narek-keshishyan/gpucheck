@@ -226,7 +226,7 @@ def test_default_server_is_production_and_used_without_flag(tmp_path, monkeypatc
     assert cli_mod.DEFAULT_SERVER == "https://gpucheck-api.fly.dev"
     seen = {}
 
-    def fake_upload(result, server, timeout_s=20):
+    def fake_upload(result, server, timeout_s=20, api_key=None):
         seen["server"] = server
         return UploadOutcome(ok=True, url=None, grade=None, delete_token=None, error=None)
 
@@ -251,3 +251,30 @@ def test_prompt_eof_or_interrupt_means_no(server, tmp_path, capsys, monkeypatch,
     assert rc == 0 and server["requests"] == [] and out.exists()
     c = capsys.readouterr()
     assert "Traceback" not in c.out + c.err
+
+
+def test_upload_sends_bearer_key_only_when_given(server):
+    upload(RESULT, server["url"], api_key="gpk_secret")
+    upload(RESULT, server["url"])
+    with_key, without = (r[1] for r in server["requests"])
+    assert with_key["Authorization"] == "Bearer gpk_secret" and "Authorization" not in without
+
+
+def test_upload_401_names_the_key(server):
+    server["status"] = 401
+    out = upload(RESULT, server["url"], api_key="gpk_bad")
+    assert out.ok is False and out.error == "API key was rejected by the server"
+
+
+def test_upload_parses_card_url(server):
+    server["body"] = json.dumps({**OK_BODY, "card_url": "https://x.test/g/abc"}).encode()
+    assert upload(RESULT, server["url"]).card_url == "https://x.test/g/abc"
+
+
+def test_single_account_upload_says_it_cannot_be_self_deleted(server, tmp_path, capsys):
+    server["body"] = json.dumps({**OK_BODY, "delete_token": None}).encode()
+    _run(tmp_path, "--yes-upload", "--server", server["url"], "--api-key", "gpk_secret")
+    c = capsys.readouterr()
+    assert "Account uploads cannot be self-deleted." in c.out and "Delete token" not in c.out
+    assert "gpk_secret" not in c.out + c.err
+    assert server["requests"][0][1]["Authorization"] == "Bearer gpk_secret"
