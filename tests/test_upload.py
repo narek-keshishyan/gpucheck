@@ -7,7 +7,7 @@ import pytest
 
 from gpucheck.cli import main
 from gpucheck.resultjson import canonical_dumps, run_id
-from gpucheck.upload import UploadOutcome, upload
+from gpucheck.upload import UploadOutcome, upload, upload_lot
 
 OK_BODY = {
     "run_id": "abc",
@@ -30,8 +30,12 @@ def server():
             )
             self.send_response(state["status"])
             self.send_header("Content-Type", "application/json")
+            for k, v in state.get("headers", {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(state["body"])
+
+        do_GET = do_POST  # a followed redirect shows up as a second recorded request
 
         def log_message(self, *a):
             pass
@@ -278,3 +282,43 @@ def test_single_account_upload_says_it_cannot_be_self_deleted(server, tmp_path, 
     assert "Account uploads cannot be self-deleted." in c.out and "Delete token" not in c.out
     assert "gpk_secret" not in c.out + c.err
     assert server["requests"][0][1]["Authorization"] == "Bearer gpk_secret"
+
+
+def test_upload_refuses_redirects_and_does_not_forward_the_key(server):
+    server["status"] = 302
+    server["headers"] = {"Location": server["url"] + "/elsewhere"}
+    out = upload(RESULT, server["url"], api_key="gpk_secret")
+    assert out.ok is False
+    assert out.error == "server redirected the upload (HTTP 302); check the --server URL"
+    assert len(server["requests"]) == 1
+
+
+def _raise_with_key(key):
+    def boom(*a, **k):
+        raise ValueError(f"Invalid header value b'Bearer {key}'")
+    return boom
+
+
+def test_upload_redacts_the_key_from_error_text(monkeypatch):
+    monkeypatch.setattr("gpucheck.upload._open", _raise_with_key("gpk_secret"))
+    out = upload(RESULT, "http://127.0.0.1:1", api_key="gpk_secret")
+    assert out.ok is False and "gpk_secret" not in out.error and "[redacted]" in out.error
+
+
+def test_upload_lot_redacts_the_key_from_error_text(monkeypatch):
+    monkeypatch.setattr("gpucheck.upload._open", _raise_with_key("gpk_secret"))
+    summary = {"lot_id": "x", "size": 1, "label": None, "cards": []}
+    out = upload_lot(summary, [RESULT], "http://127.0.0.1:1", api_key="gpk_secret")
+    assert out.ok is False and "gpk_secret" not in out.error and "[redacted]" in out.error
+
+
+def test_cli_key_with_trailing_crlf_is_cleaned(server, tmp_path):
+    _run(tmp_path, "--yes-upload", "--server", server["url"], "--api-key", "gpk_secret\r\n")
+    assert server["requests"][0][1]["Authorization"] == "Bearer gpk_secret"
+
+
+def test_cli_key_with_inner_whitespace_is_refused(server, tmp_path, capsys):
+    rc, _ = _run(tmp_path, "--yes-upload", "--server", server["url"], "--api-key", "gpk se cret")
+    c = capsys.readouterr()
+    assert rc == 1 and "gpucheck: the API key contains invalid characters" in c.err
+    assert "gpk se cret" not in c.out + c.err and server["requests"] == []

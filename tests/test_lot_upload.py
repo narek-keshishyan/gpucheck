@@ -23,8 +23,12 @@ def server():
             )
             self.send_response(state["status"])
             self.send_header("Content-Type", "application/json")
+            for k, v in state.get("headers", {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(state["body"])
+
+        do_GET = do_POST  # a followed redirect shows up as a second recorded request
 
         def log_message(self, *a):
             pass
@@ -64,7 +68,9 @@ def test_lot_is_uploaded_in_one_request(server, tmp_path, capsys):
     assert summary["uploaded"]["runs"][0]["delete_token"] == "tok0"
 
 
-def test_api_key_never_reaches_disk_or_terminal(server, tmp_path, capsys):
+@pytest.mark.parametrize("status", [200, 500])
+def test_api_key_never_reaches_disk_or_terminal(server, tmp_path, capsys, status):
+    server["status"] = status
     _, d = run_lot(tmp_path, server, "healthy,healthy", "--api-key", "gpk_secret")
     c = capsys.readouterr()
     assert "gpk_secret" not in c.out + c.err
@@ -111,4 +117,60 @@ def test_lot_401_names_the_key(server, tmp_path, capsys):
 
 def test_non_interactive_lot_needs_yes_upload(server, tmp_path, capsys):
     main(["--fake", "healthy,healthy", "--quick", "--lot-dir", str(tmp_path / "l"), "--server", server["url"]])
-    assert server["requests"] == [] and "--yes-upload" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert server["requests"] == []
+    assert f"gpucheck --upload-saved {tmp_path / 'l'}" in out and "re-run" not in out
+
+
+def test_lot_upload_refuses_redirects(server, tmp_path, capsys):
+    server["status"] = 302
+    server["headers"] = {"Location": server["url"] + "/elsewhere"}
+    server["body"] = b'{"runs": []}'
+    _, d = run_lot(tmp_path, server, "healthy,healthy", "--api-key", "gpk_secret")
+    out = capsys.readouterr().out
+    assert len(server["requests"]) == 1
+    assert "server redirected the upload (HTTP 302); check the --server URL" in out
+    assert json.loads((d / "lot.json").read_text())["uploaded"] is None
+
+
+def test_lot_upload_without_runs_list_is_still_a_success(server, tmp_path, capsys):
+    server["body"] = json.dumps({"lot_id": "x", "url": "https://x.test/l/abc"}).encode()
+    _, d = run_lot(tmp_path, server, "healthy,healthy")
+    out = capsys.readouterr().out
+    assert "upload failed" not in out and "https://x.test/l/abc" in out
+    assert json.loads((d / "lot.json").read_text())["uploaded"]["runs"] == []
+
+
+def test_delete_tokens_are_printed_when_lot_json_cannot_be_updated(server, tmp_path, capsys, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr("gpucheck.cli.mark_uploaded", boom)
+    run_lot(tmp_path, server, "healthy,healthy")
+    out = capsys.readouterr().out
+    assert "GPU 0 delete token: tok0" in out and "lot.json" in out
+    assert "Delete tokens were saved" not in out
+
+
+def test_aborted_and_busy_cards_are_split_between_results_and_untested(server, tmp_path):
+    run_lot(tmp_path, server, "healthy,overheat,busy")
+    body = json.loads(server["requests"][0][2])
+    assert [r["lot"]["position"] for r in body["results"]] == [0, 1]
+    assert body["results"][1]["aborted"] == "thermal"
+    assert [u["position"] for u in body["untested"]] == [2] and body["lot"]["size"] == 3
+
+
+def test_nothing_is_uploaded_when_no_card_produced_a_result(server, tmp_path):
+    rc, _ = run_lot(tmp_path, server, "busy,busy")
+    assert rc == 1 and server["requests"] == []
+
+
+def test_empty_key_argument_falls_back_to_environment(server, tmp_path, monkeypatch):
+    monkeypatch.setenv("GPUCHECK_API_KEY", "gpk_env")
+    run_lot(tmp_path, server, "healthy,healthy", "--api-key", "")
+    assert server["requests"][0][1]["Authorization"] == "Bearer gpk_env"
+
+
+def test_no_authorization_header_when_both_keys_are_empty(server, tmp_path, monkeypatch):
+    monkeypatch.setenv("GPUCHECK_API_KEY", "")
+    run_lot(tmp_path, server, "healthy,healthy", "--api-key", "")
+    assert "Authorization" not in server["requests"][0][1]

@@ -58,7 +58,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="show what would be uploaded")
     p.add_argument("--json", metavar="PATH", default="./gpucheck-result.json", help="where to write result.json")
     p.add_argument("--server", metavar="URL", default=None, help="upload server URL")
-    p.add_argument("--api-key", metavar="KEY", default=None, help="send this API key with the upload (or set GPUCHECK_API_KEY); it is never saved or printed")
+    p.add_argument("--api-key", metavar="KEY", default=None, help="send this API key with the upload; prefer the GPUCHECK_API_KEY environment variable, because command-line arguments are visible to other users of the machine. The key is never saved or printed")
     p.add_argument("--gpus", metavar="SPEC", default=None, help='which GPUs to test: "all" or indices such as "0,2" (default: 0)')
     p.add_argument("--include-serial", action="store_true", help="also record the card's serial number in the result")
     p.add_argument("--label", metavar="TEXT", default=None, help=f"a name for a multi-GPU lot, such as a rack or chassis (at most {MAX_LABEL_LEN} characters)")
@@ -311,7 +311,7 @@ def _maybe_upload_lot(summary: dict, results: list[dict], directory: Path, args,
     server = args.server or DEFAULT_SERVER
     if not args.yes_upload:
         if not sys.stdin.isatty():
-            print("Not uploaded. To upload this lot, re-run with --yes-upload.")
+            print(f"Not uploaded. The lot is saved in {directory}; upload it later with: gpucheck --upload-saved {directory}")
             return
         if not _confirm(server, "lot"):
             return
@@ -327,15 +327,18 @@ def _maybe_upload_lot(summary: dict, results: list[dict], directory: Path, args,
         print(f"GPU {r.get('position')}: {r.get('url')}")
         if r.get("card_url"):
             print(f"  Card history: {r['card_url']}")
-    tokens = [r.get("delete_token") for r in out.runs]
-    if any(tokens):
+    tokens = [(r.get("position"), r.get("delete_token")) for r in out.runs if r.get("delete_token")]
+    try:
+        mark_uploaded(directory, server, out)
+    except (OSError, ValueError) as e:  # the tokens exist nowhere else, so show them
+        print(f"warning: could not update {directory}/lot.json ({e}); save these delete tokens now")
+        for position, token in tokens:
+            print(f"GPU {position} delete token: {token}")
+        return
+    if tokens:
         print(f"Delete tokens were saved in {directory}/lot.json")
     elif api_key:
         print(ACCOUNT_NOTE)
-    try:
-        mark_uploaded(directory, server, out)
-    except (OSError, ValueError) as e:
-        print(f"warning: could not record the upload in {directory}/lot.json ({e})")
 
 
 def format_grade(out: UploadOutcome, model: str | None) -> str | None:
@@ -399,8 +402,11 @@ def _maybe_upload(result: dict, args, challenge: dict | None = None, api_key: st
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
-    api_key = args.api_key or os.environ.get("GPUCHECK_API_KEY") or None
+    api_key = next((k for k in (c.strip() for c in (args.api_key, os.environ.get("GPUCHECK_API_KEY")) if c) if k), None)
     args.api_key = None  # held only as an argument from here on
+    if api_key and any(ch.isspace() or not ch.isprintable() for ch in api_key):
+        print("gpucheck: the API key contains invalid characters", file=sys.stderr)
+        return EXIT_REFUSED
     index = 0
     args.gpu_index = 0
     lot_adapters = None

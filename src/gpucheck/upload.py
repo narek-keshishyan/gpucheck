@@ -28,14 +28,38 @@ class UploadOutcome:
 KEY_REJECTED = "API key was rejected by the server"
 
 
-def _error_text(e: BaseException) -> str:
+class _Redirected(Exception):
+    def __init__(self, code: int) -> None:
+        super().__init__(f"server redirected the upload (HTTP {code}); check the --server URL")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: it would carry the API key to whatever host the server names."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        raise _Redirected(code)
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _open(req, timeout):
+    return _opener.open(req, timeout=timeout)
+
+
+def _error_text(e: BaseException, api_key: str | None = None) -> str:
     if isinstance(e, urllib.error.HTTPError) and e.code == 401:
         return KEY_REJECTED
-    return " ".join(f"{type(e).__name__}: {e}".split())
+    if isinstance(e, _Redirected):
+        return str(e)
+    text = " ".join(f"{type(e).__name__}: {e}".split())
+    if api_key:
+        text = text.replace(api_key, "[redacted]")
+    return text
 
 
-def _fail(e: BaseException) -> UploadOutcome:
-    return UploadOutcome(False, None, None, None, _error_text(e))
+def _fail(e: BaseException, api_key: str | None = None) -> UploadOutcome:
+    return UploadOutcome(False, None, None, None, _error_text(e, api_key))
 
 
 def _headers(api_key: str | None, extra: dict | None = None) -> dict:
@@ -92,7 +116,7 @@ def upload(result: dict, server: str, timeout_s: float = 20, api_key: str | None
             method="POST",
             headers=_headers(api_key, {"X-Run-Id": run_id(result)}),
         )
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with _open(req, timeout_s) as resp:
             body = json.loads(resp.read().decode())
         if not isinstance(body, dict):
             raise ValueError("unexpected response shape")
@@ -110,7 +134,7 @@ def upload(result: dict, server: str, timeout_s: float = 20, api_key: str | None
             body.get("card_url") if isinstance(body.get("card_url"), str) else None,
         )
     except Exception as e:  # noqa: BLE001 - upload must never break the local run
-        return _fail(e)
+        return _fail(e, api_key)
 
 
 @dataclass(frozen=True)
@@ -134,14 +158,13 @@ def upload_lot(
         req = urllib.request.Request(
             f"{server.rstrip('/')}/v1/lots", data=data, method="POST", headers=_headers(api_key)
         )
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with _open(req, timeout_s) as resp:
             body = json.loads(resp.read().decode())
         if not isinstance(body, dict):
             raise ValueError("unexpected response shape")
-        runs = body.get("runs")
-        if not isinstance(runs, list) or not all(isinstance(r, dict) for r in runs):
-            raise ValueError("unexpected response shape")
+        runs = body.get("runs")  # the server accepted the lot even if it said nothing usable about the runs
+        runs = [r for r in runs if isinstance(r, dict)] if isinstance(runs, list) else []
         url = body.get("url")
         return LotUploadOutcome(True, url if isinstance(url, str) else None, runs, None)
     except Exception as e:  # noqa: BLE001 - upload must never break the local run
-        return LotUploadOutcome(False, None, [], _error_text(e))
+        return LotUploadOutcome(False, None, [], _error_text(e, api_key))
