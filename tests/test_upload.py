@@ -127,7 +127,9 @@ def test_upload_failure_preserves_local_result(tmp_path, capsys):
     rc, out = _run(tmp_path, "--yes-upload", "--server", _dead_url())
     assert rc == 0 and out.exists()
     assert json.loads(out.read_text())["schema_version"] == "1"
-    assert "upload failed" in capsys.readouterr().out.lower()
+    text = capsys.readouterr().out
+    assert "upload failed" in text.lower()
+    assert f"Upload it later with: gpucheck --upload-saved {out}" in text
 
 
 def test_dry_run_sends_nothing(server, tmp_path, capsys):
@@ -140,9 +142,12 @@ def test_dry_run_sends_nothing(server, tmp_path, capsys):
 
 def test_non_tty_no_prompt_no_upload(server, tmp_path, capsys, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
-    rc, _ = _run(tmp_path, "--server", server["url"])
+    rc, out = _run(tmp_path, "--server", server["url"])
     assert rc == 0 and server["requests"] == []
-    assert "--yes-upload" in capsys.readouterr().out
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        f"Not uploaded. To upload this result, re-run with --yes-upload, "
+        f"or upload the saved file later with: gpucheck --upload-saved {out}"
+    )
 
 
 def test_tty_prompt_yes_uploads(server, tmp_path, capsys, monkeypatch):
@@ -280,6 +285,7 @@ def test_single_account_upload_says_it_cannot_be_self_deleted(server, tmp_path, 
     _run(tmp_path, "--yes-upload", "--server", server["url"], "--api-key", "gpk_secret")
     c = capsys.readouterr()
     assert "Account uploads cannot be self-deleted." in c.out and "Delete token" not in c.out
+    assert "already uploaded" not in c.out
     assert "gpk_secret" not in c.out + c.err
     assert server["requests"][0][1]["Authorization"] == "Bearer gpk_secret"
 
@@ -322,3 +328,65 @@ def test_cli_key_with_inner_whitespace_is_refused(server, tmp_path, capsys):
     c = capsys.readouterr()
     assert rc == 1 and "gpucheck: the API key contains invalid characters" in c.err
     assert "gpk se cret" not in c.out + c.err and server["requests"] == []
+
+
+def test_anonymous_single_upload_without_token_says_it_was_already_uploaded(server, tmp_path, capsys):
+    server["body"] = json.dumps({**OK_BODY, "delete_token": None}).encode()
+    _run(tmp_path, "--yes-upload", "--server", server["url"])
+    assert "The server returned no delete tokens: this was already uploaded." in capsys.readouterr().out
+
+
+HTTP_ERROR = "refusing to send the API key over plain http to example.invalid; use an https server URL"
+LOT = {"lot_id": "x", "size": 1, "label": None, "cards": []}
+
+
+def _recording_opener(monkeypatch):
+    calls = []
+
+    def opener(req, timeout):
+        calls.append(req.full_url)
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr("gpucheck.upload._open", opener)
+    return calls
+
+
+def test_key_is_never_sent_over_plain_http(monkeypatch):
+    calls = _recording_opener(monkeypatch)
+    for out in (upload(RESULT, "http://example.invalid", api_key="gpk_secret"),
+                upload_lot(LOT, [RESULT], "http://example.invalid/", api_key="gpk_secret")):
+        assert out.ok is False and out.error == HTTP_ERROR
+    assert calls == []
+
+
+@pytest.mark.parametrize("url", ["http://localhost:1", "http://127.0.0.1:1", "http://[::1]:1",
+                                 "https://example.invalid"])
+def test_key_may_go_to_a_local_host_or_over_https(monkeypatch, url):
+    calls = _recording_opener(monkeypatch)
+    upload(RESULT, url, api_key="gpk_secret")
+    upload_lot(LOT, [RESULT], url, api_key="gpk_secret")
+    assert len(calls) == 2
+
+
+def test_no_key_may_go_over_plain_http(monkeypatch):
+    calls = _recording_opener(monkeypatch)
+    upload(RESULT, "http://example.invalid")
+    assert calls == ["http://example.invalid/v1/runs"]
+
+
+@pytest.mark.parametrize("key", ["gpk se cret", "gpk_secret\n", "gpk\x00secret", "gpk\tsecret"])
+def test_upload_refuses_a_malformed_key_without_echoing_it(monkeypatch, key):
+    calls = _recording_opener(monkeypatch)
+    for out in (upload(RESULT, "https://example.invalid", api_key=key),
+                upload_lot(LOT, [RESULT], "https://example.invalid", api_key=key)):
+        assert out.ok is False and out.error == "the API key contains invalid characters"
+    assert calls == []
+
+
+def test_single_run_refuses_a_key_over_plain_http(tmp_path, capsys, monkeypatch):
+    calls = _recording_opener(monkeypatch)
+    rc, out = _run(tmp_path, "--yes-upload", "--server", "http://example.invalid", "--api-key", "gpk_secret")
+    c = capsys.readouterr()
+    assert rc == 0 and calls == [] and out.exists()
+    assert f"gpucheck: {HTTP_ERROR}" in c.err and f"gpucheck --upload-saved {out}" in c.out
+    assert "gpk_secret" not in c.out + c.err

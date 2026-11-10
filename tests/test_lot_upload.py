@@ -141,9 +141,10 @@ def test_lot_upload_without_runs_list_is_still_a_success(server, tmp_path, capsy
     assert json.loads((d / "lot.json").read_text())["uploaded"]["runs"] == []
 
 
-def test_delete_tokens_are_printed_when_lot_json_cannot_be_updated(server, tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("error", [OSError("disk full"), TypeError("unexpected response")])
+def test_delete_tokens_are_printed_when_lot_json_cannot_be_updated(server, tmp_path, capsys, monkeypatch, error):
     def boom(*a, **k):
-        raise OSError("disk full")
+        raise error
     monkeypatch.setattr("gpucheck.cli.mark_uploaded", boom)
     run_lot(tmp_path, server, "healthy,healthy")
     out = capsys.readouterr().out
@@ -174,3 +175,63 @@ def test_no_authorization_header_when_both_keys_are_empty(server, tmp_path, monk
     monkeypatch.setenv("GPUCHECK_API_KEY", "")
     run_lot(tmp_path, server, "healthy,healthy", "--api-key", "")
     assert "Authorization" not in server["requests"][0][1]
+
+
+ALREADY = "The server returned no delete tokens: this was already uploaded."
+
+
+def test_malformed_position_in_the_response_keeps_the_other_tokens(server, tmp_path, capsys):
+    odd = {"position": [1], "run_id": "r1", "url": "https://x.test/r/r1", "delete_token": "tok1"}
+    server["body"] = json.dumps({**LOT_OK, "runs": [LOT_OK["runs"][0], odd]}).encode()
+    rc, d = run_lot(tmp_path, server, "healthy,healthy")
+    c = capsys.readouterr()
+    assert rc == 0 and "Traceback" not in c.out + c.err
+    runs = json.loads((d / "lot.json").read_text())["uploaded"]["runs"]
+    assert [r["position"] for r in runs] == [0] and runs[0]["delete_token"] == "tok0"
+
+
+def test_anonymous_lot_without_tokens_says_it_was_already_uploaded(server, tmp_path, capsys):
+    server["body"] = json.dumps({**LOT_OK, "runs": [{**LOT_OK["runs"][0], "delete_token": None}]}).encode()
+    run_lot(tmp_path, server, "healthy,healthy")
+    out = capsys.readouterr().out
+    assert ALREADY in out and "Account uploads" not in out
+
+
+def test_account_lot_upload_does_not_say_already_uploaded(server, tmp_path, capsys):
+    server["body"] = json.dumps({**LOT_OK, "runs": [{**LOT_OK["runs"][0], "delete_token": None}]}).encode()
+    run_lot(tmp_path, server, "healthy,healthy", "--api-key", "gpk_secret")
+    assert ALREADY not in capsys.readouterr().out
+
+
+def test_ctrl_c_during_the_lot_upload_keeps_the_exit_code(server, tmp_path, capsys, monkeypatch):
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("gpucheck.cli.upload_lot", interrupted)
+    rc, d = run_lot(tmp_path, server, "healthy,busy")
+    assert rc == 3
+    out = capsys.readouterr().out
+    assert f"upload interrupted; the lot is saved in {d}. Retry with: gpucheck --upload-saved {d}" in out
+    assert json.loads((d / "lot.json").read_text())["uploaded"] is None
+
+
+HTTP_REFUSAL = (
+    "gpucheck: refusing to send the API key over plain http to example.invalid; use an https server URL"
+)
+
+
+def _no_network(monkeypatch):
+    calls = []
+    monkeypatch.setattr("gpucheck.upload._open", lambda *a, **k: calls.append(a) or pytest.fail("network call"))
+    return calls
+
+
+def test_lot_run_refuses_a_key_over_plain_http(tmp_path, capsys, monkeypatch):
+    calls = _no_network(monkeypatch)
+    d = tmp_path / "lot"
+    rc = main(["--fake", "healthy,healthy", "--quick", "--lot-dir", str(d), "--yes-upload",
+               "--server", "http://example.invalid", "--api-key", "gpk_secret"])
+    c = capsys.readouterr()
+    assert rc == 0 and calls == [] and HTTP_REFUSAL in c.err
+    assert f"gpucheck --upload-saved {d}" in c.out and "gpk_secret" not in c.out + c.err
+    assert json.loads((d / "lot.json").read_text())["uploaded"] is None

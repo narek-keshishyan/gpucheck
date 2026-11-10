@@ -161,7 +161,10 @@ def test_other_server_keeps_previous_record(server, tmp_path, capsys):
         {**LOT_OK["runs"][0], "delete_token": None}]}).encode()
     assert main(["--upload-saved", str(d), "--server", a + "/b"]) == 0
     out = capsys.readouterr().out
-    assert "previously uploaded to" in out and a in out
+    assert (
+        f"note: this lot was uploaded to {a} before; its delete tokens for that server "
+        'will be kept in lot.json under "previous_uploads".'
+    ) in out
     lot = json.loads((d / "lot.json").read_text())
     assert lot["uploaded"]["server"] == a + "/b"
     assert lot["uploaded"]["runs"][0]["delete_token"] is None
@@ -265,3 +268,30 @@ def test_finished_lot_has_no_note(server, tmp_path, capsys):
     capsys.readouterr()
     assert main(["--upload-saved", str(d), "--server", server["url"]]) == 0
     assert "did not finish" not in capsys.readouterr().out
+
+
+def test_a_card_file_of_a_lot_is_not_uploaded_on_its_own(server, tmp_path, capsys):
+    d = _offline_lot(tmp_path)
+    capsys.readouterr()
+    assert main(["--upload-saved", str(d / "gpu0.json"), "--server", server["url"]]) == 1
+    err = capsys.readouterr().err
+    assert err.strip() == (
+        f"gpucheck: {d / 'gpu0.json'} is part of a lot; upload its directory instead: gpucheck --upload-saved {d}"
+    )
+    assert server["requests"] == []
+
+
+def test_upload_saved_refuses_a_key_over_plain_http(tmp_path, capsys, monkeypatch):
+    calls = []
+    monkeypatch.setattr("gpucheck.upload._open", lambda *a, **k: calls.append(a) or pytest.fail("network call"))
+    d = _offline_lot(tmp_path)
+    single = _single(tmp_path)
+    capsys.readouterr()
+    for path in (d, single):
+        before = {p.name: p.read_bytes() for p in path.parent.iterdir() if p.is_file()}
+        assert main(["--upload-saved", str(path), "--server", "http://example.invalid", "--api-key", "gpk_k"]) == 1
+        assert {p.name: p.read_bytes() for p in path.parent.iterdir() if p.is_file()} == before
+        err = capsys.readouterr().err
+        assert "gpucheck: refusing to send the API key over plain http to example.invalid; use an https server URL" in err
+        assert "gpk_k" not in err
+    assert calls == []

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
@@ -69,6 +70,24 @@ def _headers(api_key: str | None, extra: dict | None = None) -> dict:
     return headers
 
 
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+KEY_INVALID = "the API key contains invalid characters"
+
+
+def key_error(server: str, api_key: str | None) -> str | None:
+    """Why `api_key` must not be sent to `server`, or None. The text never contains the key."""
+    if not api_key:
+        return None
+    if any(ch.isspace() or not ch.isprintable() for ch in api_key):
+        return KEY_INVALID
+    parts = urllib.parse.urlsplit(server)
+    if parts.scheme != "https":
+        host = parts.hostname or server
+        if host not in LOCAL_HOSTS:
+            return f"refusing to send the API key over plain http to {host}; use an https server URL"
+    return None
+
+
 class ChallengeUnavailable(Exception):
     """The server could not issue a certification challenge."""
 
@@ -109,6 +128,8 @@ def fetch_challenge(server: str, timeout_s: float = 20) -> dict:
 
 
 def upload(result: dict, server: str, timeout_s: float = 20, api_key: str | None = None) -> UploadOutcome:
+    if (refused := key_error(server, api_key)) is not None:
+        return UploadOutcome(False, None, None, None, refused)
     try:
         req = urllib.request.Request(
             f"{server.rstrip('/')}/v1/runs",
@@ -153,6 +174,8 @@ def upload_lot(
     timeout_s: float = 120,
 ) -> LotUploadOutcome:
     """POST the whole lot in one request. Never raises."""
+    if (refused := key_error(server, api_key)) is not None:
+        return LotUploadOutcome(False, None, [], refused)
     try:
         data = canonical_dumps(lot_request(summary, results)).encode()
         req = urllib.request.Request(

@@ -41,7 +41,15 @@ from .report import NOT_COVERED, render_report
 from .resultjson import build_result, canonical_dumps
 from .run import NullLoad, RunConfig, execute_run
 from .specs import lookup
-from .upload import ChallengeUnavailable, UploadOutcome, fetch_challenge, upload, upload_lot
+from .upload import (
+    KEY_INVALID,
+    ChallengeUnavailable,
+    UploadOutcome,
+    fetch_challenge,
+    key_error,
+    upload,
+    upload_lot,
+)
 
 DEFAULT_SERVER = "https://gpucheck-api.fly.dev"
 
@@ -51,6 +59,7 @@ EXIT_INTERRUPTED = 130
 INTERRUPTED = "interrupted"
 NOT_REACHED = "not reached: the run stopped before this card"
 ACCOUNT_NOTE = "Account uploads cannot be self-deleted."
+NO_TOKENS_NOTE = "The server returned no delete tokens: this was already uploaded."
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -353,13 +362,22 @@ def _maybe_upload_lot(summary: dict, results: list[dict], directory: Path, args,
         print(canonical_dumps(lot_request(summary, results)))  # the key is a header, never in the body
         return
     server = args.server or DEFAULT_SERVER
+    later = f"Not uploaded. The lot is saved in {directory}; upload it later with: gpucheck --upload-saved {directory}"
+    if (refused := key_error(server, api_key)) is not None:
+        print(f"gpucheck: {refused}", file=sys.stderr)
+        print(later)
+        return
     if not args.yes_upload:
         if not sys.stdin.isatty():
-            print(f"Not uploaded. The lot is saved in {directory}; upload it later with: gpucheck --upload-saved {directory}")
+            print(later)
             return
         if not _confirm(server, "lot"):
             return
-    out = upload_lot(summary, results, server, api_key)
+    try:  # a lot upload can take minutes; Ctrl-C must not end in a traceback
+        out = upload_lot(summary, results, server, api_key)
+    except KeyboardInterrupt:
+        print(f"upload interrupted; the lot is saved in {directory}. Retry with: gpucheck --upload-saved {directory}")
+        return
     if not out.ok:
         print(
             f"warning: upload failed ({out.error}); the lot is saved in {directory}. "
@@ -379,7 +397,7 @@ def _report_lot_upload(out, directory: Path, server: str, api_key: str | None) -
     tokens = [(r.get("position"), r.get("delete_token")) for r in out.runs if r.get("delete_token")]
     try:
         mark_uploaded(directory, server, out)
-    except (OSError, ValueError) as e:  # the tokens exist nowhere else, so show them
+    except Exception as e:  # the tokens exist nowhere else, so show them
         print(f"warning: could not update {directory}/lot.json ({e}); save these delete tokens now")
         for position, token in tokens:
             print(f"GPU {position} delete token: {token}")
@@ -388,6 +406,8 @@ def _report_lot_upload(out, directory: Path, server: str, api_key: str | None) -
         print(f"Delete tokens were saved in {directory}/lot.json")
     elif api_key:
         print(ACCOUNT_NOTE)
+    else:
+        print(NO_TOKENS_NOTE)
 
 
 def format_grade(out: UploadOutcome, model: str | None) -> str | None:
@@ -421,15 +441,20 @@ def _maybe_upload(result: dict, args, challenge: dict | None = None, api_key: st
         print(canonical_dumps(result))
         return
     server = args.server or DEFAULT_SERVER
+    later = f"gpucheck --upload-saved {args.json}"
+    if (refused := key_error(server, api_key)) is not None:
+        print(f"gpucheck: {refused}", file=sys.stderr)
+        print(f"Not uploaded. The result is saved in {args.json}; upload it later with: {later}")
+        return
     if not args.yes_upload:
         if not sys.stdin.isatty():
-            print("Not uploaded. To upload this result, re-run with --yes-upload.")
+            print(f"Not uploaded. To upload this result, re-run with --yes-upload, or upload the saved file later with: {later}")
             return
         if not _confirm(server):
             return
     out = upload(result, server, api_key=api_key)
     if not out.ok:
-        print(f"warning: upload failed ({out.error}); result.json is saved locally")
+        print(f"warning: upload failed ({out.error}); result.json is saved locally. Upload it later with: {later}")
         return
     _report_upload(out, result, challenge, api_key)
 
@@ -452,12 +477,17 @@ def _report_upload(out: UploadOutcome, result: dict, challenge: dict | None, api
         print("(save this token to delete the page later)")
     elif api_key:
         print(ACCOUNT_NOTE)
+    else:
+        print(NO_TOKENS_NOTE)
 
 
 def _main_upload_saved(path_arg: str, args, api_key: str | None) -> int:
     """Upload a saved result file or lot directory. No GPU, no prompt; 0 on success, 1 on any failure."""
     path = Path(path_arg)
     server = args.server or DEFAULT_SERVER
+    if (refused := key_error(server, api_key)) is not None:
+        print(f"gpucheck: {refused}", file=sys.stderr)
+        return EXIT_REFUSED
     try:
         if path.is_dir():
             summary, results = read_lot(path)
@@ -469,8 +499,8 @@ def _main_upload_saved(path_arg: str, args, api_key: str | None) -> int:
             before = previous_upload_with_tokens(summary, server)
             if before:
                 print(
-                    f"This lot was previously uploaded to {before}; its delete tokens for that server "
-                    f"are kept in {path}/lot.json under previous_uploads."
+                    f"note: this lot was uploaded to {before} before; its delete tokens for that server "
+                    'will be kept in lot.json under "previous_uploads".'
                 )
             out = upload_lot(summary, results, server, api_key)
             if not out.ok:
@@ -481,6 +511,13 @@ def _main_upload_saved(path_arg: str, args, api_key: str | None) -> int:
         result = _read_result(path)
     except (OSError, ValueError) as e:
         print(f"gpucheck: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    if result.get("lot") is not None:  # the server takes a lot's cards only as a lot
+        print(
+            f"gpucheck: {path} is part of a lot; upload its directory instead: "
+            f"gpucheck --upload-saved {path.parent}",
+            file=sys.stderr,
+        )
         return EXIT_REFUSED
     out = upload(result, server, api_key=api_key)
     if not out.ok:
@@ -507,7 +544,7 @@ def main(argv: list[str] | None = None) -> int:
     api_key = next((k for k in (c.strip() for c in (args.api_key, os.environ.get("GPUCHECK_API_KEY")) if c) if k), None)
     args.api_key = None  # held only as an argument from here on
     if api_key and any(ch.isspace() or not ch.isprintable() for ch in api_key):
-        print("gpucheck: the API key contains invalid characters", file=sys.stderr)
+        print(f"gpucheck: {KEY_INVALID}", file=sys.stderr)
         return EXIT_REFUSED
     if args.upload_saved is not None:
         return _main_upload_saved(args.upload_saved, args, api_key)

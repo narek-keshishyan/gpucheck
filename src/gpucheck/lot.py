@@ -179,19 +179,21 @@ def mark_uploaded(directory: Path, server: str, outcome) -> None:
     if isinstance(old, dict):
         if _same_server(old.get("server"), server):
             for r in old.get("runs") or []:
-                if isinstance(r, dict):
-                    record[r.get("position")] = {k: r.get(k) for k in fields}
+                if isinstance(r, dict) and type(r.get("position")) is int:
+                    record[r["position"]] = {k: r.get(k) for k in fields}
         elif any(isinstance(r, dict) and r.get("delete_token") for r in old.get("runs") or []):
             summary["previous_uploads"] = [*(summary.get("previous_uploads") or []), old]
     for r in outcome.runs:
-        entry = record.setdefault(r.get("position"), {k: None for k in fields})
+        if type(r.get("position")) is not int:  # a malformed response entry names no card
+            continue
+        entry = record.setdefault(r["position"], {k: None for k in fields})
         token = entry.get("delete_token")
         entry.update({k: r.get(k) for k in fields})
         entry["delete_token"] = r.get("delete_token") or token
     summary["uploaded"] = {
         "server": server,
         "url": outcome.url,
-        "runs": sorted(record.values(), key=lambda e: (e.get("position") is None, e.get("position") or 0)),
+        "runs": sorted(record.values(), key=lambda e: e["position"]),
     }
     write_summary(directory, summary)
 
