@@ -37,6 +37,9 @@ from .upload import ChallengeUnavailable, UploadOutcome, fetch_challenge, upload
 DEFAULT_SERVER = "https://gpucheck-api.fly.dev"
 
 EXIT_OK, EXIT_REFUSED, EXIT_NO_GPU, EXIT_ABORTED = 0, 1, 2, 3
+EXIT_INTERRUPTED = 130
+
+INTERRUPTED = "interrupted"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -167,6 +170,14 @@ class _Unreachable:
         raise self._error
 
 
+class _CardInterrupted(BaseException):
+    """Ctrl-C while a lot card was settling or running; carries that card's outcome."""
+
+    def __init__(self, outcome: CardOutcome) -> None:
+        super().__init__(outcome)
+        self.outcome = outcome
+
+
 def _lot_adapters(args, selected: list[int]) -> list:
     if args.fake:
         return [args.fake_cards[i] for i in selected]
@@ -179,22 +190,35 @@ def _lot_adapters(args, selected: list[int]) -> list:
     return adapters
 
 
-def _run_card(adapter, args, *, position: int, lot: dict, settle_first: bool) -> CardOutcome:
-    """Test one card of a lot. A card that cannot be read or refuses preflight is recorded, not raised."""
+def _run_card(
+    adapter, args, *, position: int, gpu_index: int | None, lot: dict, settle_first: bool
+) -> CardOutcome:
+    """Test one card of a lot. A card that cannot be read, refuses preflight or fails is recorded, not raised.
+
+    Ctrl-C while settling or running raises _CardInterrupted carrying this card's outcome."""
+
+    def outcome(inventory, kind, reason, result=None) -> CardOutcome:
+        return CardOutcome(position, gpu_index, inventory, kind, reason, result)
+
     try:
         inventory = adapter.inventory()
     except Exception as e:
-        return CardOutcome(position, None, NOT_TESTED, f"could not read the card: {e}", None)
+        return outcome(None, NOT_TESTED, f"could not read the card: {e}")
     timer = _timer(args)
     started = _now()
-    settle_s = settle(adapter, sleep=timer.get("sleep", time.sleep)) if settle_first else None
-    spec = lookup(inventory.model_name)
-    device = inventory.gpu_index if inventory.gpu_index is not None else 0
-    load = _make_load(args, None, device_index=device)
-    run = execute_run(adapter, load, _config(args), spec, **timer)
+    try:
+        settle_s = settle(adapter, sleep=timer.get("sleep", time.sleep)) if settle_first else None
+        spec = lookup(inventory.model_name)
+        device = inventory.gpu_index if inventory.gpu_index is not None else 0
+        load = _make_load(args, None, device_index=device)
+        run = execute_run(adapter, load, _config(args), spec, **timer)
+    except KeyboardInterrupt:
+        raise _CardInterrupted(outcome(inventory, NOT_TESTED, INTERRUPTED)) from None
+    except Exception as e:  # one card's failure must not lose the rest of the lot
+        return outcome(inventory, NOT_TESTED, f"run failed: {type(e).__name__}: {e}")
     ended = _now()
     if run.aborted == "preflight_refused":
-        return CardOutcome(position, run.inventory, NOT_TESTED, "; ".join(run.preflight.reasons), None)
+        return outcome(run.inventory, NOT_TESTED, "; ".join(run.preflight.reasons))
     metrics = derive(run, spec)
     findings = diagnose(metrics, run.preflight, run.inventory, spec)
     result = build_result(
@@ -203,11 +227,12 @@ def _run_card(adapter, args, *, position: int, lot: dict, settle_first: bool) ->
         lot=lot,
     )
     if run.aborted:
-        return CardOutcome(position, run.inventory, ABORTED, run.aborted, result)
-    return CardOutcome(position, run.inventory, TESTED, None, result)
+        return outcome(run.inventory, ABORTED, run.aborted, result)
+    return outcome(run.inventory, TESTED, None, result)
 
 
-def _main_lot(adapters, args) -> int:
+def _main_lot(adapters, args, gpu_indices: list[int]) -> int:
+    """Test every card in turn and write the lot; gpu_indices[i] is the index adapters[i] was selected by."""
     if args.certify:
         print("gpucheck: --certify cannot be combined with a multi-GPU run", file=sys.stderr)
         return EXIT_REFUSED
@@ -218,10 +243,23 @@ def _main_lot(adapters, args) -> int:
         return EXIT_REFUSED
     created = _iso(_now())
     lot_ref = {"lot_id": lot_id, "size": len(adapters), "label": args.label}
-    cards = [
-        _run_card(adapter, args, position=pos, lot={**lot_ref, "position": pos}, settle_first=pos > 0)
-        for pos, adapter in enumerate(adapters)
-    ]
+    cards: list[CardOutcome] = []
+    interrupted = False
+    for pos, adapter in enumerate(adapters):
+        try:
+            cards.append(_run_card(
+                adapter, args, position=pos, gpu_index=gpu_indices[pos],
+                lot={**lot_ref, "position": pos}, settle_first=pos > 0,
+            ))
+        except _CardInterrupted as stop:
+            cards.append(stop.outcome)
+            interrupted = True
+        except KeyboardInterrupt:  # between cards or while reading the inventory
+            interrupted = True
+        if interrupted:
+            break
+    for pos in range(len(cards), len(adapters)):
+        cards.append(CardOutcome(pos, gpu_indices[pos], None, NOT_TESTED, INTERRUPTED, None))
     summary = lot_summary(lot_id, args.label, created, cards)
     try:
         write_lot(directory, summary, cards)
@@ -234,6 +272,8 @@ def _main_lot(adapters, args) -> int:
     print(render_lot_table(summary))
     print(NOT_COVERED)
     print(f"Lot written to {directory}")
+    if interrupted:  # an interrupted lot is never uploaded
+        return EXIT_INTERRUPTED
     return lot_exit_code(cards)
 
 
@@ -332,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"gpucheck: {e}", file=sys.stderr)
         return EXIT_NO_GPU
     if lot_adapters is not None:
-        return _main_lot(lot_adapters, args)
+        return _main_lot(lot_adapters, args, selected)
     challenge = None
     if args.certify:
         try:

@@ -27,6 +27,7 @@ class CardOutcome:
     """What happened to one card of a lot. `result` is None only when the card was not tested."""
 
     position: int
+    gpu_index: int | None  # the index the card was selected by, kept even when it could not be read
     inventory: GpuInventory | None
     outcome: str  # TESTED, ABORTED or NOT_TESTED
     reason: str | None
@@ -44,7 +45,7 @@ def lot_summary(lot_id: str, label: str | None, created_utc: str, cards: list[Ca
         entries.append(
             {
                 "position": c.position,
-                "gpu_index": inv.gpu_index if inv else None,
+                "gpu_index": inv.gpu_index if inv and inv.gpu_index is not None else c.gpu_index,
                 "model_name": inv.model_name if inv else None,
                 "uuid_hash": inv.uuid_hash if inv else None,
                 "serial": inv.serial if inv else None,

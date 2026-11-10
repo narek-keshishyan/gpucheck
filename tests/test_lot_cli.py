@@ -73,6 +73,7 @@ def test_card_that_cannot_be_read_is_recorded_and_skipped(tmp_path, monkeypatch)
     dead = s["cards"][1]
     assert dead["outcome"] == "not_tested" and "fallen off the bus" in dead["reason"]
     assert dead["uuid_hash"] is None and s["cards"][2]["outcome"] == "tested"
+    assert dead["gpu_index"] == 1
 
 
 def test_existing_lot_directory_is_not_overwritten(tmp_path, capsys):
@@ -123,3 +124,36 @@ def test_real_path_records_an_adapter_that_cannot_be_created(tmp_path, monkeypat
     assert "GPU is lost" in s["cards"][1]["reason"] and s["cards"][1]["uuid_hash"] is None
     assert made == [("load", 0), "settle", ("load", 2)]
     assert json.loads((d / "gpu2.json").read_text())["timing"]["settle_s"] == 12.0
+
+
+def _execute_run_failing_on_second_call(monkeypatch, exc):
+    real = cli.execute_run
+    calls = []
+
+    def flaky(*a, **kw):
+        calls.append(1)
+        if len(calls) == 2:
+            raise exc
+        return real(*a, **kw)
+
+    monkeypatch.setattr(cli, "execute_run", flaky)
+
+
+def test_unexpected_error_on_one_card_does_not_lose_the_lot(tmp_path, monkeypatch):
+    _execute_run_failing_on_second_call(monkeypatch, ValueError("boom"))
+    rc, d, s = lot(tmp_path, "healthy,healthy,healthy")
+    assert rc == 3
+    assert [c["outcome"] for c in s["cards"]] == ["tested", "not_tested", "tested"]
+    assert "run failed: ValueError: boom" in s["cards"][1]["reason"]
+    assert s["cards"][1]["gpu_index"] == 1 and not (d / "gpu1.json").exists()
+
+
+def test_ctrl_c_keeps_the_cards_already_tested(tmp_path, monkeypatch, capsys):
+    _execute_run_failing_on_second_call(monkeypatch, KeyboardInterrupt())
+    rc, d, s = lot(tmp_path, "healthy,healthy,healthy")
+    assert rc == 130
+    assert [c["outcome"] for c in s["cards"]] == ["tested", "not_tested", "not_tested"]
+    assert [c["reason"] for c in s["cards"][1:]] == ["interrupted", "interrupted"]
+    assert [c["gpu_index"] for c in s["cards"]] == [0, 1, 2]
+    assert (d / "gpu0.json").exists() and not (d / "gpu1.json").exists()
+    assert "Lot summary" in capsys.readouterr().out
