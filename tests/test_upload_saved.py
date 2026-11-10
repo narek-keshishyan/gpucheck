@@ -133,3 +133,90 @@ def test_upload_saved_needs_no_gpu(server, tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "gpu_count", boom)
     monkeypatch.setattr(cli, "NvmlAdapter", boom)
     assert main(["--upload-saved", str(d), "--server", server["url"]]) == 0
+
+
+def _edit_lot(d, fn):
+    p = d / "lot.json"
+    data = json.loads(p.read_text())
+    fn(data)
+    p.write_text(json.dumps(data))
+
+
+def test_empty_response_never_erases_recorded_tokens(server, tmp_path):
+    d = _offline_lot(tmp_path)
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 0
+    first = json.loads((d / "lot.json").read_text())["uploaded"]["runs"]
+    assert first[0]["delete_token"] == "tok0"
+    server["body"] = json.dumps({"lot_id": "x", "url": "https://x.test/l/abc", "runs": []}).encode()
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 0
+    assert json.loads((d / "lot.json").read_text())["uploaded"]["runs"] == first
+
+
+def test_other_server_keeps_previous_record(server, tmp_path, capsys):
+    d = _offline_lot(tmp_path)
+    a = server["url"]
+    assert main(["--upload-saved", str(d), "--server", a]) == 0
+    capsys.readouterr()
+    server["body"] = json.dumps({**LOT_OK, "url": "https://b.test/l/abc", "runs": [
+        {**LOT_OK["runs"][0], "delete_token": None}]}).encode()
+    assert main(["--upload-saved", str(d), "--server", a + "/b"]) == 0
+    out = capsys.readouterr().out
+    assert "previously uploaded to" in out and a in out
+    lot = json.loads((d / "lot.json").read_text())
+    assert lot["uploaded"]["server"] == a + "/b"
+    assert lot["uploaded"]["runs"][0]["delete_token"] is None
+    (prev,) = lot["previous_uploads"]
+    assert prev["server"] == a and prev["runs"][0]["delete_token"] == "tok0"
+
+
+@pytest.mark.parametrize("name", ["../x.json", "/etc/hosts", "lot.json", "gpu0.txt", "sub/gpu0.json"])
+def test_unsafe_card_file_name_is_refused(server, tmp_path, capsys, name):
+    d = _offline_lot(tmp_path)
+    _edit_lot(d, lambda s: s["cards"][0].__setitem__("file", name))
+    capsys.readouterr()
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 1
+    c = capsys.readouterr()
+    assert name in c.err and len(c.err.strip().splitlines()) == 1
+    assert server["requests"] == []
+
+
+def test_symlinked_card_file_is_refused(server, tmp_path, capsys):
+    d = _offline_lot(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_bytes((d / "gpu0.json").read_bytes())
+    (d / "gpu0.json").unlink()
+    try:
+        (d / "gpu0.json").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    capsys.readouterr()
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 1
+    assert "gpu0.json" in capsys.readouterr().err
+    assert server["requests"] == []
+
+
+@pytest.mark.parametrize("damage", [
+    lambda s: s.pop("size"),
+    lambda s: s.__setitem__("size", "2"),
+    lambda s: s["cards"][0].pop("outcome"),
+    lambda s: s["cards"].append("x"),
+])
+def test_damaged_lot_json_is_refused_clearly(server, tmp_path, capsys, damage):
+    d = _offline_lot(tmp_path)
+    _edit_lot(d, damage)
+    capsys.readouterr()
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 1
+    err = capsys.readouterr().err
+    assert "not a valid" in err and "lot.json" in err and len(err.strip().splitlines()) == 1
+    assert server["requests"] == []
+
+
+def test_failed_run_upload_then_upload_saved_records_tokens(server, tmp_path):
+    d = tmp_path / "lot"
+    server["status"] = 500
+    main(["--fake", "healthy,healthy", "--quick", "--lot-dir", str(d), "--yes-upload", "--server", server["url"]])
+    assert json.loads((d / "lot.json").read_text())["uploaded"] is None
+    server["status"] = 200
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 0
+    runs = json.loads((d / "lot.json").read_text())["uploaded"]["runs"]
+    assert runs[0]["delete_token"] == "tok0"

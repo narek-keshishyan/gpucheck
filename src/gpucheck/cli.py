@@ -27,6 +27,7 @@ from .lot import (
     mark_uploaded,
     new_lot_id,
     parse_gpus,
+    previous_upload_with_tokens,
     read_lot,
     render_lot_table,
     settle,
@@ -432,6 +433,12 @@ def _main_upload_saved(path_arg: str, args, api_key: str | None) -> int:
             if not results:
                 print(f"gpucheck: {path} has no tested card to upload", file=sys.stderr)
                 return EXIT_REFUSED
+            before = previous_upload_with_tokens(summary, server)
+            if before:
+                print(
+                    f"This lot was previously uploaded to {before}; its delete tokens for that server "
+                    f"stay in {path}/lot.json under previous_uploads."
+                )
             out = upload_lot(summary, results, server, api_key)
             if not out.ok:
                 print(f"gpucheck: upload failed ({out.error}); {path} is unchanged", file=sys.stderr)

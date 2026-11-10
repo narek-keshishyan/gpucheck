@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -14,6 +15,8 @@ from .resultjson import canonical_dumps, run_id
 
 MAX_LOT_CARDS = 16
 MAX_LABEL_LEN = 80
+
+_CARD_FILE = re.compile(r"gpu[0-9]+\.json")
 
 TESTED, ABORTED, NOT_TESTED = "tested", "aborted", "not_tested"
 
@@ -107,18 +110,30 @@ def read_lot(directory: Path) -> tuple[dict, list[dict]]:
             raise ValueError(f"{what} {p} is not valid JSON") from None
 
     summary = load(path, "lot")
+    invalid = ValueError(f"{path} is not a valid gpucheck lot")
     if not isinstance(summary, dict) or not summary.get("lot_id") or not isinstance(summary.get("cards"), list):
-        raise ValueError(f"{path} is not a gpucheck lot")
+        raise invalid
+    if type(summary.get("size")) is not int:
+        raise invalid
     cards = summary["cards"]
-    if not all(isinstance(c, dict) and isinstance(c.get("position"), int) for c in cards):
-        raise ValueError(f"{path} is not a gpucheck lot")
+    if not all(
+        isinstance(c, dict) and type(c.get("position")) is int and isinstance(c.get("outcome"), str)
+        for c in cards
+    ):
+        raise invalid
     results = []
     for card in sorted(cards, key=lambda c: c["position"]):
         name = card.get("file")
         if not name:
             continue
-        if not isinstance(name, str) or Path(name).name != name:
-            raise ValueError(f"{path} names an unusable card file {name!r}")
+        card_path = directory / name if isinstance(name, str) else None
+        if (
+            card_path is None
+            or not _CARD_FILE.fullmatch(name)
+            or card_path.is_symlink()
+            or not card_path.is_file()
+        ):
+            raise ValueError(f"{path} names a card file that is not a plain gpu<N>.json file in the lot: {name!r}")
         result = load(directory / name, "card file")
         if not isinstance(result, dict):
             raise ValueError(f"card file {directory / name} is not a gpucheck result")
@@ -134,23 +149,41 @@ def mark_uploaded(directory: Path, server: str, outcome) -> None:
     A retry of an upload the server already holds returns no delete tokens; the ones recorded earlier are kept."""
     path = Path(directory) / "lot.json"
     summary = json.loads(path.read_text())
-    previous = {
-        r.get("position"): r.get("delete_token")
-        for r in ((summary.get("uploaded") or {}).get("runs") or [])
-        if isinstance(r, dict) and r.get("delete_token")
-    }
+    fields = ("position", "run_id", "url", "card_url", "delete_token")
+    old = summary.get("uploaded")
+    record: dict[int, dict] = {}
+    if isinstance(old, dict):
+        if _same_server(old.get("server"), server):
+            for r in old.get("runs") or []:
+                if isinstance(r, dict):
+                    record[r.get("position")] = {k: r.get(k) for k in fields}
+        elif any(isinstance(r, dict) and r.get("delete_token") for r in old.get("runs") or []):
+            summary["previous_uploads"] = [*(summary.get("previous_uploads") or []), old]
+    for r in outcome.runs:
+        entry = record.setdefault(r.get("position"), {k: None for k in fields})
+        token = entry.get("delete_token")
+        entry.update({k: r.get(k) for k in fields})
+        entry["delete_token"] = r.get("delete_token") or token
     summary["uploaded"] = {
         "server": server,
         "url": outcome.url,
-        "runs": [
-            {
-                **{k: r.get(k) for k in ("position", "run_id", "url", "card_url", "delete_token")},
-                "delete_token": r.get("delete_token") or previous.get(r.get("position")),
-            }
-            for r in outcome.runs
-        ],
+        "runs": sorted(record.values(), key=lambda e: (e.get("position") is None, e.get("position") or 0)),
     }
     path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+
+
+def _same_server(a, b) -> bool:
+    return isinstance(a, str) and isinstance(b, str) and a.rstrip("/") == b.rstrip("/")
+
+
+def previous_upload_with_tokens(summary: dict, server: str) -> str | None:
+    """The server of an earlier upload that holds delete tokens and differs from `server`, else None."""
+    old = summary.get("uploaded")
+    if not isinstance(old, dict) or _same_server(old.get("server"), server):
+        return None
+    if any(isinstance(r, dict) and r.get("delete_token") for r in old.get("runs") or []):
+        return old.get("server")
+    return None
 
 
 def render_lot_table(summary: dict) -> str:
