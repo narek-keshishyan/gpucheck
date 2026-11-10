@@ -212,11 +212,6 @@ def test_fake_list_with_gpus_runs_the_selected_card(tmp_path):
     assert json.loads(out.read_text())["inventory"]["gpu_index"] == 1
 
 
-def test_fake_list_selecting_several_cards_is_not_available_yet(capsys):
-    assert main(["--fake", "healthy,healthy", "--offline"]) == 1
-    assert "gpucheck: multi-GPU runs are not available yet" in capsys.readouterr().err
-
-
 def test_fake_list_with_unknown_profile_names_it(capsys):
     assert main(["--fake", "healthy,nope", "--offline"]) == 2
     err = capsys.readouterr().err

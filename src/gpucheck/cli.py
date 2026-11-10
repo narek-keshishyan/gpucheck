@@ -5,16 +5,30 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .adapter import AdapterUnavailable, NvmlAdapter, gpu_count
 from .diagnose import diagnose
 from .fakes import make_fakes
-from .lot import parse_gpus
+from .lot import (
+    MAX_LABEL_LEN,
+    ABORTED,
+    NOT_TESTED,
+    TESTED,
+    CardOutcome,
+    lot_exit_code,
+    lot_summary,
+    new_lot_id,
+    parse_gpus,
+    render_lot_table,
+    settle,
+    write_lot,
+)
 from .load import LoadUnavailable, TorchGemmLoad
 from .metrics import derive
-from .report import render_report
+from .report import NOT_COVERED, render_report
 from .resultjson import build_result, canonical_dumps
 from .run import NullLoad, RunConfig, execute_run
 from .specs import lookup
@@ -38,6 +52,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--server", metavar="URL", default=None, help="upload server URL")
     p.add_argument("--gpus", metavar="SPEC", default=None, help='which GPUs to test: "all" or indices such as "0,2" (default: 0)')
     p.add_argument("--include-serial", action="store_true", help="also record the card's serial number in the result")
+    p.add_argument("--label", metavar="TEXT", default=None, help=f"a name for a multi-GPU lot, such as a rack or chassis (at most {MAX_LABEL_LEN} characters)")
+    p.add_argument("--lot-dir", metavar="DIR", default=None, help="where a multi-GPU run writes its files (default: ./gpucheck-lot-<id>)")
     p.add_argument("--fake", metavar="PROFILE", help=argparse.SUPPRESS)
     return p
 
@@ -51,6 +67,8 @@ def _parse(argv):
         p.error("--certify cannot be combined with --dry-run")
     if args.certify and args.quick:
         p.error("--certify cannot be combined with --quick")
+    if args.label is not None and len(args.label) > MAX_LABEL_LEN:
+        p.error(f"--label must be at most {MAX_LABEL_LEN} characters")
     return args
 
 
@@ -118,21 +136,105 @@ def _config(args) -> RunConfig:
     return RunConfig(baseline_s=60, load_s=600, hz=1.0)
 
 
+def _timer(args) -> dict:
+    """clock/sleep overrides for execute_run: a virtual clock for simulated hardware, else none."""
+    if not args.fake:
+        return {}
+    t = [0.0]
+
+    def clock() -> float:
+        return t[0]
+
+    def sleep(s: float) -> None:
+        t[0] += s
+
+    return {"clock": clock, "sleep": sleep}
+
+
 def _execute(adapter, args, challenge=None, device_index: int = 0):
     spec = lookup(adapter.inventory().model_name)
     load = _make_load(args, challenge, device_index=device_index)
-    kwargs = {}
-    if args.fake:  # simulated hardware: use a virtual clock instead of real waiting
-        t = [0.0]
+    return spec, load, execute_run(adapter, load, _config(args), spec, **_timer(args))
 
-        def clock() -> float:
-            return t[0]
 
-        def sleep(s: float) -> None:
-            t[0] += s
+class _Unreachable:
+    """Stands in for a card whose adapter could not be created, so the lot records it and moves on."""
 
-        kwargs = {"clock": clock, "sleep": sleep}
-    return spec, load, execute_run(adapter, load, _config(args), spec, **kwargs)
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def inventory(self):
+        raise self._error
+
+
+def _lot_adapters(args, selected: list[int]) -> list:
+    if args.fake:
+        return [args.fake_cards[i] for i in selected]
+    adapters = []
+    for i in selected:
+        try:
+            adapters.append(NvmlAdapter(index=i, include_serial=args.include_serial))
+        except Exception as e:  # AdapterUnavailable or anything else: this card only
+            adapters.append(_Unreachable(e))
+    return adapters
+
+
+def _run_card(adapter, args, *, position: int, lot: dict, settle_first: bool) -> CardOutcome:
+    """Test one card of a lot. A card that cannot be read or refuses preflight is recorded, not raised."""
+    try:
+        inventory = adapter.inventory()
+    except Exception as e:
+        return CardOutcome(position, None, NOT_TESTED, f"could not read the card: {e}", None)
+    timer = _timer(args)
+    started = _now()
+    settle_s = settle(adapter, sleep=timer.get("sleep", time.sleep)) if settle_first else None
+    spec = lookup(inventory.model_name)
+    device = inventory.gpu_index if inventory.gpu_index is not None else 0
+    load = _make_load(args, None, device_index=device)
+    run = execute_run(adapter, load, _config(args), spec, **timer)
+    ended = _now()
+    if run.aborted == "preflight_refused":
+        return CardOutcome(position, run.inventory, NOT_TESTED, "; ".join(run.preflight.reasons), None)
+    metrics = derive(run, spec)
+    findings = diagnose(metrics, run.preflight, run.inventory, spec)
+    result = build_result(
+        run, metrics, findings,
+        timing={"started_utc": _iso(started), "ended_utc": _iso(ended), "settle_s": settle_s},
+        lot=lot,
+    )
+    if run.aborted:
+        return CardOutcome(position, run.inventory, ABORTED, run.aborted, result)
+    return CardOutcome(position, run.inventory, TESTED, None, result)
+
+
+def _main_lot(adapters, args) -> int:
+    if args.certify:
+        print("gpucheck: --certify cannot be combined with a multi-GPU run", file=sys.stderr)
+        return EXIT_REFUSED
+    lot_id = new_lot_id()
+    directory = Path(args.lot_dir or f"./gpucheck-lot-{lot_id[:8]}")
+    if (directory / "lot.json").exists():
+        print(f"gpucheck: {directory} already contains a lot; choose another --lot-dir", file=sys.stderr)
+        return EXIT_REFUSED
+    created = _iso(_now())
+    lot_ref = {"lot_id": lot_id, "size": len(adapters), "label": args.label}
+    cards = [
+        _run_card(adapter, args, position=pos, lot={**lot_ref, "position": pos}, settle_first=pos > 0)
+        for pos, adapter in enumerate(adapters)
+    ]
+    summary = lot_summary(lot_id, args.label, created, cards)
+    try:
+        write_lot(directory, summary, cards)
+    except FileExistsError:
+        print(f"gpucheck: {directory} already contains a lot; choose another --lot-dir", file=sys.stderr)
+        return EXIT_REFUSED
+    for card in cards:
+        if card.result is not None:
+            print(render_report(card.result))
+    print(render_lot_table(summary))
+    print(NOT_COVERED)
+    print(f"Lot written to {directory}")
+    return lot_exit_code(cards)
 
 
 def format_grade(out: UploadOutcome, model: str | None) -> str | None:
@@ -194,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse(argv)
     index = 0
     args.gpu_index = 0
+    lot_adapters = None
     try:
         if not args.fake:
             count = gpu_count()
@@ -203,12 +306,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"gpucheck: --gpus: {e}", file=sys.stderr)
                 return EXIT_REFUSED
             if len(selected) > 1:
-                print("gpucheck: multi-GPU runs are not available yet", file=sys.stderr)
-                return EXIT_REFUSED
-            index = selected[0]
-            args.gpu_index = index
-            if args.gpus is None and count > 1:
-                print(f"{count} GPUs detected; testing GPU 0 only. Use --gpus all to test every card.")
+                lot_adapters = _lot_adapters(args, selected)
+            else:
+                index = selected[0]
+                args.gpu_index = index
+                if args.gpus is None and count > 1:
+                    print(f"{count} GPUs detected; testing GPU 0 only. Use --gpus all to test every card.")
         else:
             args.fake_cards = make_fakes(args.fake)  # unknown profile: handled below
             try:
@@ -217,16 +320,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"gpucheck: --gpus: {e}", file=sys.stderr)
                 return EXIT_REFUSED
             if len(selected) > 1:
-                print("gpucheck: multi-GPU runs are not available yet", file=sys.stderr)
-                return EXIT_REFUSED
-            args.gpu_index = selected[0]
-        adapter = _make_adapter(args)
+                lot_adapters = _lot_adapters(args, selected)
+            else:
+                args.gpu_index = selected[0]
+        if lot_adapters is None:
+            adapter = _make_adapter(args)
     except AdapterUnavailable as e:
         print(f"gpucheck: no NVIDIA GPU or driver available ({e}).", file=sys.stderr)
         return EXIT_NO_GPU
     except ValueError as e:  # a bad --fake profile name (make_fakes) or an unusable adapter
         print(f"gpucheck: {e}", file=sys.stderr)
         return EXIT_NO_GPU
+    if lot_adapters is not None:
+        return _main_lot(lot_adapters, args)
     challenge = None
     if args.certify:
         try:
