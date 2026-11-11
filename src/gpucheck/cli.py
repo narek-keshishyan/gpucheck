@@ -7,7 +7,6 @@ import dataclasses
 import json
 import os
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +20,7 @@ from .lot import (
     NOT_TESTED,
     TESTED,
     CardOutcome,
+    create_summary,
     lot_exit_code,
     lot_request,
     lot_summary,
@@ -293,33 +293,39 @@ def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None
         return EXIT_REFUSED
     lot_id = new_lot_id()
     directory = Path(args.lot_dir or f"./gpucheck-lot-{lot_id[:8]}")
-    if (directory / "lot.json").exists():
-        print(f"gpucheck: {directory} already contains a lot; choose another --lot-dir", file=sys.stderr)
-        return EXIT_REFUSED
     if directory.exists() and not directory.is_dir():
         print(f"gpucheck: {directory} is not a directory", file=sys.stderr)
-        return EXIT_REFUSED
-    try:  # find out now, not after every card has run, that the lot cannot be saved
-        directory.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryFile(dir=directory):
-            pass
-    except OSError as e:
-        print(f"gpucheck: cannot write to {directory}: {e}", file=sys.stderr)
         return EXIT_REFUSED
     created = _iso(_now())
     lot_ref = {"lot_id": lot_id, "size": len(adapters), "label": args.label}
     cards: list[CardOutcome] = []
     saved: set[int] = set()  # positions whose gpu<position>.json is on disk
 
-    def save(finished: bool, rest_reason: str) -> None:
-        """Write the card files not yet on disk, then lot.json; positions not reached get rest_reason."""
+    def current(finished: bool, rest_reason: str) -> dict:
+        """lot.json as of now; positions not reached get rest_reason."""
         rest = [CardOutcome(p, gpu_indices[p], None, NOT_TESTED, rest_reason, None)
                 for p in range(len(cards), len(adapters))]
+        return lot_summary(lot_id, args.label, created, cards + rest, finished=finished)
+
+    def save(finished: bool, rest_reason: str) -> None:
+        """Write the card files not yet on disk, then lot.json."""
         for card in cards:
             if card.result is not None and card.position not in saved:
                 write_card(directory, card)
                 saved.add(card.position)
-        write_summary(directory, lot_summary(lot_id, args.label, created, cards + rest, finished=finished))
+        write_summary(directory, current(finished, rest_reason))
+
+    # Claim the directory before any card runs: creating lot.json fails if another lot, finished or
+    # still running, is there. It also shows now, not after every card, that the lot cannot be saved.
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        create_summary(directory, current(False, NOT_REACHED))
+    except FileExistsError:
+        print(f"gpucheck: {directory} already contains a lot; choose another --lot-dir", file=sys.stderr)
+        return EXIT_REFUSED
+    except OSError as e:
+        print(f"gpucheck: cannot write to {directory}: {e}", file=sys.stderr)
+        return EXIT_REFUSED
 
     interrupted = False
     for pos, adapter in enumerate(adapters):

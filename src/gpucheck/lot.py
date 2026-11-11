@@ -7,7 +7,6 @@ import json
 import os
 import re
 import secrets
-import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -76,15 +75,30 @@ def lot_summary(
     }
 
 
-def _write_atomic(path: Path, text: str) -> None:
-    """Write via a temporary file in the same directory and an atomic rename, so a crash
-    or kill leaves either the old file or the new one, never a partial one."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+CARD_MODE = 0o666  # narrowed by the umask, like the single-run result file
+SUMMARY_MODE = 0o600  # lot.json holds delete tokens: owner only, whatever the umask
+
+
+def _write_new(path: Path, text: str, mode: int) -> None:
+    """Create `path` and write `text`; FileExistsError if it already exists."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
         with os.fdopen(fd, "w") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+
+
+def _write_atomic(path: Path, text: str, mode: int) -> None:
+    """Write via a temporary file in the same directory and an atomic rename, so a crash
+    or kill leaves either the old file or the new one, never a partial one."""
+    tmp = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+    _write_new(tmp, text, mode)
+    try:
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -92,15 +106,25 @@ def _write_atomic(path: Path, text: str) -> None:
         raise
 
 
+def _summary_text(summary: dict) -> str:
+    return json.dumps(summary, indent=2, sort_keys=True) + "\n"
+
+
 def write_card(directory: Path, card: CardOutcome) -> None:
     """Write gpu<position>.json for a card that has a result."""
     if card.result is not None:
-        _write_atomic(Path(directory) / _card_file(card.position), canonical_dumps(card.result))
+        _write_atomic(Path(directory) / _card_file(card.position), canonical_dumps(card.result), CARD_MODE)
+
+
+def create_summary(directory: Path, summary: dict) -> None:
+    """Claim the directory for this run by creating lot.json; FileExistsError if another lot is there,
+    including one whose run is still going."""
+    _write_new(Path(directory) / "lot.json", _summary_text(summary), SUMMARY_MODE)
 
 
 def write_summary(directory: Path, summary: dict) -> None:
-    """Write (or rewrite) this run's own lot.json. The caller refuses an existing lot before the run."""
-    _write_atomic(Path(directory) / "lot.json", json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    """Rewrite this run's own lot.json, which create_summary created before the first card ran."""
+    _write_atomic(Path(directory) / "lot.json", _summary_text(summary), SUMMARY_MODE)
 
 
 def untested_entries(summary: dict) -> list[dict]:

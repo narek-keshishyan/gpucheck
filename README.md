@@ -53,7 +53,9 @@ curl -X DELETE -H "X-Delete-Token: <token>" <server>/v1/runs/<run_id>
 
 `gpucheck --gpus all` (or `--gpus 0,2` for a subset, up to 16 cards) tests the cards one after another, never at the same time, and calls the whole run a lot. Each card gets an ordinary single-card run. Before every card after the first, gpucheck waits for that card's idle temperature to stop falling, up to 5 minutes, so that heat from the previous card does not skew the idle baseline. An 8-GPU server can therefore take up to about two hours at the standard length; `--quick` shortens each run.
 
-A lot writes a directory (`--lot-dir`, default `./gpucheck-lot-<id>`) containing `gpu<position>.json` for each card that produced a result, and `lot.json`, which summarises every card, including those that were not tested and why. gpucheck checks that the directory is writable before the first card runs, and refuses to start if it already holds a `lot.json`, so an earlier lot is never overwritten. In a lot run `--json` is not used.
+A lot writes a directory (`--lot-dir`, default `./gpucheck-lot-<id>`) containing `gpu<position>.json` for each card that produced a result, and `lot.json`, which summarises every card, including those that were not tested and why. Before the first card runs, gpucheck creates `lot.json`, which both checks that the directory is writable and claims it for this run: one lot directory is used by one run only. A run pointed at a directory that already holds a `lot.json` is refused, whether that lot finished long ago or is still running (for example a `nohup` run and the same command started again), so an earlier lot is never overwritten. In a lot run `--json` is not used.
+
+The card files follow your umask, like the single-run result file, while `lot.json` is readable only by the user who ran the test, because it holds delete tokens after an upload. Run `--upload-saved` as that same user, or copy the directory preserving ownership.
 
 Results are saved card by card: as soon as a card finishes, its `gpu<position>.json` is written and `lot.json` is rewritten (each through a temporary file and a rename, so a file is never left half-written). While the lot is running, `lot.json` has `"finished": false` and lists the cards not yet reached as not tested ("not reached: the run stopped before this card"). If the process is killed, the SSH session drops or the machine crashes, the cards that finished are on disk, and `gpucheck --upload-saved DIR` uploads them, with the cards not reached recorded as not tested. A long lot can take hours, so run it inside `tmux` or `screen`, or with `nohup`, so that a dropped connection does not stop it. If a card's files cannot be saved partway through, gpucheck prints a warning, keeps going and tries again at the end.
 
@@ -61,7 +63,7 @@ A card that is busy, cannot be read, or fails does not stop the lot; it is recor
 
 A multi-GPU run needs the load generator (PyTorch with CUDA, the `[load]` extra): without it every card would sit idle, so gpucheck refuses to start and names the install command.
 
-GPU numbering: PyTorch and NVML must agree on which card is GPU N, or the tool would load one card while measuring another. gpucheck therefore sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before loading PyTorch (if it was set to something else, it says it is overriding it), and on a machine with more than one GPU it refuses to run while `CUDA_VISIBLE_DEVICES` is set, because PyTorch would then number only the visible cards. Unset it and choose cards with `--gpus` instead. This also applies to a single-card run on a multi-GPU machine. MIG-enabled machines are not supported for multi-GPU runs, because the device numbering is not guaranteed there.
+GPU numbering: PyTorch and NVML must agree on which card is GPU N, or the tool would load one card while measuring another. gpucheck therefore sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before loading PyTorch (if it was set to something else, it says it is overriding it), and on a machine with more than one GPU it refuses to run while `CUDA_VISIBLE_DEVICES` is set, because PyTorch would then number only the visible cards. This includes `CUDA_VISIBLE_DEVICES` set to an empty value, which hides every GPU from PyTorch. Unset it and choose cards with `--gpus` instead. This also applies to a single-card run on a multi-GPU machine. MIG-enabled machines are not supported for multi-GPU runs, because the device numbering is not guaranteed there.
 
 `--certify` cannot be used with several cards. A machine with one GPU and `--gpus all` is an ordinary single run.
 
@@ -138,7 +140,7 @@ The report lists plain-language findings, each with a severity and a confidence.
 | 3 | Run aborted partway (thermal limit, ECC errors, or lost telemetry); result.json is still written |
 | 130 | Interrupted with Ctrl-C during a multi-GPU run (finished cards are kept) |
 
-For a multi-GPU run: 0 when every card was tested, 3 when some cards were not tested or a run was aborted (the lot is still written), 1 when no card produced a result or the lot could not be started or saved, and 130 when interrupted. A failed upload does not change the exit code. `--upload-saved` exits 0 on success and 1 on any failure.
+For a multi-GPU run: 0 when every card was tested, 3 when some cards were not tested or a run was aborted (the lot is still written), 1 when no card produced a result or the lot could not be started or saved, and 130 when interrupted. A failed upload does not change the exit code. `--upload-saved` exits 0 on success, 1 on any failure, and 130 when the upload is interrupted with Ctrl-C (nothing on disk is changed).
 
 ## What this test does not cover
 

@@ -343,3 +343,71 @@ def test_a_long_multi_line_error_becomes_a_short_one_line_reason(tmp_path, monke
     reason = s["cards"][1]["reason"]
     assert reason.startswith("could not read the card: line of driver output line of")
     assert len(reason) <= 300 and "\n" not in reason and "\t" not in reason and "  " not in reason
+
+
+def test_a_second_run_on_a_lot_still_running_is_refused(tmp_path, monkeypatch, capsys):
+    d = tmp_path / "lot"
+    real = cli.execute_run
+    calls, nested = [], []
+
+    def first_card_starts_a_second_run(*a, **kw):
+        calls.append(1)
+        if len(calls) == 1:  # the first run is under way: lot.json must already be claimed
+            nested.append(main(["--fake", "healthy,healthy", "--offline", "--quick", "--lot-dir", str(d)]))
+            nested.append(len(calls))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(cli, "execute_run", first_card_starts_a_second_run)
+    rc = main(["--fake", "healthy,healthy", "--offline", "--quick", "--lot-dir", str(d)])
+    assert nested == [1, 1]  # refused, and the second run never reached execute_run
+    assert rc == 0 and len(calls) == 2
+    assert f"gpucheck: {d} already contains a lot; choose another --lot-dir" in capsys.readouterr().err
+    assert [c["outcome"] for c in json.loads((d / "lot.json").read_text())["cards"]] == ["tested", "tested"]
+
+
+def test_a_claimed_lot_json_refuses_a_new_run(tmp_path, monkeypatch, capsys):
+    from gpucheck.lot import create_summary
+
+    d = tmp_path / "lot"
+    d.mkdir()
+    create_summary(d, {"lot_id": "x"})
+    runs = _count_runs(monkeypatch)
+    assert main(["--fake", "healthy,healthy", "--offline", "--quick", "--lot-dir", str(d)]) == 1
+    assert runs == [] and json.loads((d / "lot.json").read_text()) == {"lot_id": "x"}
+    assert capsys.readouterr().err.strip() == f"gpucheck: {d} already contains a lot; choose another --lot-dir"
+
+
+def test_a_normal_lot_leaves_only_its_card_files_and_lot_json(tmp_path):
+    rc, d, _ = lot(tmp_path, "healthy,tim_degraded,busy")
+    assert rc == 3 and _files(d) == ["gpu0.json", "gpu1.json", "lot.json"]
+
+
+def test_lot_killed_before_the_first_card_finishes_is_readable(tmp_path, monkeypatch):
+    from gpucheck.lot import read_lot
+
+    def killed(*a, **kw):
+        raise _Killed()
+
+    monkeypatch.setattr(cli, "execute_run", killed)
+    d = tmp_path / "lot"
+    with pytest.raises(_Killed):
+        main(["--fake", "healthy,healthy,healthy", "--offline", "--quick", "--lot-dir", str(d)])
+    summary, results = read_lot(d)
+    assert results == [] and summary["finished"] is False and summary["size"] == 3
+    assert [c["outcome"] for c in summary["cards"]] == ["not_tested"] * 3
+    assert [c["reason"] for c in summary["cards"]] == [NOT_REACHED] * 3
+    assert [c["gpu_index"] for c in summary["cards"]] == [0, 1, 2]
+    assert _files(d) == ["lot.json"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX file permissions")
+def test_card_files_follow_the_umask_and_lot_json_is_owner_only(tmp_path):
+    old = os.umask(0o022)
+    try:
+        rc, d, _ = lot(tmp_path, "healthy,healthy")
+    finally:
+        os.umask(old)
+    assert rc == 0
+    assert (d / "gpu0.json").stat().st_mode & 0o777 == 0o644
+    assert (d / "gpu1.json").stat().st_mode & 0o777 == 0o644
+    assert (d / "lot.json").stat().st_mode & 0o777 == 0o600
