@@ -270,3 +270,15 @@ def test_stop_never_raises_even_when_empty_cache_does(monkeypatch):
     cuda = types.SimpleNamespace(is_available=lambda: True, empty_cache=broken)
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
     TorchGemmLoad().stop()
+
+
+def test_stop_reports_a_failing_empty_cache(monkeypatch, capsys):
+    def broken():
+        raise RuntimeError("CUDA error: an illegal\nmemory access was encountered")
+
+    cuda = types.SimpleNamespace(is_available=lambda: True, empty_cache=broken)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+    TorchGemmLoad().stop()
+    assert capsys.readouterr().err == (
+        "warning: load cleanup failed (RuntimeError: CUDA error: an illegal memory access was encountered)\n"
+    )

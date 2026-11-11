@@ -7,6 +7,8 @@ import os
 import sys
 import time
 
+from .run import warn_cleanup_failed
+
 MIN_N = 2048
 MAX_N = 16384
 MEM_FRACTION = 0.6
@@ -140,5 +142,5 @@ class TorchGemmLoad:
         try:
             self._a = self._b = self._c = None
             self._torch.cuda.empty_cache()
-        except Exception:
-            pass
+        except Exception as e:
+            warn_cleanup_failed(e)

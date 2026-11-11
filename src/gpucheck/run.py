@@ -9,6 +9,7 @@ plus 1/hz (0.0 if there is none yet), so the series stays evenly spaced.
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -94,6 +95,15 @@ def _empty_sample(t_s: float) -> TelemetrySample:
     )
 
 
+MAX_CLEANUP_ERROR_LEN = 200
+
+
+def warn_cleanup_failed(e: BaseException) -> None:
+    """One stderr line for a load cleanup that failed; the run carries on."""
+    text = " ".join(f"{type(e).__name__}: {e}".split())[:MAX_CLEANUP_ERROR_LEN]
+    print(f"warning: load cleanup failed ({text})", file=sys.stderr)
+
+
 def execute_run(
     adapter: TelemetryAdapter,
     load: LoadGenerator,
@@ -153,6 +163,6 @@ def execute_run(
     finally:
         try:
             load.stop()
-        except Exception:  # a failed cleanup must not replace the samples already taken
-            pass
+        except Exception as e:  # a failed cleanup must not replace the samples already taken
+            warn_cleanup_failed(e)
     return result(aborted)

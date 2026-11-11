@@ -183,6 +183,7 @@ class NvmlAdapter(TelemetryAdapter):
         # (correctable rows, uncorrectable rows, remap pending, remap failure occurred)
         remap = self._q("nvmlDeviceGetRemappedRows", h)
         remap_ok = isinstance(remap, (tuple, list)) and len(remap) >= 4
+        rows = (_int(remap[0]), _int(remap[1])) if remap_ok else (None, None)
         vbios = self._q("nvmlDeviceGetVbiosVersion", h)
         vbios = _text(vbios).strip()[:_MAX_TEXT] or None if vbios is not None else None
         serial = clean_serial(self._q("nvmlDeviceGetSerial", h)) if self._include_serial else None
@@ -216,7 +217,7 @@ class NvmlAdapter(TelemetryAdapter):
             mig_enabled=bool(mig and mig[0]),
             fractional=False,
             retired_pages=len(retired) if retired is not None else None,
-            remapped_rows=int(remap[0]) + int(remap[1]) if remap_ok else None,
+            remapped_rows=None if None in rows else rows[0] + rows[1],
             row_remap_pending=bool(remap[2]) if remap_ok else None,
             row_remap_failure=bool(remap[3]) if remap_ok else None,
             gpu_index=self._index,

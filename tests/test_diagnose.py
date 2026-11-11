@@ -420,11 +420,24 @@ def test_lifetime_uncorrected_errors_are_memory_errors():
     card = replace(inv(), ecc_aggregate_corrected=0, ecc_aggregate_uncorrected=2)
     f = find(diagnose(healthy(), PF, card, SPEC), "MEMORY_ERRORS")
     assert f.message == (
-        "2 uncorrected memory error(s) recorded over the card's lifetime. The card has recorded memory errors."
+        "2 uncorrected memory error(s) were recorded over the card's lifetime. "
+        "The card has recorded memory errors."
     )
-    both = replace(card, remapped_rows=1)
-    assert find(diagnose(healthy(), PF, both, SPEC), "MEMORY_ERRORS").message.startswith(
-        "1 memory row(s) were remapped and 2 uncorrected memory error(s) recorded over the card's lifetime."
+
+
+def test_lifetime_errors_with_remapped_rows_message():
+    card = replace(inv(), ecc_aggregate_corrected=0, ecc_aggregate_uncorrected=2, remapped_rows=1)
+    assert find(diagnose(healthy(), PF, card, SPEC), "MEMORY_ERRORS").message == (
+        "1 memory row(s) were remapped and 2 uncorrected memory error(s) were recorded over the card's "
+        "lifetime. The card has recorded memory errors."
+    )
+
+
+def test_lifetime_errors_with_ecc_rise_message():
+    card = replace(inv(), ecc_aggregate_corrected=0, ecc_aggregate_uncorrected=3)
+    assert find(diagnose(healthy(ecc_delta=2), PF, card, SPEC), "MEMORY_ERRORS").message == (
+        "ECC error count rose by 2 during the run and 3 uncorrected memory error(s) were recorded over "
+        "the card's lifetime. The card has recorded memory errors."
     )
 
 

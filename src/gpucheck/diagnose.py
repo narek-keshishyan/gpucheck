@@ -56,7 +56,7 @@ def _memory_errors(m: Metrics, inv: GpuInventory) -> Finding | None:
     if inv.row_remap_failure:
         parts.append("memory row remapping has failed")
     if inv.ecc_aggregate_uncorrected is not None and inv.ecc_aggregate_uncorrected > 0:
-        parts.append(f"{inv.ecc_aggregate_uncorrected} uncorrected memory error(s) recorded over the card's lifetime")
+        parts.append(f"{inv.ecc_aggregate_uncorrected} uncorrected memory error(s) were recorded over the card's lifetime")
     if not parts:
         return None
     sentence = " and ".join(parts)

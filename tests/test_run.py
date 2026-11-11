@@ -218,3 +218,31 @@ def test_pacing_sleeps_follow_schedule_at_2hz():
 
 def test_pacing_never_sleeps_negative_when_behind():
     assert _sleeps(10.0) == [0.0, 0.0, 0.0, 0.0]
+
+
+class BrokenStopLoad(RecordingLoad):
+    def __init__(self, message):
+        super().__init__()
+        self.message = message
+
+    def stop(self):
+        super().stop()
+        raise RuntimeError(self.message)
+
+
+def test_failing_load_cleanup_is_reported_and_run_is_kept(capsys):
+    load = BrokenStopLoad("CUDA error:\n  an illegal   memory access")
+    r = run(make_fake("healthy"), load)
+    assert len(r.load) == 10 and r.aborted is None
+    assert capsys.readouterr().err == (
+        "warning: load cleanup failed (RuntimeError: CUDA error: an illegal memory access)\n"
+    )
+
+
+def test_load_cleanup_warning_is_at_most_200_characters(capsys):
+    r = run(make_fake("healthy"), BrokenStopLoad("x " * 500))
+    assert r.aborted is None
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    inner = err[len("warning: load cleanup failed ("):-len(")\n")]
+    assert len(inner) == 200 and inner.startswith("RuntimeError: x x")

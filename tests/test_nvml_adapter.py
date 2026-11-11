@@ -238,3 +238,9 @@ def test_non_numeric_link_and_ecc_values_are_unknown(monkeypatch):
     assert inv.pcie_width_current is None and inv.pcie_gen_max is None
     assert (inv.pcie_gen_current, inv.pcie_width_max) == (4, 16)
     assert inv.ecc_aggregate_corrected is None and inv.ecc_aggregate_uncorrected is None
+
+
+@pytest.mark.parametrize("remap", [("N/A", 2, False, False), (1, object(), False, False), (None, 0, False, False)])
+def test_non_numeric_remapped_rows_are_unknown(monkeypatch, remap):
+    inv = adapter(monkeypatch, modern(remap=remap)).inventory()
+    assert inv.remapped_rows is None
