@@ -72,6 +72,21 @@ def _headers(api_key: str | None, extra: dict | None = None) -> dict:
 
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 KEY_INVALID = "the API key contains invalid characters"
+SERVER_INVALID = "the --server URL is not valid"
+
+
+def _split(server: str) -> tuple[str, str | None] | None:
+    """The server URL's scheme and host, or None for a malformed URL such as http://[::1."""
+    try:
+        parts = urllib.parse.urlsplit(server)
+        return parts.scheme, parts.hostname
+    except ValueError:
+        return None
+
+
+def server_error(server: str) -> str | None:
+    """Why `server` cannot be used as an upload URL, or None."""
+    return SERVER_INVALID if _split(server) is None else None
 
 
 def key_error(server: str, api_key: str | None) -> str | None:
@@ -80,12 +95,19 @@ def key_error(server: str, api_key: str | None) -> str | None:
         return None
     if any(ch.isspace() or not ch.isprintable() for ch in api_key):
         return KEY_INVALID
-    parts = urllib.parse.urlsplit(server)
-    if parts.scheme != "https":
-        host = parts.hostname or server
+    if (split := _split(server)) is None:
+        return SERVER_INVALID
+    scheme, host = split
+    if scheme != "https":
+        host = host or server
         if host not in LOCAL_HOSTS:
             return f"refusing to send the API key over plain http to {host}; use an https server URL"
     return None
+
+
+def _refusal(server: str, api_key: str | None) -> str | None:
+    """Why nothing may be sent: a malformed server URL or a key that must not go there."""
+    return server_error(server) or key_error(server, api_key)
 
 
 class ChallengeUnavailable(Exception):
@@ -128,7 +150,7 @@ def fetch_challenge(server: str, timeout_s: float = 20) -> dict:
 
 
 def upload(result: dict, server: str, timeout_s: float = 20, api_key: str | None = None) -> UploadOutcome:
-    if (refused := key_error(server, api_key)) is not None:
+    if (refused := _refusal(server, api_key)) is not None:
         return UploadOutcome(False, None, None, None, refused)
     try:
         req = urllib.request.Request(
@@ -174,7 +196,7 @@ def upload_lot(
     timeout_s: float = 120,
 ) -> LotUploadOutcome:
     """POST the whole lot in one request. Never raises."""
-    if (refused := key_error(server, api_key)) is not None:
+    if (refused := _refusal(server, api_key)) is not None:
         return LotUploadOutcome(False, None, [], refused)
     try:
         data = canonical_dumps(lot_request(summary, results)).encode()

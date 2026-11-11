@@ -295,3 +295,21 @@ def test_upload_saved_refuses_a_key_over_plain_http(tmp_path, capsys, monkeypatc
         assert "gpucheck: refusing to send the API key over plain http to example.invalid; use an https server URL" in err
         assert "gpk_k" not in err
     assert calls == []
+
+
+def test_ctrl_c_during_upload_saved_changes_nothing(tmp_path, capsys, monkeypatch):
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "upload_lot", interrupted)
+    monkeypatch.setattr(cli, "upload", interrupted)
+    d = _offline_lot(tmp_path)
+    single = _single(tmp_path)
+    capsys.readouterr()
+    for path in (d, single):
+        before = {p.name: p.read_bytes() for p in path.parent.iterdir() if p.is_file()}
+        assert main(["--upload-saved", str(path), "--server", "https://example.invalid"]) == 130
+        c = capsys.readouterr()
+        assert "Traceback" not in c.out + c.err
+        assert "upload interrupted; nothing was changed on disk" in c.out + c.err
+        assert {p.name: p.read_bytes() for p in path.parent.iterdir() if p.is_file()} == before

@@ -188,6 +188,22 @@ def test_malformed_position_in_the_response_keeps_the_other_tokens(server, tmp_p
     assert rc == 0 and "Traceback" not in c.out + c.err
     runs = json.loads((d / "lot.json").read_text())["uploaded"]["runs"]
     assert [r["position"] for r in runs] == [0] and runs[0]["delete_token"] == "tok0"
+    lines = c.out.splitlines()
+    warning = ("warning: the server's response had entries gpucheck could not match to a card; "
+               "save these tokens yourself:")
+    i = lines.index(warning)
+    assert lines[i + 1] == "Unsaved delete token (position [1]): tok1"
+    assert "tok1" not in "\n".join(lines[:i] + lines[i + 2:])
+    assert f"Delete tokens were saved in {d}/lot.json" in lines
+
+
+def test_only_unmatched_tokens_are_not_called_saved(server, tmp_path, capsys):
+    odd = {"position": "0", "run_id": "r0", "url": "https://x.test/r/r0", "delete_token": "tok0"}
+    server["body"] = json.dumps({**LOT_OK, "runs": [odd]}).encode()
+    run_lot(tmp_path, server, "healthy,healthy")
+    out = capsys.readouterr().out
+    assert "Unsaved delete token (position '0'): tok0" in out
+    assert "Delete tokens were saved" not in out and ALREADY not in out
 
 
 def test_anonymous_lot_without_tokens_says_it_was_already_uploaded(server, tmp_path, capsys):

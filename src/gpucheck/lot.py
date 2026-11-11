@@ -167,8 +167,8 @@ def read_lot(directory: Path) -> tuple[dict, list[dict]]:
     return summary, results
 
 
-def mark_uploaded(directory: Path, server: str, outcome) -> None:
-    """Record a successful lot upload in lot.json (format as write_summary writes it).
+def mark_uploaded(directory: Path, server: str, outcome) -> dict:
+    """Record a successful lot upload in lot.json (format as write_summary writes it); return what was written.
 
     A retry of an upload the server already holds returns no delete tokens; the ones recorded earlier are kept."""
     path = Path(directory) / "lot.json"
@@ -196,6 +196,7 @@ def mark_uploaded(directory: Path, server: str, outcome) -> None:
         "runs": sorted(record.values(), key=lambda e: e["position"]),
     }
     write_summary(directory, summary)
+    return summary
 
 
 def lot_finished(summary: dict) -> bool:

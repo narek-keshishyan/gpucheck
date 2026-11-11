@@ -1,3 +1,4 @@
+import argparse
 import json
 from dataclasses import replace
 
@@ -7,9 +8,12 @@ from gpucheck import cli
 from gpucheck.adapter import AdapterUnavailable
 from gpucheck.cli import main
 from gpucheck.fakes import make_fake
+from gpucheck.load import LoadUnavailable
 from gpucheck.report import NOT_COVERED
 from gpucheck.run import NullLoad, RunConfig
 from gpucheck.upload import UploadOutcome
+
+REAL_MAKE_LOAD = cli._make_load
 
 
 def test_offline_fake_run_writes_json_and_report(tmp_path, capsys):
@@ -242,11 +246,13 @@ def _no_torch_construct(monkeypatch, made):
     monkeypatch.setattr(cli, "settle", lambda adapter, **kw: 0.0)
 
 
+@pytest.mark.parametrize("value", ["4,5,6,7", ""])
 @pytest.mark.parametrize("flags", [["--gpus", "all"], ["--gpus", "1"], []])
-def test_cuda_visible_devices_is_refused_on_a_multi_gpu_machine(monkeypatch, tmp_path, capsys, flags):
+def test_cuda_visible_devices_is_refused_on_a_multi_gpu_machine(monkeypatch, tmp_path, capsys, flags, value):
+    # Even an empty value matters: it hides every GPU from CUDA.
     made = _real_path(monkeypatch, 4)
     _no_torch_construct(monkeypatch, made)
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", value)
     out = tmp_path / "r.json"
     rc = main([*flags, "--offline", "--json", str(out), "--lot-dir", str(tmp_path / "lot")])
     assert rc == 1 and made == []
@@ -262,10 +268,39 @@ def test_cuda_visible_devices_is_fine_on_a_single_gpu_machine(monkeypatch, tmp_p
     assert "CUDA_VISIBLE_DEVICES" not in capsys.readouterr().err
 
 
-def test_empty_cuda_visible_devices_is_not_refused(monkeypatch, tmp_path):
-    _real_path(monkeypatch, 4)
+NO_LOAD = "no torch/CUDA — running without load; performance metrics will be gaps"
+
+
+def _no_load_generator(monkeypatch):
+    def unavailable(*a, **k):
+        raise LoadUnavailable("CUDA is not available")
+
+    monkeypatch.setattr(cli, "TorchGemmLoad", unavailable)
+
+
+@pytest.mark.parametrize("value", ["0", ""])
+def test_no_load_warning_names_cuda_visible_devices_when_set(monkeypatch, capsys, value):
+    _no_load_generator(monkeypatch)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", value)
+    assert isinstance(cli._make_load(argparse.Namespace(fake=None)), NullLoad)
+    assert capsys.readouterr().err == (
+        f"{NO_LOAD} (CUDA_VISIBLE_DEVICES is set, which may be hiding the GPU)\n"
+    )
+
+
+def test_no_load_warning_is_unchanged_when_cuda_visible_devices_is_unset(monkeypatch, capsys):
+    _no_load_generator(monkeypatch)
+    assert isinstance(cli._make_load(argparse.Namespace(fake=None)), NullLoad)
+    assert capsys.readouterr().err == f"{NO_LOAD}\n"
+
+
+def test_one_gpu_run_without_load_names_an_empty_cuda_visible_devices(monkeypatch, tmp_path, capsys):
+    _real_path(monkeypatch, 1)
+    monkeypatch.setattr(cli, "_make_load", REAL_MAKE_LOAD)
+    _no_load_generator(monkeypatch)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    assert main(["--gpus", "1", "--offline", "--json", str(tmp_path / "r.json")]) == 0
+    assert main(["--offline", "--json", str(tmp_path / "r.json")]) == 0
+    assert "(CUDA_VISIBLE_DEVICES is set, which may be hiding the GPU)" in capsys.readouterr().err
 
 
 def test_report_shows_lifetime_memory_error_counts():

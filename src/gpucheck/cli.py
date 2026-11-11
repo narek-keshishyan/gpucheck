@@ -60,6 +60,10 @@ INTERRUPTED = "interrupted"
 NOT_REACHED = "not reached: the run stopped before this card"
 ACCOUNT_NOTE = "Account uploads cannot be self-deleted."
 NO_TOKENS_NOTE = "The server returned no delete tokens: this was already uploaded."
+UPLOAD_INTERRUPTED = "upload interrupted; nothing was changed on disk"
+UNMATCHED_TOKENS = (
+    "warning: the server's response had entries gpucheck could not match to a card; save these tokens yourself:"
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -155,8 +159,11 @@ def _make_load(args, challenge=None, device_index: int = 0):
     try:
         return TorchGemmLoad(device_index=device_index)
     except LoadUnavailable:
+        hint = ""
+        if "CUDA_VISIBLE_DEVICES" in os.environ:
+            hint = " (CUDA_VISIBLE_DEVICES is set, which may be hiding the GPU)"
         print(
-            "no torch/CUDA — running without load; performance metrics will be gaps",
+            f"no torch/CUDA — running without load; performance metrics will be gaps{hint}",
             file=sys.stderr,
         )
         return NullLoad()
@@ -396,18 +403,22 @@ def _report_lot_upload(out, directory: Path, server: str, api_key: str | None) -
             print(f"  Card history: {r['card_url']}")
     tokens = [(r.get("position"), r.get("delete_token")) for r in out.runs if r.get("delete_token")]
     try:
-        mark_uploaded(directory, server, out)
+        written = mark_uploaded(directory, server, out)
     except Exception as e:  # the tokens exist nowhere else, so show them
         print(f"warning: could not update {directory}/lot.json ({e}); save these delete tokens now")
         for position, token in tokens:
             print(f"GPU {position} delete token: {token}")
         return
-    if tokens:
+    kept = [r.get("delete_token") for r in written["uploaded"]["runs"]]
+    unsaved = [(position, token) for position, token in tokens if token not in kept]
+    if len(unsaved) < len(tokens):
         print(f"Delete tokens were saved in {directory}/lot.json")
-    elif api_key:
-        print(ACCOUNT_NOTE)
-    else:
-        print(NO_TOKENS_NOTE)
+    if unsaved:  # a response entry that names no card: its token is not in lot.json
+        print(UNMATCHED_TOKENS)
+        for position, token in unsaved:
+            print(f"Unsaved delete token (position {position!r}): {token}")
+    if not tokens:
+        print(ACCOUNT_NOTE if api_key else NO_TOKENS_NOTE)
 
 
 def format_grade(out: UploadOutcome, model: str | None) -> str | None:
@@ -502,7 +513,11 @@ def _main_upload_saved(path_arg: str, args, api_key: str | None) -> int:
                     f"note: this lot was uploaded to {before} before; its delete tokens for that server "
                     'will be kept in lot.json under "previous_uploads".'
                 )
-            out = upload_lot(summary, results, server, api_key)
+            try:
+                out = upload_lot(summary, results, server, api_key)
+            except KeyboardInterrupt:
+                print(UPLOAD_INTERRUPTED)
+                return EXIT_INTERRUPTED
             if not out.ok:
                 print(f"gpucheck: upload failed ({out.error}); {path} is unchanged", file=sys.stderr)
                 return EXIT_REFUSED
@@ -519,7 +534,11 @@ def _main_upload_saved(path_arg: str, args, api_key: str | None) -> int:
             file=sys.stderr,
         )
         return EXIT_REFUSED
-    out = upload(result, server, api_key=api_key)
+    try:
+        out = upload(result, server, api_key=api_key)
+    except KeyboardInterrupt:
+        print(UPLOAD_INTERRUPTED)
+        return EXIT_INTERRUPTED
     if not out.ok:
         print(f"gpucheck: upload failed ({out.error}); {path} is unchanged", file=sys.stderr)
         return EXIT_REFUSED
@@ -554,9 +573,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.fake:
             count = gpu_count()
-            if count > 1 and os.environ.get("CUDA_VISIBLE_DEVICES"):
+            if count > 1 and "CUDA_VISIBLE_DEVICES" in os.environ:
                 # torch would number only the visible cards, NVML numbers all of them:
                 # the load would run on a different card from the one measured.
+                # An empty value hides every card from CUDA, so it is refused too.
                 print(
                     "gpucheck: CUDA_VISIBLE_DEVICES is set, so PyTorch and NVML would number the GPUs "
                     "differently; unset it and choose cards with --gpus",

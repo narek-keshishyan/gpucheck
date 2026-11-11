@@ -390,3 +390,58 @@ def test_single_run_refuses_a_key_over_plain_http(tmp_path, capsys, monkeypatch)
     assert rc == 0 and calls == [] and out.exists()
     assert f"gpucheck: {HTTP_ERROR}" in c.err and f"gpucheck --upload-saved {out}" in c.out
     assert "gpk_secret" not in c.out + c.err
+
+
+BAD_SERVER = "http://[::1"
+BAD_SERVER_ERROR = "the --server URL is not valid"
+
+
+@pytest.mark.parametrize("key", [None, "gpk_secret"])
+def test_malformed_server_url_is_an_error_outcome(monkeypatch, key):
+    calls = _recording_opener(monkeypatch)
+    for out in (upload(RESULT, BAD_SERVER, api_key=key), upload_lot(LOT, [RESULT], BAD_SERVER, api_key=key)):
+        assert out.ok is False and out.error == BAD_SERVER_ERROR
+    assert calls == []
+
+
+def _no_traceback_and_no_key(c):
+    assert "Traceback" not in c.out + c.err and "gpk_secret" not in c.out + c.err
+
+
+@pytest.mark.parametrize("key", [[], ["--api-key", "gpk_secret"]])
+def test_single_run_with_a_malformed_server_url(tmp_path, capsys, monkeypatch, key):
+    _recording_opener(monkeypatch)
+    rc, out = _run(tmp_path, "--yes-upload", "--server", BAD_SERVER, *key)
+    c = capsys.readouterr()
+    assert rc == 0 and out.exists()
+    _no_traceback_and_no_key(c)
+    lines = [ln for ln in (c.out + c.err).splitlines() if BAD_SERVER_ERROR in ln]
+    assert len(lines) == 1 and f"gpucheck --upload-saved {out}" in c.out
+
+
+@pytest.mark.parametrize("key", [[], ["--api-key", "gpk_secret"]])
+def test_lot_run_with_a_malformed_server_url(tmp_path, capsys, monkeypatch, key):
+    _recording_opener(monkeypatch)
+    d = tmp_path / "lot"
+    rc = main(["--fake", "healthy,healthy", "--quick", "--lot-dir", str(d), "--yes-upload",
+               "--server", BAD_SERVER, *key])
+    c = capsys.readouterr()
+    assert rc == 0 and (d / "lot.json").exists()
+    _no_traceback_and_no_key(c)
+    lines = [ln for ln in (c.out + c.err).splitlines() if BAD_SERVER_ERROR in ln]
+    assert len(lines) == 1 and f"gpucheck --upload-saved {d}" in c.out
+
+
+@pytest.mark.parametrize("key", [[], ["--api-key", "gpk_secret"]])
+def test_upload_saved_with_a_malformed_server_url(tmp_path, capsys, monkeypatch, key):
+    calls = _recording_opener(monkeypatch)
+    d = tmp_path / "lot"
+    main(["--fake", "healthy,healthy", "--offline", "--quick", "--lot-dir", str(d)])
+    rc_single, single = _run(tmp_path, "--offline")
+    capsys.readouterr()
+    for path in (d, single):
+        assert main(["--upload-saved", str(path), "--server", BAD_SERVER, *key]) == 1
+        c = capsys.readouterr()
+        _no_traceback_and_no_key(c)
+        assert BAD_SERVER_ERROR in c.err and len(c.err.strip().splitlines()) == 1 and c.out == ""
+    assert calls == []
