@@ -445,3 +445,19 @@ def test_upload_saved_with_a_malformed_server_url(tmp_path, capsys, monkeypatch,
         _no_traceback_and_no_key(c)
         assert BAD_SERVER_ERROR in c.err and len(c.err.strip().splitlines()) == 1 and c.out == ""
     assert calls == []
+
+
+NOT_HTTP = "the --server URL must start with http:// or https://"
+NOT_HTTP_URLS = ["ftp://x", "file:///etc/passwd", "", "://"]
+
+
+@pytest.mark.parametrize("key", [None, "gpk_secret"])
+@pytest.mark.parametrize("url", NOT_HTTP_URLS)
+def test_server_url_must_be_http_or_https(monkeypatch, url, key):
+    def opened(*a, **k):
+        pytest.fail("a request was opened")
+
+    monkeypatch.setattr("gpucheck.upload._open", opened)
+    monkeypatch.setattr("urllib.request.urlopen", opened)
+    for out in (upload(RESULT, url, api_key=key), upload_lot(LOT, [RESULT], url, api_key=key)):
+        assert out.ok is False and out.error == NOT_HTTP and "gpk_secret" not in out.error

@@ -339,3 +339,21 @@ def test_challenge_expired_parsing(exp, expired):
     from datetime import datetime, timezone
     now = datetime(2026, 11, 7, 14, 0, tzinfo=timezone.utc)
     assert cli.challenge_expired({"expires_at": exp}, now) is expired
+
+
+@pytest.mark.parametrize("url", ["ftp://x", "file:///etc/passwd", "", "://"])
+def test_fetch_challenge_needs_an_http_or_https_server(monkeypatch, url):
+    def opened(*a, **k):
+        pytest.fail("a request was opened")
+
+    monkeypatch.setattr("urllib.request.urlopen", opened)
+    with pytest.raises(ChallengeUnavailable) as e:
+        fetch_challenge(url)
+    assert str(e.value) == "the --server URL must start with http:// or https://"
+
+
+def test_fetch_challenge_with_an_unparseable_server(monkeypatch):
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: pytest.fail("a request was opened"))
+    with pytest.raises(ChallengeUnavailable) as e:
+        fetch_challenge("http://[::1")
+    assert str(e.value) == "the --server URL is not valid"

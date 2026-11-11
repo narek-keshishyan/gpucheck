@@ -73,6 +73,7 @@ def _headers(api_key: str | None, extra: dict | None = None) -> dict:
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 KEY_INVALID = "the API key contains invalid characters"
 SERVER_INVALID = "the --server URL is not valid"
+SERVER_NOT_HTTP = "the --server URL must start with http:// or https://"
 
 
 def _split(server: str) -> tuple[str, str | None] | None:
@@ -85,21 +86,27 @@ def _split(server: str) -> tuple[str, str | None] | None:
 
 
 def server_error(server: str) -> str | None:
-    """Why `server` cannot be used as an upload URL, or None."""
-    return SERVER_INVALID if _split(server) is None else None
+    """Why `server` cannot be used as a server URL, or None. Only http(s) URLs with a host are used:
+    urllib would otherwise open file: and other URLs, reading a local file as the server's response."""
+    split = _split(server)
+    if split is None:
+        return SERVER_INVALID
+    scheme, host = split
+    if scheme not in ("http", "https") or not host:
+        return SERVER_NOT_HTTP
+    return None
 
 
 def key_error(server: str, api_key: str | None) -> str | None:
     """Why `api_key` must not be sent to `server`, or None. The text never contains the key."""
     if not api_key:
         return None
+    if (invalid := server_error(server)) is not None:
+        return invalid
     if any(ch.isspace() or not ch.isprintable() for ch in api_key):
         return KEY_INVALID
-    if (split := _split(server)) is None:
-        return SERVER_INVALID
-    scheme, host = split
+    scheme, host = _split(server)
     if scheme != "https":
-        host = host or server
         if host not in LOCAL_HOSTS:
             return f"refusing to send the API key over plain http to {host}; use an https server URL"
     return None
@@ -116,6 +123,8 @@ class ChallengeUnavailable(Exception):
 
 def fetch_challenge(server: str, timeout_s: float = 20) -> dict:
     """POST /v1/challenges; raises ChallengeUnavailable with a one-line message."""
+    if (invalid := server_error(server)) is not None:
+        raise ChallengeUnavailable(invalid)
     try:
         req = urllib.request.Request(
             f"{server.rstrip('/')}/v1/challenges",

@@ -57,7 +57,7 @@ A lot writes a directory (`--lot-dir`, default `./gpucheck-lot-<id>`) containing
 
 The card files follow your umask, like the single-run result file, while `lot.json` is readable only by the user who ran the test, because it holds delete tokens after an upload. Run `--upload-saved` as that same user, or copy the directory preserving ownership.
 
-Results are saved card by card: as soon as a card finishes, its `gpu<position>.json` is written and `lot.json` is rewritten (each through a temporary file and a rename, so a file is never left half-written). While the lot is running, `lot.json` has `"finished": false` and lists the cards not yet reached as not tested ("not reached: the run stopped before this card"). If the process is killed, the SSH session drops or the machine crashes, the cards that finished are on disk, and `gpucheck --upload-saved DIR` uploads them, with the cards not reached recorded as not tested. A long lot can take hours, so run it inside `tmux` or `screen`, or with `nohup`, so that a dropped connection does not stop it. If a card's files cannot be saved partway through, gpucheck prints a warning, keeps going and tries again at the end.
+Results are saved card by card: as soon as a card finishes, its `gpu<position>.json` is written and `lot.json` is rewritten. The first `lot.json`, written before any card runs, is created in place to claim the directory; every later write of a card file or of `lot.json` goes through a temporary file and a rename, so it is never left half-written. While the lot is running, `lot.json` has `"finished": false` and lists the cards not yet reached as not tested ("not reached: the run stopped before this card"). If the process is killed, the SSH session drops or the machine crashes, the cards that finished are on disk, and `gpucheck --upload-saved DIR` uploads them, with the cards not reached recorded as not tested. A long lot can take hours, so run it inside `tmux` or `screen`, or with `nohup`, so that a dropped connection does not stop it. If a card's files cannot be saved partway through, gpucheck prints a warning, keeps going and tries again at the end.
 
 A card that is busy, cannot be read, or fails does not stop the lot; it is recorded as not tested with the reason, and the remaining cards still run. Ctrl-C during a lot keeps the cards already finished, writes `lot.json` with `"finished": true` (the remaining cards are recorded as interrupted), uploads nothing, and exits 130.
 
@@ -138,7 +138,7 @@ The report lists plain-language findings, each with a severity and a confidence.
 | 1 | Preflight refused to run (for example the GPU is busy), or the request was refused (for example a bad `--gpus` value) |
 | 2 | No NVIDIA GPU or driver available |
 | 3 | Run aborted partway (thermal limit, ECC errors, or lost telemetry); result.json is still written |
-| 130 | Interrupted with Ctrl-C during a multi-GPU run (finished cards are kept) |
+| 130 | Interrupted with Ctrl-C during a multi-GPU run (finished cards are kept) or during an `--upload-saved` upload (nothing on disk is changed) |
 
 For a multi-GPU run: 0 when every card was tested, 3 when some cards were not tested or a run was aborted (the lot is still written), 1 when no card produced a result or the lot could not be started or saved, and 130 when interrupted. A failed upload does not change the exit code. `--upload-saved` exits 0 on success, 1 on any failure, and 130 when the upload is interrupted with Ctrl-C (nothing on disk is changed).
 

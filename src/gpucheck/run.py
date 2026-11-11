@@ -99,9 +99,15 @@ MAX_CLEANUP_ERROR_LEN = 200
 
 
 def warn_cleanup_failed(e: BaseException) -> None:
-    """One stderr line for a load cleanup that failed; the run carries on."""
-    text = " ".join(f"{type(e).__name__}: {e}".split())[:MAX_CLEANUP_ERROR_LEN]
-    print(f"warning: load cleanup failed ({text})", file=sys.stderr)
+    """One stderr line for a load cleanup that failed; the run carries on.
+
+    Never raises: it runs in a finally, so an error that cannot be printed or a broken stderr
+    must not replace the finished run."""
+    try:
+        text = " ".join(f"{type(e).__name__}: {e}".split())[:MAX_CLEANUP_ERROR_LEN]
+        print(f"warning: load cleanup failed ({text})", file=sys.stderr)
+    except Exception:
+        pass
 
 
 def execute_run(

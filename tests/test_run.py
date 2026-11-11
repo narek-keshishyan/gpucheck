@@ -246,3 +246,32 @@ def test_load_cleanup_warning_is_at_most_200_characters(capsys):
     assert err.count("\n") == 1
     inner = err[len("warning: load cleanup failed ("):-len(")\n")]
     assert len(inner) == 200 and inner.startswith("RuntimeError: x x")
+
+
+class _Unprintable(Exception):
+    def __str__(self):
+        raise RuntimeError("cannot render")
+
+
+class _UnprintableStop(RecordingLoad):
+    def stop(self):
+        raise _Unprintable()
+
+
+class _BrokenStderr:
+    def write(self, text):
+        raise OSError("stderr is closed")
+
+    def flush(self):
+        raise OSError("stderr is closed")
+
+
+def test_cleanup_warning_with_an_unprintable_error_keeps_the_run():
+    r = run(make_fake("healthy"), _UnprintableStop())
+    assert len(r.load) == 10 and r.aborted is None
+
+
+def test_cleanup_warning_on_a_broken_stderr_keeps_the_run(monkeypatch):
+    monkeypatch.setattr("sys.stderr", _BrokenStderr())
+    r = run(make_fake("healthy"), BrokenStopLoad("CUDA error"))
+    assert len(r.load) == 10 and r.aborted is None

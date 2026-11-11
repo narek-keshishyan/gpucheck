@@ -282,3 +282,36 @@ def test_stop_reports_a_failing_empty_cache(monkeypatch, capsys):
     assert capsys.readouterr().err == (
         "warning: load cleanup failed (RuntimeError: CUDA error: an illegal memory access was encountered)\n"
     )
+
+
+class _Unprintable(Exception):
+    def __str__(self):
+        raise RuntimeError("cannot render")
+
+
+class _BrokenStderr:
+    def write(self, text):
+        raise OSError("stderr is closed")
+
+    def flush(self):
+        raise OSError("stderr is closed")
+
+
+def _stop_raising(monkeypatch, error):
+    def broken():
+        raise error
+
+    cuda = types.SimpleNamespace(is_available=lambda: True, empty_cache=broken)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+
+
+def test_stop_returns_when_the_error_cannot_be_printed(monkeypatch):
+    _stop_raising(monkeypatch, _Unprintable())
+    assert TorchGemmLoad().stop() is None
+
+
+def test_stop_returns_when_stderr_is_broken(monkeypatch):
+    _stop_raising(monkeypatch, RuntimeError("CUDA error"))
+    g = TorchGemmLoad()
+    monkeypatch.setattr("sys.stderr", _BrokenStderr())
+    assert g.stop() is None
