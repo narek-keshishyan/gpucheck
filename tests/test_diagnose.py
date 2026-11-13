@@ -263,29 +263,32 @@ def test_power_reason_at_the_stock_power_limit_is_not_a_finding():
 
 def test_large_shortfall_at_the_stock_power_limit_is_still_reported():
     # Without this a card at half speed that only shows the power flag would get no finding at all.
-    m = healthy(tflops_ratio_vs_spec=0.5, steady_temp_c=60.0, throttle_reasons_seen=["power"])
+    m = healthy(tflops_ratio_vs_spec=0.3, steady_temp_c=60.0, throttle_reasons_seen=["power"])
     f = find(diagnose(m, PF, inv(power_limit=400.0, default=400.0), SPEC), "UNDERPERFORMING_UNKNOWN")
     assert (f.severity, f.confidence) == ("warn", "low")
     assert f.message == (
-        "Sustained throughput was 50.0% of the datasheet peak. The card was regulating at its normal "
+        "Sustained throughput was 30.0% of the datasheet peak. The card was regulating at its normal "
         "power limit, which does not explain a shortfall this large, and the cause is unknown."
     )
 
 
 def test_normal_shortfall_at_the_stock_power_limit_is_not_reported():
-    # A healthy stock A100 measured 0.86 of the datasheet peak while regulating at 400 W.
-    for ratio in (0.86, 0.75):
+    # Measured on healthy cards regulating at their own stock limit: an A100 80GB at 400 W reached
+    # 0.86 of the datasheet peak, two DGX Station A100s (275 W stock limit) 0.69 and 0.70, and an
+    # A100 40GB held to 300 W 0.60. None of them is underperforming.
+    for ratio in (0.86, 0.70, 0.69, 0.60, 0.40):
         m = healthy(tflops_ratio_vs_spec=ratio, steady_temp_c=60.0, throttle_reasons_seen=["power"])
         assert codes(diagnose(m, PF, inv(power_limit=400.0, default=400.0), SPEC)) == []
+        assert codes(diagnose(m, PF, inv(power_limit=275.0, default=275.0), SPEC)) == []
 
 
 def test_large_shortfall_with_a_thermal_reason_is_left_to_the_thermal_rules():
-    m = healthy(tflops_ratio_vs_spec=0.5, steady_temp_c=60.0, throttle_reasons_seen=["power", "thermal"])
+    m = healthy(tflops_ratio_vs_spec=0.3, steady_temp_c=60.0, throttle_reasons_seen=["power", "thermal"])
     assert "UNDERPERFORMING_UNKNOWN" not in codes(diagnose(m, PF, inv(power_limit=400.0, default=400.0), SPEC))
 
 
 def test_large_shortfall_under_a_lowered_or_unknown_limit_is_explained_by_the_cap():
-    m = healthy(tflops_ratio_vs_spec=0.5, steady_temp_c=60.0, throttle_reasons_seen=["power"])
+    m = healthy(tflops_ratio_vs_spec=0.3, steady_temp_c=60.0, throttle_reasons_seen=["power"])
     assert codes(diagnose(m, PF, inv(power_limit=220.0, default=350.0), SPEC)) == ["POWER_CAPPED"]
     assert codes(diagnose(m, PF, inv(power_limit=None), SPEC)) == ["POWER_CAPPED"]
 

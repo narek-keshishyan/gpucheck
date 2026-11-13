@@ -29,9 +29,12 @@ HOT_IDLE_C = 50.0
 POWER_LIMIT_FRACTION = 0.9
 POWER_REASON_HEADROOM_C = 15.0
 UNDERPERFORMING_RATIO = 0.9
-# A card regulating at its stock power limit falls short of the datasheet peak without any fault:
-# a healthy stock A100 measured 0.86. Below this, the power limit does not explain the shortfall.
-UNDERPERFORMING_AT_POWER_LIMIT_RATIO = 0.75
+# A card regulating at its stock power limit falls short of the datasheet peak without any fault,
+# and by how much depends on the variant's limit. Measured on healthy cards: an A100 80GB at
+# 400 W reached 0.86, two DGX Station A100s (275 W stock limit) 0.69 and 0.70, an A100 40GB held
+# to 300 W 0.60. So this is only a floor for gross shortfalls; comparing a card with others of its
+# model is the server's job, not this rule's.
+UNDERPERFORMING_AT_POWER_LIMIT_RATIO = 0.4
 
 
 @dataclass(frozen=True)
