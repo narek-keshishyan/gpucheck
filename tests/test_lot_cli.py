@@ -122,7 +122,7 @@ def test_unwritable_lot_dir_is_refused_before_any_card_runs(tmp_path, capsys, mo
 
 def test_certify_cannot_be_combined_with_several_cards(capsys):
     assert main(["--fake", "healthy,healthy", "--certify"]) == 1
-    assert "--certify cannot be combined with a multi-GPU run" in capsys.readouterr().err
+    assert "--certify cannot be combined with a lot" in capsys.readouterr().err
 
 
 def test_label_longer_than_80_is_rejected():
@@ -411,3 +411,135 @@ def test_card_files_follow_the_umask_and_lot_json_is_owner_only(tmp_path):
     assert (d / "gpu0.json").stat().st_mode & 0o777 == 0o644
     assert (d / "gpu1.json").stat().st_mode & 0o777 == 0o644
     assert (d / "lot.json").stat().st_mode & 0o777 == 0o600
+
+
+# --- found on real hardware (2026-11-12) -----------------------------------
+
+
+def test_one_card_with_a_lot_dir_or_label_makes_a_one_card_lot(tmp_path):
+    # On a one-GPU A100 machine --lot-dir and --label were silently ignored.
+    rc, d, s = lot(tmp_path, "healthy", "--label", "bench")
+    assert rc == 0 and s["size"] == 1 and s["label"] == "bench" and s["finished"] is True
+    assert [c["file"] for c in s["cards"]] == ["gpu0.json"]
+    r = json.loads((d / "gpu0.json").read_text())
+    assert r["lot"] == {"lot_id": s["lot_id"], "position": 0, "size": 1, "label": "bench"}
+
+
+def test_one_card_with_only_a_label_makes_a_lot_in_the_default_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main(["--fake", "healthy", "--offline", "--quick", "--label", "bench"]) == 0
+    [d] = list(tmp_path.glob("gpucheck-lot-*"))
+    assert json.loads((d / "lot.json").read_text())["label"] == "bench"
+    assert not (tmp_path / "gpucheck-result.json").exists()
+
+
+def test_one_card_without_lot_flags_stays_a_plain_single_run(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main(["--fake", "healthy", "--offline", "--quick"]) == 0
+    assert (tmp_path / "gpucheck-result.json").exists() and not list(tmp_path.glob("gpucheck-lot-*"))
+
+
+def test_real_path_one_gpu_machine_with_a_lot_dir_makes_a_lot(tmp_path, monkeypatch):
+    made = _real_lot(monkeypatch, 1)
+    d = tmp_path / "lot"
+    assert main(["--gpus", "all", "--offline", "--lot-dir", str(d), "--label", "bench"]) == 0
+    s = json.loads((d / "lot.json").read_text())
+    assert s["size"] == 1 and [c["gpu_index"] for c in s["cards"]] == [0]
+    assert [m for m in made if m != "settle"] == [("adapter", 0), ("load", 0)] and "settle" not in made
+
+
+def test_one_card_lot_cannot_be_certified(tmp_path, capsys):
+    d = tmp_path / "lot"
+    assert main(["--fake", "healthy", "--certify", "--server", "http://localhost:1", "--lot-dir", str(d)]) == 1
+    assert capsys.readouterr().err.strip() == "gpucheck: --certify cannot be combined with a lot (--gpus, --lot-dir or --label)"
+    assert not d.exists()
+
+
+def test_lot_says_which_card_it_is_testing_and_how_each_one_ended(tmp_path, capsys):
+    lot(tmp_path, "healthy,busy,healthy")
+    out = capsys.readouterr().out
+    lines = [l for l in out.splitlines() if l.startswith(("Testing GPU", "GPU "))][:6]
+    assert lines[0] == "Testing GPU 0 (card 1 of 3)..."
+    assert lines[1] == "GPU 0: tested"
+    assert lines[2] == "Testing GPU 1 (card 2 of 3)..."
+    assert lines[3].startswith("GPU 1: not tested (") and "busy" in lines[3].lower()
+    assert lines[4:] == ["Testing GPU 2 (card 3 of 3)...", "GPU 2: tested"]
+    assert out.index("GPU 2: tested") < out.index("gpucheck report")
+
+
+def test_lot_progress_reaches_a_redirected_log_before_the_next_card_starts(tmp_path, monkeypatch):
+    # With output redirected to a file the log stayed empty for a whole 45-minute lot.
+    import io
+    import sys
+
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="utf-8"))  # block-buffered, like a file
+    seen = []
+    real = cli._run_card
+
+    def spy(adapter, args, **kw):
+        seen.append(raw.getvalue().decode())
+        return real(adapter, args, **kw)
+
+    monkeypatch.setattr(cli, "_run_card", spy)
+    lot(tmp_path, "healthy,healthy")
+    assert "Testing GPU 0 (card 1 of 2)..." in seen[0]
+    assert "GPU 0: tested" in seen[1] and "Testing GPU 1 (card 2 of 2)..." in seen[1]
+
+
+def test_a_broken_output_pipe_does_not_lose_a_finished_card_or_stop_the_lot(tmp_path, monkeypatch):
+    # gpucheck --gpus all | head, or a terminal that went away: the progress lines must not cost a card.
+    import sys
+
+    class Broken:
+        def write(self, text):
+            raise BrokenPipeError("stdout is gone")
+
+        def flush(self):
+            raise BrokenPipeError("stdout is gone")
+
+    monkeypatch.setattr(sys, "stdout", Broken())
+    d = tmp_path / "lot"
+    with pytest.raises(BrokenPipeError):  # the final report still needs somewhere to go
+        main(["--fake", "healthy,healthy", "--offline", "--quick", "--lot-dir", str(d)])
+    s = json.loads((d / "lot.json").read_text())
+    assert s["finished"] is True and [c["outcome"] for c in s["cards"]] == ["tested", "tested"]
+    assert (d / "gpu0.json").exists() and (d / "gpu1.json").exists()
+
+
+def test_a_card_is_on_disk_before_its_progress_line_is_printed(tmp_path, monkeypatch):
+    import builtins
+
+    d = tmp_path / "lot"
+    on_disk = {}
+    real_print = builtins.print
+
+    def spy(*a, **k):
+        if a and str(a[0]).startswith("GPU 0: tested"):
+            on_disk["gpu0"] = (d / "gpu0.json").exists()
+        return real_print(*a, **k)
+
+    monkeypatch.setattr(builtins, "print", spy)
+    lot(tmp_path, "healthy,healthy")
+    assert on_disk == {"gpu0": True}
+
+
+@pytest.mark.parametrize("flags", [["--label", "rack-7"], ["--lot-dir", "x"], ["--label", "rack-7", "--lot-dir", "x"]])
+def test_a_lot_on_a_multi_gpu_machine_must_say_which_cards(tmp_path, monkeypatch, capsys, flags):
+    # --label rack-7 alone used to mean "GPU 0"; as a lot that would be a one-card "rack-7", silently.
+    made = _real_lot(monkeypatch, 8)
+    runs = _count_runs(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    assert main([*flags, "--offline"]) == 1
+    assert capsys.readouterr().err.strip() == (
+        "gpucheck: this machine has 8 GPUs; a lot needs --gpus to say which cards to test (for example --gpus all)"
+    )
+    assert runs == [] and made == [] and not list(tmp_path.iterdir())
+
+
+def test_a_lot_of_one_named_card_on_a_multi_gpu_machine_is_allowed(tmp_path, monkeypatch):
+    _real_lot(monkeypatch, 8)
+    d = tmp_path / "lot"
+    assert main(["--gpus", "3", "--label", "spare", "--offline", "--lot-dir", str(d)]) == 0
+    s = json.loads((d / "lot.json").read_text())
+    assert s["size"] == 1 and [c["gpu_index"] for c in s["cards"]] == [3]

@@ -43,8 +43,9 @@ def _pcie_link(inv: dict) -> str | None:
     keys = ("pcie_gen_current", "pcie_width_current", "pcie_gen_max", "pcie_width_max")
     if any(inv.get(k) is None for k in keys):
         return None
+    when = "under load" if inv.get("pcie_link_under_load") else "at idle"
     return (
-        f"gen {inv['pcie_gen_current']} x{inv['pcie_width_current']} "
+        f"gen {inv['pcie_gen_current']} x{inv['pcie_width_current']} {when} "
         f"(max gen {inv['pcie_gen_max']} x{inv['pcie_width_max']})"
     )
 

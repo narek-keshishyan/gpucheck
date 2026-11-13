@@ -244,3 +244,42 @@ def test_non_numeric_link_and_ecc_values_are_unknown(monkeypatch):
 def test_non_numeric_remapped_rows_are_unknown(monkeypatch, remap):
     inv = adapter(monkeypatch, modern(remap=remap)).inventory()
     assert inv.remapped_rows is None
+
+
+def test_pcie_link_reads_the_current_generation_and_width(monkeypatch):
+    nv = _with_manifest(modern())
+    monkeypatch.setitem(sys.modules, "pynvml", nv)
+    a = NvmlAdapter()
+    assert a.pcie_link() == (4, 8)
+    nv.nvmlDeviceGetCurrPcieLinkGeneration = lambda h: 5  # the link speeds up under load
+    assert a.pcie_link() == (5, 8)
+
+
+def test_pcie_link_is_unknown_when_nvml_cannot_report_it(monkeypatch):
+    monkeypatch.setitem(sys.modules, "pynvml", modern())  # no PCIe functions at all
+    assert NvmlAdapter().pcie_link() == (None, None)
+
+
+def test_importing_nvml_does_not_warn_that_the_package_is_deprecated():
+    # Seen on every real run: the old "pynvml" distribution warns on import. The NVML bindings
+    # must come from nvidia-ml-py, which provides the same module without the warning.
+    import subprocess
+
+    out = subprocess.run(
+        [sys.executable, "-W", "error::FutureWarning", "-c", "import pynvml"], capture_output=True, text=True
+    )
+    assert out.returncode == 0, out.stderr[-400:]
+
+
+def test_an_old_pynvml_left_behind_by_an_upgrade_does_not_warn_through_gpucheck():
+    # pip install -U leaves an already-installed "pynvml" distribution in place; its import warning
+    # is nothing the person running a test can act on.
+    import subprocess
+
+    code = (
+        "import warnings, gpucheck.adapter\n"
+        "warnings.warn('The pynvml package is deprecated. Please install nvidia-ml-py instead.', FutureWarning)\n"
+        "warnings.warn('something else', FutureWarning)\n"
+    )
+    out = subprocess.run([sys.executable, "-W", "error::FutureWarning", "-c", code], capture_output=True, text=True)
+    assert out.returncode != 0 and "something else" in out.stderr and "pynvml package" not in out.stderr

@@ -16,6 +16,12 @@ class AdapterUnavailable(Exception):
     """Raised when no GPU or NVIDIA driver is available."""
 
 
+# An old "pynvml" distribution left in place by an upgrade warns on every import that it is
+# deprecated. gpucheck depends on nvidia-ml-py, which provides the same module, so the warning
+# is nothing the person running a test can act on.
+warnings.filterwarnings("ignore", message="The pynvml package is deprecated", category=FutureWarning)
+
+
 @dataclass(frozen=True)
 class GpuInventory:
     model_name: str
@@ -37,6 +43,7 @@ class GpuInventory:
     pcie_gen_max: int | None = None
     pcie_width_current: int | None = None
     pcie_width_max: int | None = None
+    pcie_link_under_load: bool | None = None  # True when the current link was read while the load ran
     ecc_aggregate_corrected: int | None = None  # lifetime counts
     ecc_aggregate_uncorrected: int | None = None
     serial: str | None = None  # read only on explicit opt-in
@@ -55,6 +62,9 @@ class TelemetrySample:
 
 
 class TelemetryAdapter(Protocol):
+    """An adapter may also offer pcie_link() -> (generation, width): the link as it is right now.
+    The run reads it under load, because a link drops to a lower speed at idle to save power."""
+
     def inventory(self) -> GpuInventory: ...
 
     def sample(self) -> TelemetrySample: ...
@@ -196,16 +206,13 @@ class NvmlAdapter(TelemetryAdapter):
             "nvmlDeviceGetTotalEccErrors", h,
             _const(nv, "NVML_MEMORY_ERROR_TYPE_UNCORRECTED", default=1), aggregate,
         )
+        gen_cur, width_cur = self.pcie_link()
         link = {
-            key: self._q(fn, h)
-            for key, fn in (
-                ("gen_cur", "nvmlDeviceGetCurrPcieLinkGeneration"),
-                ("gen_max", "nvmlDeviceGetMaxPcieLinkGeneration"),
-                ("width_cur", "nvmlDeviceGetCurrPcieLinkWidth"),
-                ("width_max", "nvmlDeviceGetMaxPcieLinkWidth"),
-            )
+            "gen_cur": gen_cur,
+            "gen_max": _int(self._q("nvmlDeviceGetMaxPcieLinkGeneration", h)),
+            "width_cur": width_cur,
+            "width_max": _int(self._q("nvmlDeviceGetMaxPcieLinkWidth", h)),
         }
-        link = {k: _int(v) for k, v in link.items()}
         return GpuInventory(
             model_name=_text(nv.nvmlDeviceGetName(h)),
             uuid_hash=hash_uuid(uuid),
@@ -229,6 +236,14 @@ class NvmlAdapter(TelemetryAdapter):
             ecc_aggregate_corrected=_int(ecc_corrected),
             ecc_aggregate_uncorrected=_int(ecc_uncorrected),
             serial=serial,
+        )
+
+    def pcie_link(self) -> tuple[int | None, int | None]:
+        """The PCIe link's current (generation, width); None for a value NVML cannot report."""
+        h = self._h
+        return (
+            _int(self._q("nvmlDeviceGetCurrPcieLinkGeneration", h)),
+            _int(self._q("nvmlDeviceGetCurrPcieLinkWidth", h)),
         )
 
     def _throttle_mask(self) -> int | None:

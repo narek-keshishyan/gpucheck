@@ -275,3 +275,102 @@ def test_cleanup_warning_on_a_broken_stderr_keeps_the_run(monkeypatch):
     monkeypatch.setattr("sys.stderr", _BrokenStderr())
     r = run(make_fake("healthy"), BrokenStopLoad("CUDA error"))
     assert len(r.load) == 10 and r.aborted is None
+
+
+def _event_run(config, sample=None):
+    """Run with every sample, tick and sleep appended, in order, to one list."""
+    events = []
+
+    class Load:
+        def start(self):
+            events.append("start")
+
+        def tick(self):
+            events.append("tick")
+            return 42.0
+
+        def stop(self):
+            events.append("stop")
+
+    def fn(i, base):
+        events.append("sample")
+        return sample(i, base) if sample else base.sample()
+
+    r = execute_run(
+        ScriptedAdapter(fn), Load(), config, SPEC,
+        clock=FakeClock(), sleep=lambda s: events.append("sleep"),
+    )
+    return r, events
+
+
+def test_load_samples_are_taken_right_after_the_load_burst_not_after_the_pause():
+    # Found on a real A100: a sample taken after the pause between bursts reads idle power and a
+    # cooler card, so each load-phase sample must follow its burst with no sleep in between.
+    _, events = _event_run(RunConfig(baseline_s=1, load_s=3))
+    assert events[events.index("start"):] == [
+        "start",
+        "tick", "sample", "sleep",
+        "tick", "sample", "sleep",
+        "tick", "sample", "sleep",
+        "stop",
+    ]
+
+
+def test_baseline_samples_are_still_one_per_period_with_no_load():
+    _, events = _event_run(RunConfig(baseline_s=2, load_s=1))
+    # the first sample is preflight's
+    assert events[: events.index("start")] == ["sample", "sample", "sleep", "sample", "sleep"]
+
+
+class LinkAdapter(ScriptedAdapter):
+    """A card whose PCIe link is slow at idle (what inventory() sees) and faster while loaded."""
+
+    def __init__(self, links, idle=(1, 8)):
+        super().__init__(lambda i, base: base.sample())
+        self._links = list(links)
+        self._idle = idle
+        self.link_reads = 0
+
+    def inventory(self):
+        return replace(
+            self._base.inventory(),
+            pcie_gen_current=self._idle[0], pcie_width_current=self._idle[1], pcie_gen_max=4, pcie_width_max=16,
+        )
+
+    def pcie_link(self):
+        link = self._links[min(self.link_reads, len(self._links) - 1)]
+        self.link_reads += 1
+        if isinstance(link, Exception):
+            raise link
+        return link
+
+
+def _link(inventory):
+    return (inventory.pcie_gen_current, inventory.pcie_width_current, inventory.pcie_link_under_load)
+
+
+def test_pcie_link_is_read_under_load_and_replaces_the_idle_reading():
+    r = run(LinkAdapter([(4, 16)]), load=RecordingLoad())
+    assert _link(r.inventory) == (4, 16, True)
+    assert (r.inventory.pcie_gen_max, r.inventory.pcie_width_max) == (4, 16)
+
+
+def test_pcie_link_under_load_keeps_the_best_speed_and_width_seen():
+    r = run(LinkAdapter([(2, 8), (4, 8), (3, 8)]), load=RecordingLoad())
+    assert _link(r.inventory) == (4, 8, True)
+
+
+def test_pcie_link_is_left_as_read_at_idle_when_no_load_ran():
+    adapter = LinkAdapter([(4, 16)])
+    r = run(adapter)  # NullLoad: tick() returns None
+    assert _link(r.inventory) == (1, 8, None) and adapter.link_reads == 0
+
+
+def test_pcie_link_read_that_fails_or_is_unknown_leaves_the_idle_reading():
+    assert _link(run(LinkAdapter([RuntimeError("nvml")]), load=RecordingLoad()).inventory) == (1, 8, None)
+    assert _link(run(LinkAdapter([(None, 16)]), load=RecordingLoad()).inventory) == (1, 8, None)
+
+
+def test_adapter_without_a_link_reader_still_runs_under_load():
+    r = run(make_fake("healthy"), load=RecordingLoad())
+    assert r.aborted is None and r.inventory.pcie_link_under_load is None

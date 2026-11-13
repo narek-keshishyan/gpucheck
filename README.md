@@ -30,8 +30,8 @@ gpucheck --json PATH     # where to write result.json (default ./gpucheck-result
 gpucheck --certify       # use a one-time server challenge so the result can earn a certificate (off on the default server)
 gpucheck --gpus all      # test every GPU in the machine, one after another (a "lot")
 gpucheck --gpus 0,2      # test only these GPU indices
-gpucheck --label "Rack 4"        # name a multi-GPU run (at most 80 characters)
-gpucheck --lot-dir DIR   # where a multi-GPU run writes its files (default ./gpucheck-lot-<id>)
+gpucheck --gpus all --label "Rack 4"   # name a lot (at most 80 characters)
+gpucheck --gpus all --lot-dir DIR      # where a lot writes its files (default ./gpucheck-lot-<id>)
 gpucheck --include-serial        # also record the card's serial number
 gpucheck --api-key KEY   # send an API key with the upload; prefer the GPUCHECK_API_KEY environment variable
 gpucheck --upload-saved PATH     # upload a saved result file or lot directory; tests no GPU
@@ -39,7 +39,7 @@ gpucheck --upload-saved PATH     # upload a saved result file or lot directory; 
 
 Without `--gpus`, gpucheck tests GPU 0 only and says so when the machine has more than one card.
 
-A single-card result is always written locally to `result.json` first, before any upload; a multi-GPU run writes its lot directory card by card as each card finishes. The tool only reads from the GPU; it does not change any settings. Ctrl-C stops a run at any time. For a single-card run, an interrupted run writes no result.json and uploads nothing. An interrupted or killed multi-GPU run keeps the cards that finished: see below.
+A single-card result is always written locally to `result.json` first, before any upload; a lot (several cards, or one card run with `--lot-dir` or `--label`) writes its lot directory card by card as each card finishes. The tool only reads from the GPU; it does not change any settings. Ctrl-C stops a run at any time. For a plain single-card run, an interrupted run writes no result.json and uploads nothing. An interrupted or killed lot keeps the cards that finished: see below.
 
 ### Upload flow
 
@@ -51,7 +51,7 @@ curl -X DELETE -H "X-Delete-Token: <token>" <server>/v1/runs/<run_id>
 
 ## Testing every GPU in a machine
 
-`gpucheck --gpus all` (or `--gpus 0,2` for a subset, up to 16 cards) tests the cards one after another, never at the same time, and calls the whole run a lot. Each card gets an ordinary single-card run. Before every card after the first, gpucheck waits for that card's idle temperature to stop falling, up to 5 minutes, so that heat from the previous card does not skew the idle baseline. An 8-GPU server can therefore take up to about two hours at the standard length; `--quick` shortens each run.
+`gpucheck --gpus all` (or `--gpus 0,2` for a subset, up to 16 cards) tests the cards one after another, never at the same time, and calls the whole run a lot. Each card gets an ordinary single-card run. Before every card after the first, gpucheck waits for that card's idle temperature to stop falling, up to 5 minutes, so that heat from the previous card does not skew the idle baseline. An 8-GPU server can therefore take up to about two hours at the standard length; `--quick` shortens each run. While a lot runs, gpucheck prints one line when each card starts and one when it ends, also when the output goes to a file; the per-card reports and the summary follow when every card is done.
 
 A lot writes a directory (`--lot-dir`, default `./gpucheck-lot-<id>`) containing `gpu<position>.json` for each card that produced a result, and `lot.json`, which summarises every card, including those that were not tested and why. Before the first card runs, gpucheck creates `lot.json`, which both checks that the directory is writable and claims it for this run: one lot directory is used by one run only. A run pointed at a directory that already holds a `lot.json` is refused, whether that lot finished long ago or is still running (for example a `nohup` run and the same command started again), so an earlier lot is never overwritten. In a lot run `--json` is not used.
 
@@ -65,7 +65,7 @@ A multi-GPU run needs the load generator (PyTorch with CUDA, the `[load]` extra)
 
 GPU numbering: PyTorch and NVML must agree on which card is GPU N, or the tool would load one card while measuring another. gpucheck therefore sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before loading PyTorch (if it was set to something else, it says it is overriding it), and on a machine with more than one GPU it refuses to run while `CUDA_VISIBLE_DEVICES` is set, because PyTorch would then number only the visible cards. This includes `CUDA_VISIBLE_DEVICES` set to an empty value, which hides every GPU from PyTorch. Unset it and choose cards with `--gpus` instead. This also applies to a single-card run on a multi-GPU machine. MIG-enabled machines are not supported for multi-GPU runs, because the device numbering is not guaranteed there.
 
-`--certify` cannot be used with several cards. A machine with one GPU and `--gpus all` is an ordinary single run.
+`--certify` cannot be used with a lot. A single card (a machine with one GPU and `--gpus all`, or `--gpus N`) is an ordinary single run, unless you pass `--lot-dir` or `--label`: then that one card is written as a lot of one, and `--json` is not used. On a machine with more than one GPU, `--lot-dir` or `--label` needs `--gpus` as well: gpucheck refuses rather than make a labelled lot out of GPU 0 alone.
 
 After a lot, gpucheck asks once whether to upload (or uses `--yes-upload`; with `--dry-run` it prints the request instead). In a non-interactive shell it prints how to upload later with `--upload-saved`. Ctrl-C during the upload stops it and prints the same retry command. Uploading a lot needs a server deployed with lot support; an older server answers 404, the upload is reported as failed, and the lot stays saved for `--upload-saved`.
 
@@ -73,7 +73,7 @@ After a lot, gpucheck asks once whether to upload (or uses `--yes-upload`; with 
 
 Nothing, unless you opt in. Uploading is off in non-interactive shells unless you pass `--yes-upload`. `--dry-run` prints the exact payload so you can read it first.
 
-The payload is the contents of `result.json`: GPU model and driver details, measurements, findings, and the time series of samples. Besides the model and driver, each card's record includes, where the card reports them: its GPU index, firmware (VBIOS) version, PCIe link generation and width (current and maximum), and lifetime corrected and uncorrected memory-error counts. A value the card does not report is simply absent. If the PCIe link runs below what the card supports, the report shows a `PCIE_LINK_DEGRADED` finding; a lower generation at idle can be normal power saving. The result also carries the run's start and end times and, in a lot, the lot ID, the card's position and your label. The GPU's UUID is replaced by a salted hash, so the raw UUID is never sent. The salt is a public constant in this source code, so anyone who already knows your GPU's UUID can recompute the hash and recognise your card.
+The payload is the contents of `result.json`: GPU model and driver details, measurements, findings, and the time series of samples. Besides the model and driver, each card's record includes, where the card reports them: its GPU index, firmware (VBIOS) version, PCIe link generation and width (current and maximum), and lifetime corrected and uncorrected memory-error counts. A value the card does not report is simply absent. The current PCIe link is read while the load runs, because a link drops to a lower speed at idle to save power, and the record says that it was read under load. If the link then runs below what the card and slot support, the report shows a `PCIE_LINK_DEGRADED` finding. When no load ran, the link is read at idle: only a narrower width is reported, and the speed is not judged. The result also carries the run's start and end times and, in a lot, the lot ID, the card's position and your label. The GPU's UUID is replaced by a salted hash, so the raw UUID is never sent. The salt is a public constant in this source code, so anyone who already knows your GPU's UUID can recompute the hash and recognise your card.
 
 The serial number is never read or uploaded unless you pass `--include-serial`. When you do, the serial appears in the uploaded result and on the public pages, and is also written to your local result files.
 
@@ -128,7 +128,7 @@ Verifying a certificate offline needs the certificate payload, its signature, an
 
 ## Findings
 
-The report lists plain-language findings, each with a severity and a confidence. Besides the thermal, power and throughput findings (`THERMAL_THROTTLING`, `POWER_CAPPED`, `HOT_ENVIRONMENT`, `UNDERPERFORMING_UNKNOWN`, `INSUFFICIENT_EVIDENCE`), it can report `HOT_UNDER_LOAD` (the card throttled quickly and ran near its temperature limit even though it idled cool), `MEMORY_ERRORS` (errors during the run, remapped memory rows, or uncorrected memory errors over the card's lifetime, recorded by the card), `MEMORY_NOT_CHECKED` (the card exposes no memory-error counters, so memory health was not checked) and `PCIE_LINK_DEGRADED`. Every report ends with a "Not covered" note listing what the test does not examine.
+The report lists plain-language findings, each with a severity and a confidence. Besides the thermal, power and throughput findings (`THERMAL_THROTTLING`, `POWER_CAPPED`, `HOT_ENVIRONMENT`, `UNDERPERFORMING_UNKNOWN`, `INSUFFICIENT_EVIDENCE`), it can report `HOT_UNDER_LOAD` (the card throttled quickly and ran near its temperature limit even though it idled cool), `MEMORY_ERRORS` (errors during the run, remapped memory rows, or uncorrected memory errors over the card's lifetime, recorded by the card), `MEMORY_NOT_CHECKED` (the card exposes no memory-error counters, so memory health was not checked) and `PCIE_LINK_DEGRADED`. `POWER_CAPPED` means the card's power limit is set below 90% of its default; a card that regulates at its stock limit under full load is not flagged. (When the limits cannot be read, power capping seen on a cool card is reported instead.) `UNDERPERFORMING_UNKNOWN` is reported when sustained throughput is below 90% of the datasheet peak with no throttling seen, or below 75% on a card that only shows power regulation at its stock limit: a healthy stock A100 measured 86%, so the power limit does not explain a larger shortfall. Every report ends with a "Not covered" note listing what the test does not examine.
 
 ## Exit codes
 
@@ -138,9 +138,9 @@ The report lists plain-language findings, each with a severity and a confidence.
 | 1 | Preflight refused to run (for example the GPU is busy), or the request was refused (for example a bad `--gpus` value) |
 | 2 | No NVIDIA GPU or driver available |
 | 3 | Run aborted partway (thermal limit, ECC errors, or lost telemetry); result.json is still written |
-| 130 | Interrupted with Ctrl-C during a multi-GPU run (finished cards are kept) or during an `--upload-saved` upload (nothing on disk is changed) |
+| 130 | Interrupted with Ctrl-C during a lot (finished cards are kept) or during an `--upload-saved` upload (nothing on disk is changed) |
 
-For a multi-GPU run: 0 when every card was tested, 3 when some cards were not tested or a run was aborted (the lot is still written), 1 when no card produced a result or the lot could not be started or saved, and 130 when interrupted. A failed upload does not change the exit code. `--upload-saved` exits 0 on success, 1 on any failure, and 130 when the upload is interrupted with Ctrl-C (nothing on disk is changed).
+For a lot: 0 when every card was tested, 3 when some cards were not tested or a run was aborted (the lot is still written), 1 when no card produced a result or the lot could not be started or saved, and 130 when interrupted. A failed upload does not change the exit code. `--upload-saved` exits 0 on success, 1 on any failure, and 130 when the upload is interrupted with Ctrl-C (nothing on disk is changed).
 
 ## What this test does not cover
 
@@ -154,7 +154,7 @@ This is a pre-flight check, not proof of health. It does not test memory cells, 
 - It refuses to run on a GPU that is already busy.
 - Grades depend on a reference set of comparable runs; for new or rare models you will see "insufficient reference".
 - A single run is a snapshot. A run with no findings is a snapshot of one test, not a guarantee.
-- Multi-GPU runs have been tested only with simulated cards and have not yet been run on real multi-GPU hardware. The manifest queries (VBIOS, PCIe link, lifetime memory-error counts, serial) and `--gpus N` on a multi-GPU machine are also unverified on real hardware. Until the procedure in `docs/smoke-rented-gpu.md` has been carried out, treat them as unverified.
+- Real-hardware coverage so far is one machine with four RTX 3090s and one A100 80GB (November 2026, procedure in `docs/smoke-rented-gpu.md`). Lots on datacenter cards, machines with more than four GPUs, H100 and other models have not been run on real hardware; treat them as unverified.
 
 ## License
 

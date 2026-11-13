@@ -234,23 +234,68 @@ def test_power_capped_limit_arm_skipped_when_limits_unknown():
 def test_power_capped_reason_arm_fires_below_max_minus_15():
     # SPEC max is 83 C, so the reason arm needs steady < 68 C.
     m = healthy(steady_temp_c=67.9, throttle_reasons_seen=["power"])
-    f = find(diagnose(m, PF, inv(), SPEC), "POWER_CAPPED")
+    f = find(diagnose(m, PF, inv(power_limit=None), SPEC), "POWER_CAPPED")
     assert (f.severity, f.confidence) == ("info", "high")
 
 
 def test_power_capped_reason_arm_matches_any_power_reason():
     m = healthy(steady_temp_c=60.0, throttle_reasons_seen=["sw_power_cap"])
-    assert "POWER_CAPPED" in codes(diagnose(m, PF, inv(), SPEC))
+    assert "POWER_CAPPED" in codes(diagnose(m, PF, inv(default=None), SPEC))
 
 
 def test_power_capped_reason_arm_not_at_max_minus_15():
     m = healthy(steady_temp_c=68.0, throttle_reasons_seen=["power"])
-    assert "POWER_CAPPED" not in codes(diagnose(m, PF, inv(), SPEC))
+    assert "POWER_CAPPED" not in codes(diagnose(m, PF, inv(power_limit=None), SPEC))
 
 
 def test_power_capped_reason_arm_skipped_without_spec():
     m = healthy(steady_temp_c=60.0, throttle_reasons_seen=["power"])
-    assert "POWER_CAPPED" not in codes(diagnose(m, PF, inv(), None))
+    assert "POWER_CAPPED" not in codes(diagnose(m, PF, inv(power_limit=None), None))
+
+
+def test_power_reason_at_the_stock_power_limit_is_not_a_finding():
+    # Found on a real A100: at its default 400 W limit the card reports the power-cap flag under
+    # full load. That is the card regulating at its normal limit, not a card capped below it.
+    m = healthy(steady_temp_c=60.0, throttle_reasons_seen=["power"])
+    assert "POWER_CAPPED" not in codes(diagnose(m, PF, inv(power_limit=400.0, default=400.0), SPEC))
+    assert "POWER_CAPPED" not in codes(diagnose(m, PF, inv(power_limit=405.0, default=450.0), SPEC))
+
+
+def test_large_shortfall_at_the_stock_power_limit_is_still_reported():
+    # Without this a card at half speed that only shows the power flag would get no finding at all.
+    m = healthy(tflops_ratio_vs_spec=0.5, steady_temp_c=60.0, throttle_reasons_seen=["power"])
+    f = find(diagnose(m, PF, inv(power_limit=400.0, default=400.0), SPEC), "UNDERPERFORMING_UNKNOWN")
+    assert (f.severity, f.confidence) == ("warn", "low")
+    assert f.message == (
+        "Sustained throughput was 50.0% of the datasheet peak. The card was regulating at its normal "
+        "power limit, which does not explain a shortfall this large, and the cause is unknown."
+    )
+
+
+def test_normal_shortfall_at_the_stock_power_limit_is_not_reported():
+    # A healthy stock A100 measured 0.86 of the datasheet peak while regulating at 400 W.
+    for ratio in (0.86, 0.75):
+        m = healthy(tflops_ratio_vs_spec=ratio, steady_temp_c=60.0, throttle_reasons_seen=["power"])
+        assert codes(diagnose(m, PF, inv(power_limit=400.0, default=400.0), SPEC)) == []
+
+
+def test_large_shortfall_with_a_thermal_reason_is_left_to_the_thermal_rules():
+    m = healthy(tflops_ratio_vs_spec=0.5, steady_temp_c=60.0, throttle_reasons_seen=["power", "thermal"])
+    assert "UNDERPERFORMING_UNKNOWN" not in codes(diagnose(m, PF, inv(power_limit=400.0, default=400.0), SPEC))
+
+
+def test_large_shortfall_under_a_lowered_or_unknown_limit_is_explained_by_the_cap():
+    m = healthy(tflops_ratio_vs_spec=0.5, steady_temp_c=60.0, throttle_reasons_seen=["power"])
+    assert codes(diagnose(m, PF, inv(power_limit=220.0, default=350.0), SPEC)) == ["POWER_CAPPED"]
+    assert codes(diagnose(m, PF, inv(power_limit=None), SPEC)) == ["POWER_CAPPED"]
+
+
+def test_power_reason_below_the_stock_limit_still_reports_the_low_limit():
+    m = healthy(steady_temp_c=60.0, throttle_reasons_seen=["power"])
+    f = find(diagnose(m, PF, inv(power_limit=220.0, default=350.0), SPEC), "POWER_CAPPED")
+    assert f.message == (
+        "Power limit is 220 W, below 90% of the 350 W default, so the card is capped below normal power."
+    )
 
 
 # --- UNDERPERFORMING_UNKNOWN (warn, low) ----------------------------------
@@ -265,9 +310,11 @@ def test_underperforming_not_at_0_9():
     assert "UNDERPERFORMING_UNKNOWN" not in codes(diagnose(healthy(tflops_ratio_vs_spec=0.9), PF, inv(), SPEC))
 
 
-def test_underperforming_not_when_throttle_reasons_seen():
-    m = healthy(tflops_ratio_vs_spec=0.5, throttle_reasons_seen=["sw_power_cap"], steady_temp_c=70.0)
-    assert "UNDERPERFORMING_UNKNOWN" not in codes(diagnose(m, PF, inv(), SPEC))
+def test_underperforming_not_when_another_rule_explains_the_throttling():
+    thermal = healthy(tflops_ratio_vs_spec=0.5, throttle_reasons_seen=["thermal"], steady_temp_c=70.0)
+    assert "UNDERPERFORMING_UNKNOWN" not in codes(diagnose(thermal, PF, inv(), SPEC))
+    capped = healthy(tflops_ratio_vs_spec=0.5, throttle_reasons_seen=["sw_power_cap"], steady_temp_c=70.0)
+    assert codes(diagnose(capped, PF, inv(power_limit=300.0), SPEC)) == ["POWER_CAPPED"]
 
 
 def test_underperforming_skipped_without_spec():
@@ -393,25 +440,44 @@ def test_memory_errors_wins_over_not_checked():
     assert "MEMORY_ERRORS" in found and "MEMORY_NOT_CHECKED" not in found
 
 
-def _pcie(gc, gm, wc, wm):
-    return replace(inv(), pcie_gen_current=gc, pcie_gen_max=gm, pcie_width_current=wc, pcie_width_max=wm)
-
-
-def test_pcie_link_degraded_on_narrow_width():
-    f = find(diagnose(healthy(), PF, _pcie(4, 4, 8, 16), SPEC), "PCIE_LINK_DEGRADED")
-    assert f.severity == "info" and f.confidence == "high"
-    assert f.message == (
-        "PCIe link is running at gen 4 x8; the card and slot support gen 4 x16. Check seating, riser "
-        "and slot. A lower generation at idle can be normal power saving."
+def _pcie(gc, gm, wc, wm, under_load=None):
+    return replace(
+        inv(), pcie_gen_current=gc, pcie_gen_max=gm, pcie_width_current=wc, pcie_width_max=wm,
+        pcie_link_under_load=under_load,
     )
 
 
-def test_pcie_link_degraded_on_lower_generation():
-    assert "PCIE_LINK_DEGRADED" in codes(diagnose(healthy(), PF, _pcie(3, 4, 16, 16), SPEC))
+def test_pcie_link_read_under_load_flags_a_narrow_link():
+    f = find(diagnose(healthy(), PF, _pcie(4, 4, 8, 16, under_load=True), SPEC), "PCIE_LINK_DEGRADED")
+    assert (f.severity, f.confidence) == ("info", "high")
+    assert f.message == (
+        "PCIe link ran at gen 4 x8 under load; the card and slot support gen 4 x16. "
+        "Check seating, riser and slot."
+    )
+
+
+def test_pcie_link_read_under_load_flags_a_lower_generation():
+    assert "PCIE_LINK_DEGRADED" in codes(diagnose(healthy(), PF, _pcie(3, 4, 16, 16, under_load=True), SPEC))
+
+
+def test_pcie_lower_generation_read_at_idle_is_not_a_finding():
+    # Found on real RTX 3090s: the link idles at gen 1-2 and runs at gen 4 under load.
+    assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, _pcie(1, 4, 16, 16), SPEC))
+    assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, _pcie(2, 4, 16, 16, under_load=False), SPEC))
+
+
+def test_pcie_narrow_width_read_at_idle_is_flagged_without_judging_the_speed():
+    f = find(diagnose(healthy(), PF, _pcie(1, 4, 8, 16), SPEC), "PCIE_LINK_DEGRADED")
+    assert f.message == (
+        "PCIe link width is x8; the card and slot support x16. Check seating, riser and slot. "
+        "The link was read at idle, where a lower speed is normal power saving, so its speed was not judged."
+    )
 
 
 def test_pcie_link_full_or_unknown_is_silent():
     assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, _pcie(4, 4, 16, 16), SPEC))
+    assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, _pcie(4, 4, 16, 16, under_load=True), SPEC))
+    assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, _pcie(None, 4, 8, 16, under_load=True), SPEC))
     assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, _pcie(None, 4, 8, 16), SPEC))
     assert "PCIE_LINK_DEGRADED" not in codes(diagnose(healthy(), PF, inv(), SPEC))
 

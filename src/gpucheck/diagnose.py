@@ -29,6 +29,9 @@ HOT_IDLE_C = 50.0
 POWER_LIMIT_FRACTION = 0.9
 POWER_REASON_HEADROOM_C = 15.0
 UNDERPERFORMING_RATIO = 0.9
+# A card regulating at its stock power limit falls short of the datasheet peak without any fault:
+# a healthy stock A100 measured 0.86. Below this, the power limit does not explain the shortfall.
+UNDERPERFORMING_AT_POWER_LIMIT_RATIO = 0.75
 
 
 @dataclass(frozen=True)
@@ -90,14 +93,25 @@ def _pcie_link(inv: GpuInventory) -> Finding | None:
     if any(v is None for v in vals):
         return None
     gc, gm, wc, wm = vals
-    if wc >= wm and gc >= gm:
+    if inv.pcie_link_under_load:
+        if wc >= wm and gc >= gm:
+            return None
+        return Finding(
+            "PCIE_LINK_DEGRADED",
+            "info",
+            "high",
+            f"PCIe link ran at gen {gc} x{wc} under load; the card and slot support gen {gm} x{wm}. "
+            "Check seating, riser and slot.",
+        )
+    # Read at idle: a link saves power by dropping to a lower generation, so only its width counts.
+    if wc >= wm:
         return None
     return Finding(
         "PCIE_LINK_DEGRADED",
         "info",
         "high",
-        f"PCIe link is running at gen {gc} x{wc}; the card and slot support gen {gm} x{wm}. "
-        "Check seating, riser and slot. A lower generation at idle can be normal power saving.",
+        f"PCIe link width is x{wc}; the card and slot support x{wm}. Check seating, riser and slot. "
+        "The link was read at idle, where a lower speed is normal power saving, so its speed was not judged.",
     )
 
 
@@ -140,8 +154,12 @@ def _power_capped(m: Metrics, inv: GpuInventory, spec: GpuSpec | None) -> Findin
         and inv.default_power_limit_w is not None
         and inv.power_limit_w < POWER_LIMIT_FRACTION * inv.default_power_limit_w
     )
+    # A card at its stock limit shows the power-cap flag under full load: that is normal regulation.
+    # So the flag alone counts only when the limits themselves could not be read.
+    limits_unknown = inv.power_limit_w is None or inv.default_power_limit_w is None
     reason_arm = (
-        spec is not None
+        limits_unknown
+        and spec is not None
         and m.steady_temp_c is not None
         and any("power" in r for r in m.throttle_reasons_seen)
         and m.steady_temp_c < spec.max_temp_c - POWER_REASON_HEADROOM_C
@@ -181,9 +199,33 @@ def _thermal_throttling(m: Metrics) -> Finding | None:
     )
 
 
-def _underperforming(m: Metrics, spec: GpuSpec | None) -> Finding | None:
-    if spec is None or m.tflops_ratio_vs_spec is None or m.throttle_reasons_seen:
+def _at_stock_power_limit(inv: GpuInventory) -> bool:
+    return (
+        inv.power_limit_w is not None
+        and inv.default_power_limit_w is not None
+        and inv.power_limit_w >= POWER_LIMIT_FRACTION * inv.default_power_limit_w
+    )
+
+
+def _underperforming(m: Metrics, inv: GpuInventory, spec: GpuSpec | None) -> Finding | None:
+    if spec is None or m.tflops_ratio_vs_spec is None:
         return None
+    if m.throttle_reasons_seen:
+        # Only the power flag, on a card at its stock limit: no other rule speaks for this card,
+        # so a shortfall too large for normal power regulation must not pass without a word.
+        only_power = not _throttled(m) and all("power" in r for r in m.throttle_reasons_seen)
+        if not (only_power and _at_stock_power_limit(inv)):
+            return None
+        if m.tflops_ratio_vs_spec >= UNDERPERFORMING_AT_POWER_LIMIT_RATIO:
+            return None
+        return Finding(
+            "UNDERPERFORMING_UNKNOWN",
+            "warn",
+            "low",
+            f"Sustained throughput was {m.tflops_ratio_vs_spec:.1%} of the datasheet peak. The card was "
+            "regulating at its normal power limit, which does not explain a shortfall this large, "
+            "and the cause is unknown.",
+        )
     if m.tflops_ratio_vs_spec >= UNDERPERFORMING_RATIO:
         return None
     if "throttle_reasons" in m.telemetry_gaps:
@@ -234,7 +276,7 @@ def diagnose(
         _hot_environment(metrics),
         throttling,
         _power_capped(metrics, inventory, spec),
-        _underperforming(metrics, spec),
+        _underperforming(metrics, inventory, spec),
         insufficient,
         _pcie_link(inventory),
     )

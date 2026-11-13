@@ -2,7 +2,8 @@
 
 Time is driven by this module's own schedule: every iteration calls
 adapter.sample() once, then sleeps until the next 1/hz slot (measured with the
-injected clock). Sample timestamps (t_s) come from the adapter. A sample() that
+injected clock). In the load phase the load burst runs first and the sample is
+taken straight after it, so it reads the card under load. Sample timestamps (t_s) come from the adapter. A sample() that
 raises is recorded as an all-None sample whose t_s is the previous sample's t_s
 plus 1/hz (0.0 if there is none yet), so the series stays evenly spaced.
 """
@@ -125,9 +126,29 @@ def execute_run(
     loaded: list[TelemetrySample] = []
     period = 1.0 / config.hz
     state = {"last_t": None, "errors": 0}
+    link: dict[str, int] = {}  # best PCIe generation and width seen while the load ran
 
     def result(aborted: str | None) -> RawRun:
-        return RawRun(inventory, preflight, baseline, loaded, config, aborted)
+        inv = inventory
+        if "gen" in link and "width" in link:
+            # A link drops to a lower speed at idle, so the idle reading from inventory() says
+            # little; what the link reached under load is the one worth reporting.
+            inv = replace(
+                inv, pcie_gen_current=link["gen"], pcie_width_current=link["width"], pcie_link_under_load=True
+            )
+        return RawRun(inv, preflight, baseline, loaded, config, aborted)
+
+    def read_link() -> None:
+        reader = getattr(adapter, "pcie_link", None)
+        if reader is None:
+            return
+        try:
+            gen, width = reader()
+        except Exception:
+            return
+        if gen is not None and width is not None:
+            link["gen"] = max(gen, link.get("gen", gen))
+            link["width"] = max(width, link.get("width", width))
 
     if preflight.mode == "refuse":
         return result("preflight_refused")
@@ -147,11 +168,17 @@ def execute_run(
     def phase(count: int, out: list[TelemetrySample], watchdog: _Watchdog | None, tick: bool) -> str | None:
         start = clock()
         for i in range(count):
-            s = take()
             if tick:
+                # Sample straight after the burst. Sampling first would read the card after the
+                # pause that ends each period: on cards that report instantaneous values (A100)
+                # that showed idle power and a card several degrees cooler than under load.
                 tflops = load.tick()
+                s = take()
                 if tflops is not None:
                     s = replace(s, achieved_tflops=tflops)
+                    read_link()  # only when a burst really ran
+            else:
+                s = take()
             out.append(s)
             if watchdog is not None and (reason := watchdog.check(s)):
                 return reason

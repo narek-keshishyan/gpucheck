@@ -80,8 +80,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--api-key", metavar="KEY", default=None, help="send this API key with the upload; prefer the GPUCHECK_API_KEY environment variable, because command-line arguments are visible to other users of the machine. The key is never saved or printed")
     p.add_argument("--gpus", metavar="SPEC", default=None, help='which GPUs to test: "all" or indices such as "0,2" (default: 0)')
     p.add_argument("--include-serial", action="store_true", help="also record the card's serial number in the result")
-    p.add_argument("--label", metavar="TEXT", default=None, help=f"a name for a multi-GPU lot, such as a rack or chassis (at most {MAX_LABEL_LEN} characters)")
-    p.add_argument("--lot-dir", metavar="DIR", default=None, help="where a multi-GPU run writes its files (default: ./gpucheck-lot-<id>)")
+    p.add_argument("--label", metavar="TEXT", default=None, help=f"a name for a lot, such as a rack or chassis (at most {MAX_LABEL_LEN} characters); makes the run a lot even with one card")
+    p.add_argument("--lot-dir", metavar="DIR", default=None, help="where a lot writes its files (default: ./gpucheck-lot-<id>); makes the run a lot even with one card")
     p.add_argument("--upload-saved", metavar="PATH", default=None, help="upload a saved result file or lot directory without testing any GPU")
     p.add_argument("--fake", metavar="PROFILE", help=argparse.SUPPRESS)
     return p
@@ -286,10 +286,29 @@ def _run_card(
     return outcome(run.inventory, TESTED, None, result)
 
 
+def _say(text: str) -> None:
+    """A progress line for a long lot, flushed so a log file or a pipe shows it at once.
+
+    Never raises: an output that has gone away (a closed pipe, a lost terminal) must not cost the
+    card that just finished or stop the cards still to run."""
+    try:
+        print(text, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def _progress_line(card: CardOutcome) -> str:
+    """One line saying how a lot card ended."""
+    if card.outcome == TESTED:
+        return f"GPU {card.gpu_index}: tested"
+    how = "stopped early" if card.outcome == ABORTED else "not tested"
+    return f"GPU {card.gpu_index}: {how} ({card.reason})"
+
+
 def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None) -> int:
     """Test every card in turn and write the lot; gpu_indices[i] is the index adapters[i] was selected by."""
     if args.certify:
-        print("gpucheck: --certify cannot be combined with a multi-GPU run", file=sys.stderr)
+        print("gpucheck: --certify cannot be combined with a lot (--gpus, --lot-dir or --label)", file=sys.stderr)
         return EXIT_REFUSED
     lot_id = new_lot_id()
     directory = Path(args.lot_dir or f"./gpucheck-lot-{lot_id[:8]}")
@@ -330,6 +349,7 @@ def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None
     interrupted = False
     for pos, adapter in enumerate(adapters):
         try:
+            _say(f"Testing GPU {gpu_indices[pos]} (card {pos + 1} of {len(adapters)})...")
             cards.append(_run_card(
                 adapter, args, position=pos, gpu_index=gpu_indices[pos],
                 lot={**lot_ref, "position": pos}, settle_first=pos > 0,
@@ -338,6 +358,7 @@ def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None
                 save(False, NOT_REACHED)
             except OSError as e:  # retried at the end; the result stays in memory
                 print(f"warning: could not save GPU {pos} to {directory}: {e}", file=sys.stderr)
+            _say(_progress_line(cards[-1]))  # after the save: the card is on disk when this is read
         except _CardInterrupted as stop:
             cards.append(stop.outcome)
             interrupted = True
@@ -599,8 +620,18 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as e:
             print(f"gpucheck: --gpus: {e}", file=sys.stderr)
             return EXIT_REFUSED
-        if len(selected) > 1:
-            if not args.fake and not _load_available():
+        # One card is a lot too when the user asked for one by naming a directory or a label.
+        wants_lot = args.lot_dir is not None or args.label is not None
+        if wants_lot and not args.fake and args.gpus is None and count > 1:
+            # Without --gpus only GPU 0 would be tested: a labelled lot holding one card of many.
+            print(
+                f"gpucheck: this machine has {count} GPUs; a lot needs --gpus to say which cards to test "
+                "(for example --gpus all)",
+                file=sys.stderr,
+            )
+            return EXIT_REFUSED
+        if len(selected) > 1 or wants_lot:
+            if len(selected) > 1 and not args.fake and not _load_available():
                 print(
                     'gpucheck: a multi-GPU run needs the load generator (PyTorch with CUDA); '
                     'install it with: pip install "gpucheck-cli[load]"',

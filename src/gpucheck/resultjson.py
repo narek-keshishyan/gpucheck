@@ -45,6 +45,7 @@ MANIFEST_FIELDS = (
     "pcie_gen_max",
     "pcie_width_current",
     "pcie_width_max",
+    "pcie_link_under_load",
     "ecc_aggregate_corrected",
     "ecc_aggregate_uncorrected",
     "serial",

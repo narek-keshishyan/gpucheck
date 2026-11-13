@@ -61,6 +61,7 @@ Answer `y` to the upload prompt. Note the page URL and the delete token.
 - Sustained TFLOPs is within 2x of the datasheet figure for that model.
 - Open `<server>/r/<run_id>` on a phone (via the tunnel or ngrok URL): layout fits the screen, charts render, text is readable.
 - The page says "insufficient reference (n=0)" (fresh DB) or a grade, and shows "graded against n=..." when graded.
+- Load-phase telemetry matches an independent reading. During the load phase run `nvidia-smi --query-gpu=power.draw,temperature.gpu --format=csv -l 1` in a second terminal: the `power_w` and `temp_c` of the load samples in `gpucheck-result.json` should agree with it (on an A100, near the power limit). Samples that read idle power under load mean the telemetry is being taken in the pause between load bursts.
 - Delete works:
   `curl -i -X DELETE -H "X-Delete-Token: <token>" http://localhost:8000/v1/runs/<run_id>` returns 204, and the page then returns 404.
 
@@ -77,7 +78,7 @@ Keep for each GPU tested: the exact model name as reported, driver version, powe
 
 ## Multi-GPU machine
 
-Multi-GPU runs have so far been tested only with simulated cards. Run this section once on real hardware before relying on `--gpus all`. Budget up to two hours for an 8-GPU machine at the standard length; use `--quick` for a first pass.
+This section was first run on real hardware on 2026-11-12 (four RTX 3090s). Run it again on real hardware before relying on `--gpus all` after a change to the run loop, the load or the lot code. Budget up to two hours for an 8-GPU machine at the standard length; use `--quick` for a first pass.
 
 1. Rent a machine with at least two GPUs (four or more for step 6), ideally A100 or H100, and install gpucheck as in section 2. Record the PyTorch and CUDA versions:
 
@@ -96,7 +97,7 @@ Multi-GPU runs have so far been tested only with simulated cards. Run this secti
 7. Busy card. Hold a small CUDA process on one card, for example `python -c "import torch, time; x = torch.ones(1, device='cuda:1'); time.sleep(3600)"`, then run `gpucheck --quick --offline --gpus all --lot-dir ./smoke-busy`. Confirm that card is recorded as not tested with a "GPU busy" reason while the others run. Inside a container the process list can be hidden from NVML; note what the tool says for the busy card there (it may not see the other process at all).
 8. Ctrl-C mid-lot. Start `gpucheck --quick --offline --gpus all --lot-dir ./smoke-ctrlc` and press Ctrl-C during the second card. Confirm exit code 130 (`echo $?`), `gpu0.json` and `lot.json` present, `"finished": true`, and the remaining cards recorded as interrupted.
 9. Killed run. Start `gpucheck --quick --offline --gpus all --lot-dir ./smoke-killed`, and during the second card run `kill -9 <pid>` from another terminal. Confirm the finished cards' `gpu<N>.json` files are present, `lot.json` has `"finished": false` with the rest "not reached", and no temporary files are left. Then `gpucheck --upload-saved ./smoke-killed --server http://localhost:8000` (server and tunnel from section 4) must upload, printing "note: this lot did not finish".
-10. Compare each `gpu<N>.json` manifest against `nvidia-smi -q` for serial, VBIOS version and PCIe link, and against `nvidia-smi -q -d ECC,ROW_REMAPPER` for the memory counters. Note that a PCIe link below maximum at idle can be normal power saving.
+10. Compare each `gpu<N>.json` manifest against `nvidia-smi -q` for serial, VBIOS version and PCIe link, and against `nvidia-smi -q -d ECC,ROW_REMAPPER` for the memory counters. The current PCIe link in the file is read under load (`pcie_link_under_load` is true), so compare it with `nvidia-smi` while a run is loading the card, not at idle, where the link drops to a lower speed.
 11. Record `timing.settle_s` for every card and each card's `metrics.idle_temp_c`; note whether cards 2..N read hotter at idle than card 1. These numbers decide the settle defaults.
 12. Repeat steps 3 and 5 on a consumer card (or run `--gpus 0` on one) and confirm the manifest fields that card does not support are simply absent and the run completes.
 13. Upload the lot to a local server, using the server and tunnel from section 4:
@@ -109,3 +110,5 @@ Multi-GPU runs have so far been tested only with simulated cards. Run this secti
 14. Run a short lot without the flag, `gpucheck --quick --offline --gpus 0,1 --lot-dir ./smoke-noserial`, and confirm no serial is in its files: no `gpu<N>.json` contains a `serial` key (`grep -l serial smoke-noserial/gpu*.json` prints nothing), and every card's `serial` in `smoke-noserial/lot.json` is `null`.
 15. Run the same `gpucheck --upload-saved ./smoke-lot --server http://localhost:8000` again and confirm nothing is duplicated (the same pages, no new runs) and the delete tokens in `smoke-lot/lot.json` are still there.
 16. Save the lot directories under a dated folder for reference seeding.
+17. One card as a lot. On any machine run `gpucheck --quick --offline --gpus 0 --label one-card --lot-dir ./smoke-one` and confirm a lot directory with `gpu0.json` and a `lot.json` of size 1 is written, not a plain `gpucheck-result.json`.
+18. Progress in a log. Run a lot with its output redirected (`... > lot.log 2>&1 &`) and confirm `lot.log` gains a `Testing GPU N (card i of n)...` line as each card starts and a `GPU N: tested` line as it ends, not only at the end of the lot.
