@@ -115,9 +115,11 @@ This section was first run on real hardware on 2026-11-12 (four RTX 3090s). Run 
 
 ## Extra checks
 
-Not yet run on real hardware. This section is the gate for `--driver-errors`, `--answer-check`, `--memtest`, `--links`, `--burn-in`, `--together` and `--thorough`: none of them should be described as working until it has been run. They were developed on a machine with no NVIDIA GPU, against simulated cards and a small stand-in for PyTorch. On 14 November 2026 the answer check and the memory test were run against real PyTorch 2.15.0 on that machine's CPU (`python -m gpucheck.deepchecks --device cpu`, and each full-size case once): every call was accepted, no product was wrong and no word differed. So the first rented run is the first time a real GPU, its multiply routines and a real driver see this code, and the first time the driver error log, the NVLink readings, the card-to-card copy and the all-at-once mode run on anything real. Earlier real runs found bugs that tests with fakes had missed; expect some here.
+First run on real hardware on 2026-11-14: two A100 SXM4 80GB cards with NVLink in a Vast.ai container (driver 595.91.07, CUDA 13.2, PyTorch 2.14.1, Python 3.12). Steps 1 to 9 below were run, except the second half of step 9; the results are under "Results of the first run" at the end of this section. Run the section again after a change to the checks, the run loop or the lot code, and before describing any of the following as working, because they have still never run on real hardware: a card that actually fails a check, a card without ECC, a card without NVLink (step 10), more than two cards at once, a burn-in longer than one hour, and a driver that refuses the event log.
 
-Nobody rents a machine without the owner's go-ahead. The proposal, its cost and what each step is for:
+The checks were developed on a machine with no NVIDIA GPU, against simulated cards and a small stand-in for PyTorch. Earlier real runs had found bugs that tests with fakes missed, and this one did too (three, listed in the results).
+
+Nobody rents a machine without the owner's go-ahead. What each check needs, what a run costs and what each step is for:
 
 ### What needs which hardware
 
@@ -134,13 +136,13 @@ Nobody rents a machine without the owner's go-ahead. The proposal, its cost and 
 
 One machine covers all six: **two A100 SXM4 80GB cards in one chassis**. On Vast.ai that was $2.1 per hour on 13 November 2026. Filter for "A100 SXM4", 2 GPUs, a PyTorch image, and check before renting that `nvidia-smi nvlink -s` is going to mean something: the listing should be an HGX or DGX host, not two PCIe A100s.
 
-- Steps 1 to 9 below take about 2.5 to 3 hours including set-up: **about $6 to $7**.
+- Steps 1 to 9 below take about two hours including set-up when they are scripted: the first run took 1 hour 49 minutes and cost **$4.48** at $2.489 per hour. Allow 2.5 to 3 hours, about $6 to $7, when doing them by hand.
 - Optional second machine, for a card without ECC or NVLink and for four cards at once: four RTX 3090s, as rented on 12 November 2026, for about an hour. Use that day's price from the Vast.ai billing page; at the "$0.30 to $2 per hour" range in section 1 it is **$2 or less**.
 - Optional, later: a full 24-hour burn-in on one cheap card. At $0.20 to $0.40 per hour for an RTX 3090 that is **$5 to $10**; it only adds the 24-hour memory and file-size figures, so it can wait until someone asks for burn-in.
 
-So the proposal is **about $7, or about $9 with the second machine; allow $10**. Prices move; read the hourly price on the listing before renting and destroy the instance as soon as the steps are done.
+So a full run is **about $5 to $7, or up to $9 with the second machine; allow $10**. Prices move; read the hourly price on the listing before renting and destroy the instance as soon as the steps are done.
 
-Install as in section 2, from the `deeper-tests` branch. Start the local server from the server's `deeper-tests` branch and open the tunnel as in section 4.
+Install as in section 2, from the `deeper-tests` branch. Some images have no `python` on the path outside a login shell: on Vast.ai's PyTorch image run `source /venv/main/bin/activate` first. In a container the kernel log cannot be read (`dmesg: Operation not permitted`), so step 5 can only compare against what the fault itself prints. Start the local server from the server's `deeper-tests` branch and open the tunnel as in section 4.
 
 ### Steps
 
@@ -160,7 +162,7 @@ Install as in section 2, from the `deeper-tests` branch. Start the local server 
    - `metrics` in `thorough.json` are within noise of `plain.json` (the checks run after the load);
    - `checks.driver_errors.status` is `ran`. If it is `unavailable`, record the `reason` text exactly: it decides whether the event log works in containers at all;
    - `checks.answer`: `products` in the hundreds or thousands, `wrong_products` 0, `skipped` empty, `seconds` about 20 (60 without `--quick`). Record `products`;
-   - `checks.memtest`: `bytes_tested` / `bytes_total`, `seconds`, `mismatched_words` 0, `max_temp_c`. Record them: the README still says the time is not measured;
+   - `checks.memtest`: `bytes_tested` / `bytes_total`, `seconds`, `mismatched_words` 0, `max_temp_c`. Record them (an A100 80GB: 76 GB of 85 GB in 2.4 s);
    - `checks.nvlink.status` is `ran` with the link count `nvidia-smi nvlink -s -i 0` shows, and `errors` holds counters (if it is empty, the driver answered neither the per-link nor the card-wide query: record that);
    - the "Not covered" note no longer lists memory cells or silent data corruption and says "data transfer over links between GPUs";
    - on the result page: the "Extra checks in this run" block, the same note, a grade unchanged from a plain run, and the phone layout as in section 5.
@@ -202,3 +204,24 @@ Install as in section 2, from the `deeper-tests` branch. Start the local server 
 ### If something fails
 
 A finding on a card that passes a plain run is the likeliest failure, and until proven otherwise it is a fault in the check. Keep the result file, note the driver and PyTorch versions, and do not upload it to the public server.
+
+### Results of the first run (2026-11-14, two A100 SXM4 80GB)
+
+Machine: Vast.ai instance in a Docker container, 2 of the 8 cards of an NVLink chassis (board MZ52-G41-00), 400 W power limit, ECC on, 12 NVLink links per card. Result files and notes: `gpucheck-results/2026-11-14-a100-sxm4-vast/`.
+
+| Step | What was seen |
+| --- | --- |
+| 1 | CPU and `cuda:0` self-tests passed. Answer check: all four number formats multiplied, none skipped, none wrong. Memory test: 76.07 GB of 85.09 GB (89.4%), six patterns, 2.4 s, no mismatch; `nvidia-smi` showed 73.5 GiB in use during it and nothing afterwards. |
+| 2 | Plain `--quick`: 267.83 TFLOPS (0.858 of the datasheet), no `checks` key, no `load_bucket_s`. |
+| 3 | `--quick --thorough`: 267.93 TFLOPS; standard `--thorough`: 267.61 TFLOPS. Every check `ran`, no finding. The event log opened in the container without root. A thorough run took 22 s longer than a quick run and 65 s longer than a standard one. The result page showed the checks block and the narrowed note. |
+| 4 | 12 links, all active, on both cards, as `nvidia-smi nvlink -s` shows; all four per-link error counters were readable and zero, as in `nvidia-smi nvlink -e`; `nvidia-smi topo -p2p n` reports the two cards as NVLink peers. Counters that are non-zero and do not move were not seen, so that case is still untested. |
+| 5 | The deliberate out-of-range index in a second process was delivered as one event, Xid 43, in phase `load`, and became a `DRIVER_ERRORS` finding. Xid 43 is a program fault, which is why the finding no longer says "hardware". |
+| 6 | One after another: 267.76 and 269.20 TFLOPS, each card with its own checks, no `transfer`, no `together` key in `lot.json`. |
+| 7 | All at once: both cards went above 300 W in the same second and no gpucheck process held memory on either card before it; 266.89 and 270.02 TFLOPS, within 0.3% of step 6; `checks.together.cards` 2 and `measurements_only` on both. The copy of 256 MiB came back unchanged and `nvlink_kib` was 262143 on each card (256 MiB less 1 KiB). The lot page said the cards were loaded at the same time, showed no grade, and neither run was stored as a reference. |
+| 8 | **Bug found:** Ctrl-C kept GPU 1 and lost GPU 0 ("did not stop after the interrupt"). Before Python 3.13 an interrupt inside `Thread.join()` can mark a running thread as finished. Fixed by waiting on per-card events; the repeat kept both cards (46 load samples each), exit code 130, memory released. |
+| 9 | One hour, both cards at once, thorough: progress lines every ten minutes for each card; first ten minutes against the final part 267.66 and 267.62 TFLOPS on GPU 0, 271.05 and 271.00 on GPU 1 (a fall of 0.02%); 3600 load samples stored, no `load_bucket_s`, 585 KB per file; no finding. The process held 0.59 GB while idle, 0.98 GB under load (flat for the hour) and 1.46 GB during the checks at the end. A single-card `--burn-in 1` stopped with Ctrl-C was written as `"aborted": "interrupted"` with exit code 130. The 1.5-hour run was not done, so no real result has been stored as summaries yet. |
+
+Two more things the run changed:
+
+- **The answer check left the card nearly idle** (68 W) and compared only about 7 products a second: its bookkeeping ran as small CPU tensor operations, which took 10 to 25 ms each because PyTorch started a thread for each of the host's 128 cores in a container given 32. With the bookkeeping in plain Python it compared about 160 products a second on the same card (140 to 185 W). It is still not a full load.
+- **Figures for the thresholds:** a working A100 lost 0.02% of its throughput over an hour, against the 5% at which `THROUGHPUT_FELL` is reported. One hour on two cards is not a calibration.
