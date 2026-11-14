@@ -211,3 +211,230 @@ class TorchMemtest:
             "by_pattern": dict(self._mismatched),
             "seconds": seconds,
         }
+
+
+# ---- answer check --------------------------------------------------------------------------
+
+ANSWER_S = 60.0
+ANSWER_QUICK_S = 20.0
+# (dtype, matrix size, nonzero entries per row). Each case is exact in its own number format:
+# every partial sum of a product is a whole multiple, of at most `weight`, of one power of two,
+# and `weight` is no more than the format holds exactly (2**24 for float32, 2**11 for float16,
+# 2**8 for bfloat16). So the result is the same in whatever order, and at whatever precision
+# from the operands' own upwards, the card adds the terms up. The half-precision cases keep
+# the full size, so they go through the same large matrix-multiply routine as the load.
+ANSWER_CASES: tuple[tuple[str, int, int], ...] = (
+    ("float32", 4096, 4096),
+    ("float16", 4096, 2048),
+    ("bfloat16", 4096, 256),
+    ("float64", 2048, 2048),
+)
+_SCALES = (0.25, 0.5, 1.0, 2.0, 4.0)  # row scales: powers of two, exact in every format
+
+
+def _hadamard(torch, n: int, dtype, device: str):
+    """The n x n Sylvester Hadamard matrix (n a power of two): entries +1/-1, rows orthogonal."""
+    h = torch.ones((1, 1), dtype=dtype, device=device)
+    while h.shape[0] < n:
+        h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
+    return h
+
+
+class TorchAnswerCheck:
+    """Compute matrix products whose correct result is known in advance and count wrong ones.
+
+    The operands are built from a Hadamard matrix, whose rows are orthogonal: with its rows
+    shuffled and scaled by signed powers of two, the product of one such matrix with the
+    transpose of another has exactly one known non-zero entry in each row and is zero
+    everywhere else. Nothing is taken from a second computation on the same card: the expected
+    matrix is written down from the shuffles alone.
+
+    It catches a card that returns wrong numbers for these products during the minute it runs.
+    It does not catch corruption that needs other operations, other data or more time to show,
+    which by published accounts is most of it."""
+
+    name = "answer"
+
+    def __init__(
+        self,
+        device_index: int = 0,
+        *,
+        device: str | None = None,
+        seconds: float = ANSWER_S,
+        cases: tuple[tuple[str, int, int], ...] = ANSWER_CASES,
+        seed: int = 0x6770636B,
+        step_s: float = STEP_S,
+        clock=time.perf_counter,
+    ) -> None:
+        self._device = device or f"cuda:{device_index}"
+        self._seconds = seconds
+        self._cases = list(cases)
+        self._seed = seed
+        self._step_s = step_s
+        self._clock = clock
+        self._torch = None
+        self._base: dict[tuple, object] = {}
+        self._counts: dict[tuple, list[int]] = {}
+        self._skipped: list[str] = []
+        self._i = 0
+        self._rounds = 0
+        self._t0: float | None = None
+        self._elapsed: float | None = None
+        self._wrong_elements = 0
+
+    def start(self) -> None:
+        t = self._torch = _import_torch()
+        self._gen = t.Generator().manual_seed(self._seed)
+        self._scales = t.tensor(list(_SCALES), dtype=t.float64)
+        for case in list(self._cases):
+            name, n, weight = case
+            try:
+                dtype = getattr(t, name)
+                block = _hadamard(t, weight, dtype, self._device)
+                # Rows stay orthogonal, each with `weight` non-zero entries.
+                self._base[case] = block if weight == n else t.kron(t.eye(n // weight, dtype=dtype, device=self._device), block)
+                self._counts[case] = [0, 0]
+            except Exception:  # a number format this card or build cannot hold
+                self._skip(case)
+        if not self._cases:
+            raise CheckUnavailable("none of the answer check's number formats is usable on this card")
+        _sync(t, self._device)
+        self._t0 = self._clock()
+
+    def _skip(self, case) -> None:
+        self._cases.remove(case)
+        self._base.pop(case, None)
+        self._counts.pop(case, None)
+        if case[0] not in self._skipped:
+            self._skipped.append(case[0])
+
+    def _signed_scales(self, n: int):
+        t, g = self._torch, self._gen
+        sign = (t.randint(0, 2, (n,), generator=g) * 2 - 1).to(t.float64)
+        return self._scales[t.randint(0, len(_SCALES), (n,), generator=g)] * sign
+
+    def _product(self, case) -> int:
+        """One product for `case`; the number of entries that differ from the known result."""
+        t, dev = self._torch, self._device
+        name, n, weight = case
+        base = self._base[case]
+        dtype = base.dtype
+        pa, pb = t.randperm(n, generator=self._gen), t.randperm(n, generator=self._gen)
+        sa, sb = self._signed_scales(n), self._signed_scales(n)
+        a = base[pa.to(dev)] * sa.to(device=dev, dtype=dtype)[:, None]
+        b = base[pb.to(dev)] * sb.to(device=dev, dtype=dtype)[:, None]
+        c = a @ b.T
+        # Row i of a is row pa[i] of the base; it meets the same base row in b at column k[i].
+        where = t.empty(n, dtype=t.int64)
+        where[pb] = t.arange(n)
+        k = where[pa]
+        value = sa * sb[k] * float(weight)
+        expected = t.zeros((n, n), dtype=dtype, device=dev)
+        expected[t.arange(n, device=dev), k.to(dev)] = value.to(device=dev, dtype=dtype)
+        return int(t.count_nonzero(c != expected))
+
+    def step(self) -> bool:
+        if self._t0 is None or not self._cases:
+            return False
+        now = self._clock()
+        if self._rounds >= 1 and now - self._t0 >= self._seconds:
+            self._elapsed = now - self._t0
+            return False
+        end = now + self._step_s
+        while self._cases:
+            case = self._cases[self._i % len(self._cases)]
+            try:
+                wrong = self._product(case)
+            except RuntimeError as e:  # this format's product is not supported here: not a wrong answer
+                self._skip(case)
+                if not self._cases:
+                    # Nothing left to compare. Say the check did not run, never that nothing was wrong.
+                    raise CheckUnavailable(f"every number format failed to multiply ({e})") from e
+                continue
+            self._counts[case][0] += 1
+            if wrong:
+                self._counts[case][1] += 1
+                self._wrong_elements += wrong
+            self._i += 1
+            if self._i % len(self._cases) == 0:
+                self._rounds += 1  # every format has now been through at least this many products
+            if self._clock() >= end:
+                break
+        return bool(self._cases)
+
+    def stop(self) -> None:
+        try:
+            self._base = {}
+            if self._torch is not None:
+                _release(self._torch, self._device)
+        except Exception as e:
+            warn_cleanup_failed(e)
+
+    def result(self) -> dict:
+        elapsed = self._elapsed
+        if elapsed is None and self._t0 is not None:
+            elapsed = self._clock() - self._t0
+        return {
+            "products": sum(c[0] for c in self._counts.values()),
+            "wrong_products": sum(c[1] for c in self._counts.values()),
+            "wrong_elements": self._wrong_elements,
+            "seconds": elapsed,
+            "cases": [
+                {"dtype": name, "n": n, "products": self._counts[(name, n, w)][0],
+                 "wrong_products": self._counts[(name, n, w)][1]}
+                for name, n, w in self._counts
+            ],
+            "skipped": list(self._skipped),
+        }
+
+
+# ---- self-test -----------------------------------------------------------------------------
+
+SELF_TEST_CASES = (("float32", 256, 256), ("float16", 256, 128), ("bfloat16", 256, 64), ("float64", 128, 128))
+
+
+def self_test(device: str | None = None, seconds: float = 5.0) -> int:
+    """Run the memory test and the answer check against the installed PyTorch and print what
+    they report. `python -m gpucheck.deepchecks` runs it: on a CPU it uses small sizes and only
+    shows that PyTorch accepts every call and that sound hardware gets no mismatch; on a GPU
+    (`--device cuda:0`) it runs both checks at full size on that card, with no load before them.
+
+    Returns 0 when both checks ran, used every number format and found nothing wrong."""
+    import json
+
+    torch = _import_torch()
+    if device is None:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    on_gpu = device.startswith("cuda")
+    checks = [
+        TorchAnswerCheck(device=device, seconds=seconds, cases=ANSWER_CASES if on_gpu else SELF_TEST_CASES),
+        TorchMemtest(device=device) if on_gpu else TorchMemtest(
+            device=device, budget_bytes=64 * MIB, chunk_bytes=16 * MIB, min_bytes=MIB),
+    ]
+    ok = True
+    for check in checks:
+        try:
+            check.start()
+            while check.step():
+                pass
+            out = {"status": "ran", **check.result()}
+        except Exception as e:
+            out = {"status": "unavailable", "reason": f"{type(e).__name__}: {e}"}
+        finally:
+            check.stop()
+        print(json.dumps({check.name: out, "device": device, "torch": torch.__version__}, indent=2))
+        ok = ok and out["status"] == "ran" and not out.get("mismatched_words") \
+            and not out.get("wrong_products") and not out.get("skipped")
+    print("self-test: every call was accepted and nothing differed" if ok else "self-test: see above")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    _p = argparse.ArgumentParser(prog="python -m gpucheck.deepchecks", description=self_test.__doc__)
+    _p.add_argument("--device", default=None, help='"cpu" or "cuda:N" (default: cuda:0 when available, else cpu)')
+    _p.add_argument("--seconds", type=float, default=5.0, help="how long the answer check runs")
+    _a = _p.parse_args()
+    sys.exit(self_test(_a.device, _a.seconds))

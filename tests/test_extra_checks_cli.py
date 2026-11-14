@@ -148,7 +148,7 @@ def test_the_real_memory_test_is_built_for_the_selected_card(monkeypatch):
 
     made = []
     monkeypatch.setattr(cli, "TorchMemtest", lambda index: made.append(index) or "memtest")
-    args = argparse.Namespace(fake=None, memtest=True, driver_errors=False)
+    args = argparse.Namespace(fake=None, memtest=True, driver_errors=False, quick=False)
     assert cli._make_checks(args, object(), 3) == ["memtest"] and made == [3]
     assert sorted(cli._extras(args, object(), 3)) == ["checks", "plan"]
     assert cli._extras(argparse.Namespace(fake=None, memtest=False, driver_errors=False), object(), 3) == {}
@@ -166,3 +166,54 @@ def test_memtest_without_pytorch_is_reported_as_not_run(tmp_path, monkeypatch, c
     assert result["checks"]["memtest"] == {"status": "unavailable", "reason": "PyTorch is not installed"}
     out = capsys.readouterr().out
     assert "Memory test: could not be run, so memory cells were not tested" in out and NOT_COVERED in out
+
+
+# ---- answer check -------------------------------------------------------------------------
+
+
+def test_answer_check_passing_card(tmp_path, capsys):
+    rc, result = single(tmp_path, "healthy", "--answer-check")
+    assert rc == 0 and codes(result) == []
+    assert result["checks"]["answer"]["status"] == "ran" and result["checks"]["answer"]["wrong_products"] == 0
+    out = capsys.readouterr().out
+    assert "Answer check: compared 400 computed products with known results: none was wrong" in out
+    assert "It does not test memory cells, faults that appear only after hours of use, links between GPUs, or physical damage." in out
+    assert "it can catch some silent data corruption and cannot rule it out." in out
+
+
+def test_answer_check_failing_card(tmp_path, capsys):
+    rc, result = single(tmp_path, "wrong_answers", "--answer-check")
+    assert rc == 0 and codes(result) == ["WRONG_ANSWERS"]
+    assert result["findings"][0]["severity"] == "bad"
+    assert "got 2 of 400 products wrong" in result["findings"][0]["message"]
+    assert "compared 400 computed products with known results: 2 wrong" in capsys.readouterr().out
+
+
+def test_no_result_ever_claims_to_rule_out_silent_data_corruption(tmp_path, capsys):
+    for i, fake in enumerate(("healthy", "wrong_answers")):
+        single(tmp_path, fake, "--answer-check", "--memtest", "--driver-errors", name=f"{i}.json")
+        out = capsys.readouterr().out.lower()
+        assert "cannot rule it out" in out
+        for claim in ("no silent data corruption", "free of", "healthy", "certified", "passed"):
+            assert claim not in out.replace("not proof of health", "")
+
+
+def test_the_answer_check_runs_before_the_memory_test_and_is_shorter_in_a_quick_run(monkeypatch):
+    import argparse
+
+    made = []
+    monkeypatch.setattr(cli, "TorchMemtest", lambda index: "memtest")
+    monkeypatch.setattr(cli, "TorchAnswerCheck", lambda index, seconds: made.append((index, seconds)) or "answer")
+    args = argparse.Namespace(fake=None, memtest=True, answer_check=True, driver_errors=False, quick=False)
+    assert cli._make_checks(args, object(), 1) == ["answer", "memtest"]
+    args.quick = True
+    cli._make_checks(args, object(), 1)
+    assert made == [(1, 60.0), (1, 20.0)]
+
+
+def test_both_checks_together_leave_the_load_measurement_alone(tmp_path):
+    _, plain = single(tmp_path, "healthy", name="a.json")
+    _, tested = single(tmp_path, "healthy", "--memtest", "--answer-check", name="b.json")
+    assert list(tested["checks"]) == ["answer", "memtest"]
+    for key in ("metrics", "samples", "config", "preflight", "inventory", "findings"):
+        assert plain[key] == tested[key]

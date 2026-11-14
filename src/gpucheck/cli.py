@@ -16,8 +16,8 @@ from .adapter import AdapterUnavailable, NvmlAdapter, gpu_count
 from .checks import CheckPlan, burn_in_report
 from .coverage import narrowed, not_covered_many
 from .diagnose import diagnose
-from .deepchecks import TorchMemtest
-from .fakes import fake_memtest, make_fakes
+from .deepchecks import ANSWER_QUICK_S, ANSWER_S, TorchAnswerCheck, TorchMemtest
+from .fakes import fake_answer, fake_memtest, make_fakes
 from .lot import (
     MAX_LABEL_LEN,
     ABORTED,
@@ -97,6 +97,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     x.add_argument("--driver-errors", action="store_true", help="listen for hardware error events (Xid) the driver reports for the card during the run")
     x.add_argument("--memtest", action="store_true", help="after the load, write test patterns across most of the card's free memory and read them back (needs PyTorch with CUDA)")
+    x.add_argument("--answer-check", action="store_true", help="after the load, compute matrix products whose correct result is known and count wrong ones; catches some silent data corruption, cannot rule it out (needs PyTorch with CUDA)")
     p.add_argument("--fake", metavar="PROFILE", help=argparse.SUPPRESS)
     return p
 
@@ -117,6 +118,7 @@ def _parse(argv):
             ("--long", args.long), ("--label", args.label is not None),
             ("--lot-dir", args.lot_dir is not None), ("--include-serial", args.include_serial),
             ("--driver-errors", args.driver_errors), ("--memtest", args.memtest),
+            ("--answer-check", args.answer_check),
         ):
             if used:
                 p.error(f"--upload-saved cannot be combined with {flag}")
@@ -222,6 +224,7 @@ def _plan(args) -> CheckPlan:
     return CheckPlan(
         driver_errors=getattr(args, "driver_errors", False),
         memtest=getattr(args, "memtest", False),
+        answer=getattr(args, "answer_check", False),
     )
 
 
@@ -230,6 +233,9 @@ def _make_checks(args, adapter, device_index: int = 0) -> list:
     plan = _plan(args)
     simulated = getattr(adapter, "extras", {}) if args.fake else None
     checks = []
+    if plan.answer:  # first, while the card is still hot from the load
+        seconds = ANSWER_QUICK_S if args.quick else ANSWER_S
+        checks.append(fake_answer(simulated) if simulated is not None else TorchAnswerCheck(device_index, seconds=seconds))
     if plan.memtest:
         checks.append(fake_memtest(simulated) if simulated is not None else TorchMemtest(device_index))
     return checks
