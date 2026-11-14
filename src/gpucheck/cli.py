@@ -104,6 +104,7 @@ def _parser() -> argparse.ArgumentParser:
         "extra checks",
         "Off by default: a plain run is unchanged by them. Each one adds to the result what it checked.",
     )
+    x.add_argument("--thorough", action="store_true", help="every check that only adds minutes and leaves the graded measurement alone: --driver-errors, --answer-check, --memtest and --links. It does not lengthen the load (--burn-in) or load cards together (--together); ask for those by name")
     x.add_argument("--driver-errors", action="store_true", help="listen for hardware error events (Xid) the driver reports for the card during the run")
     x.add_argument("--memtest", action="store_true", help="after the load, write test patterns across most of the card's free memory and read them back (needs PyTorch with CUDA)")
     x.add_argument("--answer-check", action="store_true", help="after the load, compute matrix products whose correct result is known and count wrong ones; catches some silent data corruption, cannot rule it out (needs PyTorch with CUDA)")
@@ -136,6 +137,7 @@ def _parse(argv):
             ("--driver-errors", args.driver_errors), ("--memtest", args.memtest),
             ("--answer-check", args.answer_check), ("--burn-in", args.burn_in is not None),
             ("--together", args.together), ("--links", args.links),
+            ("--thorough", args.thorough),
         ):
             if used:
                 p.error(f"--upload-saved cannot be combined with {flag}")
@@ -240,11 +242,12 @@ def _timer(args) -> dict:
 
 def _plan(args) -> CheckPlan:
     """The extra checks this run was asked for; none by default."""
+    everything = getattr(args, "thorough", False)
     return CheckPlan(
-        driver_errors=getattr(args, "driver_errors", False),
-        memtest=getattr(args, "memtest", False),
-        answer=getattr(args, "answer_check", False),
-        links=getattr(args, "links", False),
+        driver_errors=everything or getattr(args, "driver_errors", False),
+        memtest=everything or getattr(args, "memtest", False),
+        answer=everything or getattr(args, "answer_check", False),
+        links=everything or getattr(args, "links", False),
     )
 
 

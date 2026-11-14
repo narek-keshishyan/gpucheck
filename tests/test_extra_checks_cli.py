@@ -217,3 +217,47 @@ def test_both_checks_together_leave_the_load_measurement_alone(tmp_path):
     assert list(tested["checks"]) == ["answer", "memtest"]
     for key in ("metrics", "samples", "config", "preflight", "inventory", "findings"):
         assert plain[key] == tested[key]
+
+
+# ---- the preset ---------------------------------------------------------------------------
+
+
+def test_thorough_turns_on_the_four_checks_that_only_add_minutes(tmp_path, capsys):
+    rc, result = single(tmp_path, "nvlink", "--thorough")
+    assert rc == 0 and sorted(result["checks"]) == ["answer", "driver_errors", "memtest", "nvlink"]
+    assert result["config"] == {"baseline_s": 30, "load_s": 150, "hz": 1.0}  # the load is not lengthened
+    assert result["preflight"]["mode"] == "full"
+    out = capsys.readouterr().out
+    assert "It does not test faults that appear only after hours of use, data transfer over links between GPUs, or physical damage." in out
+
+
+def test_thorough_does_not_change_the_load_measurement(tmp_path):
+    _, plain = single(tmp_path, "healthy", name="a.json")
+    _, thorough = single(tmp_path, "healthy", "--thorough", name="b.json")
+    for key in ("metrics", "samples", "config", "preflight", "inventory", "findings"):
+        assert plain[key] == thorough[key]
+
+
+def test_thorough_on_a_failing_card_reports_each_failure(tmp_path):
+    _, a = single(tmp_path, "xid", "--thorough", name="a.json")
+    _, b = single(tmp_path, "bad_memory", "--thorough", name="b.json")
+    _, c = single(tmp_path, "wrong_answers", "--thorough", name="c.json")
+    _, d = single(tmp_path, "nvlink_errors", "--thorough", name="d.json")
+    assert [codes(r) for r in (a, b, c, d)] == [
+        ["DRIVER_ERRORS"], ["MEMTEST_MISMATCH"], ["WRONG_ANSWERS"], ["NVLINK_ERRORS", "NVLINK_LINKS_INACTIVE"]]
+
+
+def test_every_extra_flag_is_refused_with_upload_saved(capsys):
+    for flag in (["--thorough"], ["--memtest"], ["--answer-check"], ["--links"], ["--together"], ["--burn-in", "2"]):
+        with pytest.raises(SystemExit):
+            main(["--upload-saved", "x.json", *flag])
+        assert f"--upload-saved cannot be combined with {flag[0]}" in capsys.readouterr().err
+
+
+def test_help_lists_the_extra_checks_as_off_by_default(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "extra checks:" in out and "Off by default: a plain run is unchanged by them." in out
+    for flag in ("--thorough", "--driver-errors", "--memtest", "--answer-check", "--links", "--together", "--burn-in"):
+        assert flag in out
