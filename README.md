@@ -35,6 +35,15 @@ gpucheck --gpus all --lot-dir DIR      # where a lot writes its files (default .
 gpucheck --include-serial        # also record the card's serial number
 gpucheck --api-key KEY   # send an account key with the upload (needed to upload a lot); prefer the GPUCHECK_API_KEY environment variable
 gpucheck --upload-saved PATH     # upload a saved result file or lot directory; tests no GPU
+
+# Extra checks: all off by default (see "Extra checks" below)
+gpucheck --thorough      # --driver-errors, --answer-check, --memtest and --links together
+gpucheck --driver-errors # listen for hardware error events (Xid) the driver reports during the run
+gpucheck --answer-check  # after the load, compute products with a known result and count wrong ones
+gpucheck --memtest       # after the load, write patterns across most of the card's memory and read them back
+gpucheck --links         # read NVLink link state and error counters before and after the run
+gpucheck --burn-in 24    # a load of 24 hours (1 to 72) instead of 10 minutes
+gpucheck --gpus all --together   # load every selected card at the same time (measurements only)
 ```
 
 Without `--gpus`, gpucheck tests GPU 0 only and says so when the machine has more than one card.
@@ -53,7 +62,7 @@ curl -X DELETE -H "X-Delete-Token: <token>" <server>/v1/runs/<run_id>
 
 ## Testing every GPU in a machine
 
-`gpucheck --gpus all` (or `--gpus 0,2` for a subset, up to 16 cards) tests the cards one after another, never at the same time, and calls the whole run a lot. Each card gets an ordinary single-card run. Before every card after the first, gpucheck waits for that card's idle temperature to stop falling, up to 5 minutes, so that heat from the previous card does not skew the idle baseline. An 8-GPU server can therefore take up to about two hours at the standard length; `--quick` shortens each run. While a lot runs, gpucheck prints one line when each card starts and one when it ends, also when the output goes to a file; the per-card reports and the summary follow when every card is done.
+`gpucheck --gpus all` (or `--gpus 0,2` for a subset, up to 16 cards) tests the cards one after another, never at the same time (unless you ask for that with `--together`, see "Extra checks"), and calls the whole run a lot. Each card gets an ordinary single-card run. Before every card after the first, gpucheck waits for that card's idle temperature to stop falling, up to 5 minutes, so that heat from the previous card does not skew the idle baseline. An 8-GPU server can therefore take up to about two hours at the standard length; `--quick` shortens each run. While a lot runs, gpucheck prints one line when each card starts and one when it ends, also when the output goes to a file; the per-card reports and the summary follow when every card is done.
 
 A lot writes a directory (`--lot-dir`, default `./gpucheck-lot-<id>`) containing `gpu<position>.json` for each card that produced a result, and `lot.json`, which summarises every card, including those that were not tested and why. Before the first card runs, gpucheck creates `lot.json`, which both checks that the directory is writable and claims it for this run: one lot directory is used by one run only. A run pointed at a directory that already holds a `lot.json` is refused, whether that lot finished long ago or is still running (for example a `nohup` run and the same command started again), so an earlier lot is never overwritten. In a lot run `--json` is not used.
 
@@ -91,11 +100,71 @@ Nothing has to be tested again. `--yes-upload` and `--upload-saved` send the lot
 
 Uploading a lot needs a server deployed with lot support; an older server answers 404, the upload is reported as failed, and the lot stays saved for `--upload-saved`.
 
+## Extra checks
+
+A plain `gpucheck` run is exactly what it was before these existed: the same baseline, the same load, the same result file. Each check below is opt-in, and a result says which ones ran, in an "Extra checks" section of the report and a `checks` block in the result file. None of them has been run on real hardware yet (see Limitations); they were developed against simulated cards.
+
+`--thorough` turns on the four that only add minutes and leave the graded measurement alone: `--driver-errors`, `--answer-check`, `--memtest` and `--links`. They run after the load (or only listen during it), so a thorough run's throughput, temperatures and grade are measured exactly as in a plain run, and it can still serve as a reference. `--burn-in` and `--together` are not part of it: one costs hours, the other changes what is measured.
+
+| Flag | What it checks | Time it adds | What it cannot catch |
+| --- | --- | --- | --- |
+| `--driver-errors` | Listens for the hardware error events the NVIDIA driver reports for the card (Xid errors, double-bit and other memory errors) from before the baseline to the end of the run. | None. | Errors the driver does not report as an event, anything from before the run started, and errors on a system where the driver refuses a listener (some containers): the report then says the log was not available. It never reads the kernel log, which needs root. |
+| `--answer-check` | After the load, while the card is hot, multiplies matrices whose correct product is known in advance, in four number formats (float32, float16, bfloat16, float64), and counts products that differ. | About 1 minute (20 s with `--quick`). | Most silent data corruption. It catches a card that returns wrong numbers for these products in that minute. Corruption that needs other operations, other data or more time does not show. By published accounts from large fleets, short synthetic checks miss most affected chips. |
+| `--memtest` | After the load has released its memory, writes six patterns (all zeros, all ones, two checkerboards, each word's own address, pseudo-random) across 90% of the card's free memory, keeping 1 GiB back, reads each back and counts the 64-bit words that differ. | Not measured yet. It depends on the card's memory size; expect under a minute to a few minutes. | Memory it could not allocate (the driver's own and the part kept back). On a card with ECC, an error the card corrects on the way out: that shows in the ECC counters, which the run records during the test and reports as `MEMORY_ERRORS`. Faults that only appear at other temperatures or with other patterns. |
+| `--links` | Reads each NVLink link's state and its replay, recovery and CRC error counters before the baseline and after the run. With `--together` it also copies 256 MiB of test data between every pair of linked cards, there and back, and compares. | Seconds. | Whether a link is fast. Faults that a short copy does not provoke. Links to cards that were not selected. A card without an active NVLink link reports nothing: that is not a pass. |
+| `--burn-in HOURS` | The standard run with a load of 1 to 72 hours instead of 10 minutes. Throttling, memory errors, driver errors and a temperature abort are watched the whole time, and throughput in the final part of the run is compared with the first ten minutes. | The hours you ask for. | Faults that need longer than the run. A burn-in is graded but never used as a reference. |
+| `--together` | In a lot, loads every selected card at the same time instead of one after another, so the machine's power supply and cooling carry the full load. | Makes a lot shorter: one run length for all cards. | Which card is at fault when all slow down together. The results are measurements only: not graded, and never used as references for cards measured alone. |
+
+### Driver error log (`--driver-errors`)
+
+gpucheck registers with the driver, through NVML's event functions, as a listener for error events on the card it is testing, and collects what arrives at every sample. Registering changes no GPU setting. Each event is recorded with the phase it arrived in (baseline, load, or the checks after the load) and, for an Xid, its number. Any event is a `DRIVER_ERRORS` finding. Xid numbers are NVIDIA's driver error codes; NVIDIA publishes what each means.
+
+### Answer check (`--answer-check`)
+
+The operands are built from a Hadamard matrix, whose rows are all at right angles to each other. With its rows shuffled and scaled by signed powers of two, the product of one such matrix with the transpose of another has exactly one known non-zero entry in each row and zeros everywhere else. The expected result is written down from the shuffles; nothing is compared with a second computation on the same card. Every case is built so that it is exact in its own number format whatever order the card adds the terms in, so a card that works cannot be reported as wrong for rounding. A product with any entry that differs is counted, and any wrong product is a `WRONG_ANSWERS` finding. A number format the card cannot multiply is skipped and listed, not counted as wrong.
+
+A result that ran this check says so in these words and no stronger ones: it can catch some silent data corruption and cannot rule it out.
+
+### Memory test (`--memtest`)
+
+It runs as its own phase after the load and the answer check, once the load has freed its buffers, and frees its own memory when it ends, so it never holds memory the load needs. Every pattern is written to the whole tested area before any of it is read back. The card keeps being sampled between slices of work, so the temperature limit still stops the run. Any word that differs is a `MEMTEST_MISMATCH` finding.
+
+### Burn-in (`--burn-in HOURS`)
+
+`--burn-in` cannot be combined with `--quick`, `--long` or `--certify`. Run it inside `tmux` or `screen`, or with `nohup`.
+
+- A line is printed every ten minutes of load (`burn-in: 3 h 10 min of 24 h 0 min of load done, 71 C, 724.1 TFLOPS`), so a log shows how far a run got if the machine goes down.
+- The first Ctrl-C stops the run at its next sample and writes what was measured as a run that was stopped early (`"aborted": "interrupted"`, exit code 130, never uploaded on its own; upload it later with `--upload-saved` if you want it on a page). A second Ctrl-C quits at once without a result, like Ctrl-C in any other single-card run.
+- All measurements are computed from every one-second sample. The result file would be far too large to upload with a day of them, so a load of more than an hour is stored as at most 3600 summaries: `samples.load_bucket_s` says how many seconds each covers (24 for a 24-hour run), and each summary keeps the highest temperature and fan speed, the lowest clock, every throttle reason seen, the latest error count and the mean power and throughput of its span. A 72-hour result is about half a megabyte. Loads of up to an hour (`--quick`, the standard run, `--long`) are stored sample for sample, as before.
+- The result's `checks.burn_in` records how long the load really ran, the throughput where a standard run reads it (the last two minutes of the first ten) and the throughput over the final 20%. A fall of more than 5% is a `THROUGHPUT_FELL` finding. That threshold has not been calibrated on real hardware.
+- The "not covered" note names the hours the load really ran: "faults that appear only after more than 24 hours of use".
+- One-second samples are held in memory until the run ends: about 20 MB per card per day.
+
+### All cards at once (`--together`)
+
+`gpucheck --gpus all --together` needs at least two selected cards. Every card idles through the baseline at the same time; then all loads start together, and each card is sampled as in a single run. A card that is busy, cannot be read or fails is recorded as not tested and does not hold the others up. No load is started on any card before every card has passed its busy check.
+
+A card loaded alongside others shares the machine's power supply and cooling with them, so its result is marked as measured together (`checks.together`, and `preflight.mode` is `measurements_only` with the reason). It is not graded and is never used as a reference. For grades, run the ordinary lot (one card after another) as well. If only one card ends up being loaded, because the others were refused, its run is an ordinary one.
+
+Ctrl-C stops every card at its next sample, keeps what each measured as a run that was stopped early, uploads nothing and exits 130. A second Ctrl-C quits without keeping anything. Unlike the one-after-another lot, the card files are written when all cards have finished, not one by one.
+
+All loads run in one process, one thread per card. Whether that costs throughput compared with a card tested alone has not been measured.
+
+### Links between cards (`--links`)
+
+Reading the links uses NVML getters only. Counters that rose during the run, or a link that was active before it and down after it, are an `NVLINK_ERRORS` finding (a warning: low error rates on a link can be normal). Some links inactive is reported as `NVLINK_LINKS_INACTIVE`, for information.
+
+The copy between cards runs only with `--together`, after every card has finished, and only between cards that NVML reports as NVLink peers. PyTorch and the driver choose the path a copy takes, so gpucheck also reads the cards' NVLink data counters around the copies: only when they rose does the result say the copy went over the links. Otherwise it says the counters did not show it, and the "not covered" note still lists data transfer over the links. Data that comes back changed is a `LINK_TRANSFER_MISMATCH` finding on both cards of the pair, because a copy cannot tell which end is at fault; the finding says with how many of its peers each card differed, and the card that differs with all of them is the likelier cause.
+
+### Checking the PyTorch calls without a GPU run
+
+`python -m gpucheck.deepchecks` runs the answer check and the memory test against the installed PyTorch and prints what they report. On a machine without a GPU it uses the CPU and small sizes: it only shows that PyTorch accepts every call and that a working machine gets no mismatch. With `--device cuda:0` it runs both at full size on that card.
+
 ## What gets uploaded
 
 Nothing, unless you opt in. Uploading is off in non-interactive shells unless you pass `--yes-upload`. `--dry-run` prints the exact payload so you can read it first.
 
-The payload is the contents of `result.json`: GPU model and driver details, measurements, findings, and the time series of samples. Besides the model and driver, each card's record includes, where the card reports them: its GPU index, firmware (VBIOS) version, PCIe link generation and width (current and maximum), and lifetime corrected and uncorrected memory-error counts. A value the card does not report is simply absent. The current PCIe link is read while the load runs, because a link drops to a lower speed at idle to save power, and the record says that it was read under load. If the link then runs below what the card and slot support, the report shows a `PCIE_LINK_DEGRADED` finding. When no load ran, the link is read at idle: only a narrower width is reported, and the speed is not judged. The result also carries the run's start and end times and, in a lot, the lot ID, the card's position and your label. The GPU's UUID is replaced by a salted hash, so the raw UUID is never sent. The salt is a public constant in this source code, so anyone who already knows your GPU's UUID can recompute the hash and recognise your card.
+The payload is the contents of `result.json`: GPU model and driver details, measurements, findings, and the time series of samples. Besides the model and driver, each card's record includes, where the card reports them: its GPU index, firmware (VBIOS) version, PCIe link generation and width (current and maximum), and lifetime corrected and uncorrected memory-error counts. A value the card does not report is simply absent. The current PCIe link is read while the load runs, because a link drops to a lower speed at idle to save power, and the record says that it was read under load. If the link then runs below what the card and slot support, the report shows a `PCIE_LINK_DEGRADED` finding. When no load ran, the link is read at idle: only a narrower width is reported, and the speed is not judged. The result also carries the run's start and end times and, in a lot, the lot ID, the card's position and your label. A run with extra checks also carries a `checks` block with what each check counted (for the driver error log, the events with their Xid numbers), and a burn-in's load samples are summaries (see "Burn-in"). The GPU's UUID is replaced by a salted hash, so the raw UUID is never sent. The salt is a public constant in this source code, so anyone who already knows your GPU's UUID can recompute the hash and recognise your card.
 
 The serial number is never read or uploaded unless you pass `--include-serial`. When you do, the serial appears in the uploaded result and on the public pages, and is also written to your local result files.
 
@@ -109,7 +178,7 @@ With an API key (`--api-key`, or better the `GPUCHECK_API_KEY` environment varia
 
 ### Uploading later (`--upload-saved`)
 
-`gpucheck --upload-saved PATH` uploads a saved result file or a lot directory without touching a GPU, and without a prompt. It uses `--server`, `--api-key` and `GPUCHECK_API_KEY` as usual, and cannot be combined with flags that run a test (`--gpus`, `--quick`, `--long`, `--label`, `--lot-dir`, `--include-serial`, `--offline`, `--dry-run`, `--certify`). It refuses a lot whose card files were changed after the run, and a single `gpu<N>.json` from a lot (upload its directory instead). A lot that did not finish (its run was killed) is uploaded with a note that the cards not reached are recorded as not tested. After a successful lot upload it records the URLs and delete tokens in `lot.json`; uploading the same lot again does not create duplicates and keeps tokens recorded earlier, and tokens from an upload to a different server are kept under `previous_uploads`. A single result file's delete token is printed, not saved. If the server refuses a lot because no key was given, gpucheck exits 1, leaves the directory unchanged, and prints how to get a key and the command to run again once `GPUCHECK_API_KEY` is set.
+`gpucheck --upload-saved PATH` uploads a saved result file or a lot directory without touching a GPU, and without a prompt. It uses `--server`, `--api-key` and `GPUCHECK_API_KEY` as usual, and cannot be combined with flags that run a test (`--gpus`, `--quick`, `--long`, `--burn-in`, `--label`, `--lot-dir`, `--include-serial`, `--offline`, `--dry-run`, `--certify`, and the extra-check flags). It refuses a lot whose card files were changed after the run, and a single `gpu<N>.json` from a lot (upload its directory instead). A lot that did not finish (its run was killed) is uploaded with a note that the cards not reached are recorded as not tested. After a successful lot upload it records the URLs and delete tokens in `lot.json`; uploading the same lot again does not create duplicates and keeps tokens recorded earlier, and tokens from an upload to a different server are kept under `previous_uploads`. A single result file's delete token is printed, not saved. If the server refuses a lot because no key was given, gpucheck exits 1, leaves the directory unchanged, and prints how to get a key and the command to run again once `GPUCHECK_API_KEY` is set.
 
 ## Certificates (`--certify`)
 
@@ -152,6 +221,8 @@ Verifying a certificate offline needs the certificate payload, its signature, an
 
 The report lists plain-language findings, each with a severity and a confidence. Besides the thermal, power and throughput findings (`THERMAL_THROTTLING`, `POWER_CAPPED`, `HOT_ENVIRONMENT`, `UNDERPERFORMING_UNKNOWN`, `INSUFFICIENT_EVIDENCE`), it can report `HOT_UNDER_LOAD` (the card throttled quickly and ran near its temperature limit even though it idled cool), `MEMORY_ERRORS` (errors during the run, remapped memory rows, or uncorrected memory errors over the card's lifetime, recorded by the card), `MEMORY_NOT_CHECKED` (the card exposes no memory-error counters, so memory health was not checked) and `PCIE_LINK_DEGRADED`. `POWER_CAPPED` means the card's power limit is set below 90% of its default; a card that regulates at its stock limit under full load is not flagged. (When the limits cannot be read, power capping seen on a cool card is reported instead.) `UNDERPERFORMING_UNKNOWN` is reported when sustained throughput is below 90% of the datasheet peak with no throttling seen, or below 40% on a card that only shows power regulation at its stock limit. That second figure is only a floor for gross shortfalls: healthy A100s regulating at their own limit measured between 60% and 86% of the datasheet peak depending on the variant's power limit, so the datasheet is a poor yardstick there and the grade on the result page, which compares a card with others of its model, is the one to read. Every report ends with a "Not covered" note listing what the test does not examine.
 
+The extra checks add these: `DRIVER_ERRORS` (the driver reported hardware error events during the run), `MEMTEST_MISMATCH` (the memory test read back data that differed from what it wrote), `WRONG_ANSWERS` (the answer check got a product wrong), `LINK_TRANSFER_MISMATCH` (test data copied between two cards came back changed), `NVLINK_ERRORS` (NVLink error counters rose or a link went down during the run), `NVLINK_LINKS_INACTIVE` (some of the card's NVLink links were inactive), `THROUGHPUT_FELL` (a burn-in's final throughput was more than 5% below its first ten minutes) and `CHECK_NOT_RUN` (a check that was asked for could not run or did not finish, so what it would have covered is not covered). ECC errors counted while the answer check or the memory test ran are reported under `MEMORY_ERRORS`. On the result page a failed memory test, answer check or card-to-card copy makes the grade an F, and driver error events cap it at D.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -160,13 +231,23 @@ The report lists plain-language findings, each with a severity and a confidence.
 | 1 | Preflight refused to run (for example the GPU is busy), or the request was refused (for example a bad `--gpus` value) |
 | 2 | No NVIDIA GPU or driver available |
 | 3 | Run aborted partway (thermal limit, ECC errors, or lost telemetry); result.json is still written |
-| 130 | Interrupted with Ctrl-C during a lot (finished cards are kept) or during an `--upload-saved` upload (nothing on disk is changed) |
+| 130 | Interrupted with Ctrl-C during a lot (finished cards are kept), during a burn-in (what was measured is written) or during an `--upload-saved` upload (nothing on disk is changed) |
 
 For a lot: 0 when every card was tested, 3 when some cards were not tested or a run was aborted (the lot is still written), 1 when no card produced a result or the lot could not be started or saved, and 130 when interrupted. A failed upload does not change the exit code. `--upload-saved` exits 0 on success, 1 on any failure, and 130 when the upload is interrupted with Ctrl-C (nothing on disk is changed).
 
 ## What this test does not cover
 
 This is a pre-flight check, not proof of health. It does not test memory cells, silent data corruption, faults that appear only after hours of use, links between GPUs, or physical damage.
+
+That is the note for a plain run. The note is written per result, so a run that did an extra check says what that check reached instead of saying the area is untested, and a run that did not still says it is untested:
+
+- After `--memtest`, "memory cells" is replaced by how much of the card's memory the patterns reached and that they cannot rule out faults they do not provoke.
+- After `--answer-check`, "silent data corruption" is replaced by the number of products compared and "it can catch some silent data corruption and cannot rule it out".
+- After a burn-in, the note says "faults that appear only after more than N hours of use", with the hours the load really ran.
+- After `--links` on a card with active NVLink links, the note says the link state and counters were read and that data transfer over the links is not tested, unless a copy between cards was seen on the NVLink data counters.
+- A check that could not run, or stopped early, changes nothing in the note.
+
+Physical damage is never tested. A lot's summary, and the lot and card pages, list only what no run on the page tested and point to each run's own report for the rest.
 
 ## Limitations
 
@@ -176,6 +257,8 @@ This is a pre-flight check, not proof of health. It does not test memory cells, 
 - It refuses to run on a GPU that is already busy.
 - Grades depend on a reference set of comparable runs; for new or rare models you will see "insufficient reference".
 - A single run is a snapshot. A run with no findings is a snapshot of one test, not a guarantee.
+- None of the extra checks (`--driver-errors`, `--answer-check`, `--memtest`, `--links`, `--burn-in`, `--together`, `--thorough`) has been run on real hardware yet, and the answer check, the memory test and the card-to-card copy have not been run against real PyTorch either: the development machine has neither, so their logic was tested on a small stand-in. Until the procedure in `docs/smoke-rented-gpu.md` ("Extra checks") has been run, treat every one of them as unverified, including the claim that a working card gets no finding from them.
+- The extra checks need a server that knows them. An older server still accepts the upload but drops the `checks` block and shows the new findings only as "findings this server does not recognise".
 - Real-hardware coverage so far is one machine with four RTX 3090s and one A100 80GB (November 2026, procedure in `docs/smoke-rented-gpu.md`). Lots on datacenter cards, machines with more than four GPUs, H100 and other models have not been run on real hardware; treat them as unverified.
 
 ## License
