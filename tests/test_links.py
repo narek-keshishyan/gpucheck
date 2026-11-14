@@ -157,7 +157,7 @@ def test_linked_cards_copy_test_data_between_every_pair(tmp_path, capsys):
             "nvlink_kib": 2 * (256 << 10)}
     out = capsys.readouterr().out
     assert "Copying test data between 3 linked cards (3 pairs)..." in out
-    assert "copied 0.5 GiB of test data to and from 2 other cards: it came back unchanged; the NVLink data counters rose during the copies" in out
+    assert "copied 512 MiB of test data to and from 2 other cards: it came back unchanged; the NVLink data counters rose during the copies" in out
     assert "It read this card's NVLink links and copied test data between it and 2 other cards" in out
     assert "links between GPUs," not in out.split("Lot summary")[0].split("Not covered")[1]
 

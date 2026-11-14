@@ -281,12 +281,20 @@ def _driver_errors(result: dict) -> Finding | None:
         return None
     total = sum(n for _, n in events)
     listed = ", ".join(f"{name} x{n}" for name, n in events)
+    # A memory or poison event is the hardware. An Xid may be the hardware, the driver, or a
+    # program using the card (a rented A100 reported Xid 43 for a deliberate fault in another
+    # process), so a run with only Xid events is a warning that says so.
+    only_xid = all(name.startswith("Xid ") for name, _ in events)
+    cause = (
+        " An Xid can come from the hardware, the driver or a program using the card; "
+        "NVIDIA's Xid list says which causes each number has." if only_xid else ""
+    )
     return Finding(
         "DRIVER_ERRORS",
-        "bad",
+        "warn" if only_xid else "bad",
         "high",
-        f"The driver reported {total} hardware error event{'' if total == 1 else 's'} for this card "
-        f"during the run: {listed}. Xid numbers are NVIDIA driver error codes.",
+        f"The driver reported {total} error event{'' if total == 1 else 's'} for this card "
+        f"during the run: {listed}.{cause}",
     )
 
 

@@ -105,7 +105,7 @@ def _parser() -> argparse.ArgumentParser:
         "Off by default: a plain run is unchanged by them. Each one adds to the result what it checked.",
     )
     x.add_argument("--thorough", action="store_true", help="every check that only adds minutes and leaves the graded measurement alone: --driver-errors, --answer-check, --memtest and --links. It does not lengthen the load (--burn-in) or load cards together (--together); ask for those by name")
-    x.add_argument("--driver-errors", action="store_true", help="listen for hardware error events (Xid) the driver reports for the card during the run")
+    x.add_argument("--driver-errors", action="store_true", help="listen for the error events (Xid, memory errors) the driver reports for the card during the run")
     x.add_argument("--memtest", action="store_true", help="after the load, write test patterns across most of the card's free memory and read them back (needs PyTorch with CUDA)")
     x.add_argument("--answer-check", action="store_true", help="after the load, compute matrix products whose correct result is known and count wrong ones; catches some silent data corruption, cannot rule it out (needs PyTorch with CUDA)")
     x.add_argument("--links", action="store_true", help="read the state and error counters of the card's NVLink links before and after the run; with --together, also copy test data between linked cards. A card without active NVLink links reports nothing")
@@ -651,14 +651,19 @@ def _together_outcome(m: _Measured, lot: dict, loaded: int, transfer: dict | Non
     return outcome(TESTED, None, result)
 
 
-def _join(threads: list, timeout_s: float | None = None) -> None:
-    """Wait for every thread while staying interruptible by Ctrl-C; give up after timeout_s if given."""
+def _join(done: list, timeout_s: float | None = None) -> None:
+    """Wait until every card's "done" event is set, staying interruptible by Ctrl-C; give up
+    after timeout_s if given.
+
+    It waits on events, not on Thread.join(): before Python 3.13 a Ctrl-C that lands inside
+    join() can mark a thread that is still running as finished. On a rented two-card machine
+    that dropped the first card's measurements from an interrupted lot."""
     deadline = None if timeout_s is None else time.monotonic() + timeout_s
-    while any(t.is_alive() for t in threads):
+    while not all(e.is_set() for e in done):
         if deadline is not None and time.monotonic() >= deadline:
             return
-        for t in threads:
-            t.join(0.1)
+        for e in done:
+            e.wait(0.1)
 
 
 def _run_together(adapters, args, gpu_indices: list[int], lot_ref: dict) -> tuple[list[CardOutcome], bool]:
@@ -676,6 +681,7 @@ def _run_together(adapters, args, gpu_indices: list[int], lot_ref: dict) -> tupl
         except Exception as e:
             loads.append(e)
     measured: list = [None] * n
+    done = [threading.Event() for _ in range(n)]
 
     def work(pos: int) -> None:
         try:
@@ -684,6 +690,8 @@ def _run_together(adapters, args, gpu_indices: list[int], lot_ref: dict) -> tupl
         except BaseException as e:  # nothing may escape a thread and leave a position empty
             measured[pos] = CardOutcome(
                 pos, gpu_indices[pos], None, NOT_TESTED, _one_line(f"run failed: {type(e).__name__}: {e}"), None)
+        finally:
+            done[pos].set()
 
     threads = [threading.Thread(target=work, args=(pos,), daemon=True, name=f"gpucheck-card-{pos}") for pos in range(n)]
     _say(f"Testing {n} GPUs at the same time (GPU {', '.join(str(i) for i in gpu_indices)})...")
@@ -691,7 +699,7 @@ def _run_together(adapters, args, gpu_indices: list[int], lot_ref: dict) -> tupl
         t.start()
     interrupted = False
     try:
-        _join(threads)
+        _join(done)
     except KeyboardInterrupt:
         interrupted = True
         stop.set()
@@ -699,7 +707,7 @@ def _run_together(adapters, args, gpu_indices: list[int], lot_ref: dict) -> tupl
         _say("Interrupted: stopping every card at its next sample and keeping what was measured.")
         # A card whose driver call hangs would never stop: wait a while, then write what the
         # others measured and record that one as not tested.
-        _join(threads, STOP_WAIT_S)
+        _join(done, STOP_WAIT_S)
     # A card counts as loaded together only if its load really started: not one whose load
     # failed to start, and not one still waiting at the gate when the lot was interrupted. A
     # card whose thread never came back still counts: the others were loaded alongside it.

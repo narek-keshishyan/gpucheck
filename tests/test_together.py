@@ -320,8 +320,7 @@ def test_a_card_that_never_stops_does_not_lose_what_the_others_measured(tmp_path
         calls.append(1)
         if len(calls) == 1:
             hung.wait(10)
-            while threads[0].is_alive():  # card 0 runs to its end
-                threads[0].join(0.05)
+            threads[0].wait(10)  # card 0 runs to its end
             raise KeyboardInterrupt
         real(threads, timeout_s)
 
@@ -343,3 +342,42 @@ def test_cards_that_are_ready_do_not_wait_for_ever_for_one_that_is_not():
     t0 = cli.time.monotonic()
     gate.arrive()  # the other card never arrives and never withdraws
     assert 0.15 < cli.time.monotonic() - t0 < 5 and gate.arrived == 1
+
+
+def test_a_real_ctrl_c_keeps_every_card_even_when_it_lands_while_waiting_for_the_first(tmp_path, monkeypatch):
+    # Found on a rented two-card machine: Ctrl-C arrived while the main thread was waiting for
+    # card 0, Python marked that still-running thread as finished, and its measurements were lost.
+    import os
+    import signal
+    import time
+
+    cards = make_fakes("healthy,healthy")
+    under_load = threading.Event()
+
+    def slow(card):
+        real = card.sample
+        seen = [0]
+
+        def sample():
+            seen[0] += 1
+            if seen[0] > 40:  # under load: every sample takes real time, as a real load burst does
+                under_load.set()
+                time.sleep(0.05)
+            return real()
+
+        card.sample = sample
+
+    for card in cards:
+        slow(card)
+    monkeypatch.setattr(cli, "make_fakes", lambda s: cards)
+
+    def press_ctrl_c():
+        under_load.wait(10)
+        time.sleep(0.3)  # the main thread is by now waiting for the cards
+        os.kill(os.getpid(), signal.SIGINT)
+
+    threading.Thread(target=press_ctrl_c, daemon=True).start()
+    rc, summary, results = together(tmp_path, "healthy,healthy")
+    assert rc == 130
+    assert [(c["outcome"], c["reason"]) for c in summary["cards"]] == [("aborted", "interrupted")] * 2
+    assert sorted(results) == [0, 1] and all(r["samples"]["load"] for r in results.values())

@@ -72,7 +72,7 @@ def test_driver_errors_passing_card(tmp_path, capsys):
     assert rc == 0 and codes(result) == []
     assert result["checks"] == {"driver_errors": {"status": "ran", "count": 0, "events": []}}
     out = capsys.readouterr().out
-    assert "Driver error log: listened for hardware error events from the driver for the whole run; none was reported" in out
+    assert "Driver error log: listened for error events from the driver for the whole run; none was reported" in out
     assert NOT_COVERED in out  # listening for driver errors narrows none of the "not covered" items
 
 

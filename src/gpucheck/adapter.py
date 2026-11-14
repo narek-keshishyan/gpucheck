@@ -67,7 +67,7 @@ class TelemetryAdapter(Protocol):
     The run reads it under load, because a link drops to a lower speed at idle to save power.
 
     For the opt-in extra checks it may also offer open_event_log() -> an object with poll() and
-    close() (hardware error events the driver reports for this card), nvlink() -> a snapshot of
+    close() (error events the driver reports for this card), nvlink() -> a snapshot of
     its NVLink links or None when it has none, and nvlink_peer(other) -> whether NVML reports
     NVLink peer-to-peer access between this card and another adapter's card."""
 
@@ -149,7 +149,8 @@ def _reason_bit(nv, suffix: str) -> int:
     )
 
 
-# Driver events that report a hardware error, by the name gpucheck records and the NVML ABI bit.
+# Driver events that report an error, by the name gpucheck records and the NVML ABI bit. An Xid
+# is not always a hardware fault: some numbers are raised by a fault in a program using the card.
 # Clock, power-state and configuration-change events are not errors and are not listened for.
 ERROR_EVENTS = (
     ("xid", "nvmlEventTypeXidCriticalError", 0x8),
@@ -172,7 +173,7 @@ class EventLogUnavailable(Exception):
 
 
 class NvmlEventLog:
-    """Hardware error events (Xid and memory errors) the driver reports for one card.
+    """Error events (Xid and memory errors) the driver reports for one card.
 
     The driver delivers only events that happen after registration, which is what a run wants:
     errors while it was testing. Registering is not a GPU setting and needs no root on a normal
@@ -392,7 +393,7 @@ class NvmlAdapter(TelemetryAdapter):
         )
 
     def open_event_log(self) -> NvmlEventLog:
-        """Start listening for hardware error events on this card; EventLogUnavailable if it cannot."""
+        """Start listening for error events on this card; EventLogUnavailable if it cannot."""
         return NvmlEventLog(self._nv, self._h)
 
     def _fields(self, wanted: tuple, scope: int = 0) -> dict[str, int]:

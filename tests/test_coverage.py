@@ -145,7 +145,7 @@ def test_check_lines_say_when_a_check_could_not_run():
 
 def test_a_clean_log_and_a_partial_one():
     assert dict(check_lines(result(driver_errors={"status": "ran", "events": []})))["Driver error log"] == (
-        "listened for hardware error events from the driver for the whole run; none was reported"
+        "listened for error events from the driver for the whole run; none was reported"
     )
     part = dict(check_lines(result(driver_errors={"status": "partial", "events": []})))["Driver error log"]
     assert "for part of the run (listening stopped early)" in part

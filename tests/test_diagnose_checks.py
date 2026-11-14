@@ -101,3 +101,23 @@ def test_every_check_that_did_not_finish_is_named_once():
         "driver error log (stopped before finishing), memory test (could not be run), "
         "answer check (could not be run), NVLink links (could not be run)."
     )
+
+
+def test_an_xid_alone_is_a_warning_that_says_it_may_not_be_the_hardware():
+    # Seen on a rented A100 (14 November 2026): a deliberate fault in another process on the card
+    # was reported as Xid 43, which is a program fault, not a hardware one.
+    (f,) = findings({"driver_errors": {"status": "ran", "events": [{"kind": "xid", "xid": 43, "phase": "load"}]}})
+    assert (f.code, f.severity, f.confidence) == ("DRIVER_ERRORS", "warn", "high")
+    assert f.message == (
+        "The driver reported 1 error event for this card during the run: Xid 43 x1. An Xid can come from the "
+        "hardware, the driver or a program using the card; NVIDIA's Xid list says which causes each number has."
+    )
+    assert "hardware error" not in f.message
+
+
+def test_a_memory_error_event_is_bad_whatever_else_was_reported():
+    (f,) = findings({"driver_errors": {"status": "ran", "events": [
+        {"kind": "xid", "xid": 48}, {"kind": "double_bit_ecc"}]}})
+    assert f.severity == "bad" and f.message == (
+        "The driver reported 2 error events for this card during the run: Xid 48 x1, double-bit ECC error x1."
+    )

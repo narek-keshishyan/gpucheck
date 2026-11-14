@@ -7,6 +7,7 @@ CPU in tests; on a GPU it is "cuda:<index>".
 
 from __future__ import annotations
 
+import random
 import time
 
 from .checks import CheckUnavailable
@@ -235,6 +236,7 @@ ANSWER_CASES: tuple[tuple[str, int, int], ...] = (
     ("float64", 2048, 2048),
 )
 _SCALES = (0.25, 0.5, 1.0, 2.0, 4.0)  # row scales: powers of two, exact in every format
+_SIGNED_SCALES = tuple(sign * scale for scale in _SCALES for sign in (1.0, -1.0))
 
 
 def _hadamard(torch, n: int, dtype, device: str):
@@ -289,8 +291,12 @@ class TorchAnswerCheck:
 
     def start(self) -> None:
         t = self._torch = _import_torch()
-        self._gen = t.Generator().manual_seed(self._seed)
-        self._scales = t.tensor(list(_SCALES), dtype=t.float64)
+        # The shuffles and scales are drawn, and the expected result worked out, in plain Python:
+        # nothing of the bookkeeping runs on the card, and nothing runs as small CPU tensor
+        # operations either. Those took 10 to 25 ms each on a rented machine whose container had
+        # 32 of the host's 128 cores (PyTorch started a thread for every host core), which left
+        # the card idle for most of the check.
+        self._rng = random.Random(self._seed)
         for case in list(self._cases):
             name, n, weight = case
             try:
@@ -312,10 +318,10 @@ class TorchAnswerCheck:
         if case[0] not in self._skipped:
             self._skipped.append(case[0])
 
-    def _signed_scales(self, n: int):
-        t, g = self._torch, self._gen
-        sign = (t.randint(0, 2, (n,), generator=g) * 2 - 1).to(t.float64)
-        return self._scales[t.randint(0, len(_SCALES), (n,), generator=g)] * sign
+    def _shuffle(self, n: int) -> list[int]:
+        order = list(range(n))
+        self._rng.shuffle(order)
+        return order
 
     def _product(self, case) -> int:
         """One product for `case`; the number of entries that differ from the known result."""
@@ -323,18 +329,27 @@ class TorchAnswerCheck:
         name, n, weight = case
         base = self._base[case]
         dtype = base.dtype
-        pa, pb = t.randperm(n, generator=self._gen), t.randperm(n, generator=self._gen)
-        sa, sb = self._signed_scales(n), self._signed_scales(n)
-        a = base[pa.to(dev)] * sa.to(device=dev, dtype=dtype)[:, None]
-        b = base[pb.to(dev)] * sb.to(device=dev, dtype=dtype)[:, None]
-        c = a @ b.T
+        pa, pb = self._shuffle(n), self._shuffle(n)
+        sa = self._rng.choices(_SIGNED_SCALES, k=n)
+        sb = self._rng.choices(_SIGNED_SCALES, k=n)
         # Row i of a is row pa[i] of the base; it meets the same base row in b at column k[i].
-        where = t.empty(n, dtype=t.int64)
-        where[pb] = t.arange(n)
-        k = where[pa]
-        value = sa * sb[k] * float(weight)
+        where = [0] * n
+        for column, row in enumerate(pb):
+            where[row] = column
+        k = [where[row] for row in pa]
+        value = [float(weight) * sa[i] * sb[k[i]] for i in range(n)]
+
+        def on_card(values, kind):
+            return t.tensor(values, dtype=kind).to(dev)
+
+        def scale(values):  # built as float32 (exact for powers of two), converted on the card
+            return on_card(values, t.float32).to(dtype)
+
+        a = base[on_card(pa, t.int64)] * scale(sa)[:, None]
+        b = base[on_card(pb, t.int64)] * scale(sb)[:, None]
+        c = a @ b.T
         expected = t.zeros((n, n), dtype=dtype, device=dev)
-        expected[t.arange(n, device=dev), k.to(dev)] = value.to(device=dev, dtype=dtype)
+        expected[t.arange(n, device=dev), on_card(k, t.int64)] = scale(value)
         return int(t.count_nonzero(c != expected))
 
     def step(self) -> bool:

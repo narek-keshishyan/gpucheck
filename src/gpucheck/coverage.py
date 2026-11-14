@@ -94,6 +94,8 @@ def _plural(n: int, word: str) -> str:
 
 
 def _gib(n: int) -> str:
+    if n < GIB:
+        return f"{n / (1 << 20):.0f} MiB"
     return f"{n / GIB:.1f}".rstrip("0").rstrip(".") + " GiB"
 
 
@@ -337,11 +339,11 @@ def check_lines(result: Any) -> list[tuple[str, str]]:
             whole = status(result, "driver_errors") == RAN
             span = "for the whole run" if whole else "for part of the run (listening stopped early)"
             if not total:
-                text = f"listened for hardware error events from the driver {span}; none was reported"
+                text = f"listened for error events from the driver {span}; none was reported"
             else:
                 shown = ", ".join(f"{name} x{n}" for name, n in events[:MAX_EVENTS_SHOWN])
                 more = ", and others" if len(events) > MAX_EVENTS_SHOWN else ""
-                text = (f"listened for hardware error events from the driver {span}; "
+                text = (f"listened for error events from the driver {span}; "
                         f"{total} reported ({shown}{more})")
         out.append((CHECK_LABELS["driver_errors"], text))
 
