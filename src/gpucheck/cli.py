@@ -106,6 +106,7 @@ def _parser() -> argparse.ArgumentParser:
     x.add_argument("--driver-errors", action="store_true", help="listen for hardware error events (Xid) the driver reports for the card during the run")
     x.add_argument("--memtest", action="store_true", help="after the load, write test patterns across most of the card's free memory and read them back (needs PyTorch with CUDA)")
     x.add_argument("--answer-check", action="store_true", help="after the load, compute matrix products whose correct result is known and count wrong ones; catches some silent data corruption, cannot rule it out (needs PyTorch with CUDA)")
+    x.add_argument("--together", action="store_true", help="in a lot, load every selected card at the same time instead of one after another, to exercise the machine's power supply and cooling; the results are measurements only (never graded, never used as references)")
     p.add_argument("--fake", metavar="PROFILE", help=argparse.SUPPRESS)
     return p
 
@@ -132,6 +133,7 @@ def _parse(argv):
             ("--lot-dir", args.lot_dir is not None), ("--include-serial", args.include_serial),
             ("--driver-errors", args.driver_errors), ("--memtest", args.memtest),
             ("--answer-check", args.answer_check), ("--burn-in", args.burn_in is not None),
+            ("--together", args.together),
         ):
             if used:
                 p.error(f"--upload-saved cannot be combined with {flag}")
@@ -324,10 +326,10 @@ def _checks_block(run) -> dict:
     return checks
 
 
-def _result(run, spec, *, challenge=None, challenge_workload=None, timing=None, lot=None) -> dict:
-    """Metrics, findings and the result dict for a finished run."""
+def _result(run, spec, *, challenge=None, challenge_workload=None, timing=None, lot=None, extra=None) -> dict:
+    """Metrics, findings and the result dict for a finished run. `extra` adds entries to its checks block."""
     metrics = derive(run, spec)
-    checks = _checks_block(run)
+    checks = {**_checks_block(run), **(extra or {})}
     if not checks:  # a plain run: exactly the calls it has always made
         findings = diagnose(metrics, run.preflight, run.inventory, spec)
         return build_result(run, metrics, findings, challenge, challenge_workload, timing=timing, lot=lot)
@@ -423,6 +425,173 @@ def _run_card(
     return outcome(run.inventory, TESTED, None, result)
 
 
+class _StartGate:
+    """Holds every card at the end of its idle baseline until all of them are there, so the loads
+    start at the same moment. A card that will never get there (refused, unreadable, failed)
+    withdraws, so the others are not kept waiting."""
+
+    def __init__(self, expected: int) -> None:
+        self._cond = threading.Condition()
+        self._expected = expected
+        self._open = False
+        self.arrived = 0  # cards whose load started together
+
+    def arrive(self) -> None:
+        with self._cond:
+            self.arrived += 1
+            self._cond.notify_all()
+            while not self._open and self.arrived < self._expected:
+                self._cond.wait()
+            self._open = True
+            self._cond.notify_all()
+
+    def withdraw(self) -> None:
+        with self._cond:
+            self._expected -= 1
+            self._cond.notify_all()
+
+    def release(self) -> None:
+        with self._cond:
+            self._open = True
+            self._cond.notify_all()
+
+
+@dataclasses.dataclass
+class _Measured:
+    """A card of an all-at-once lot whose run has ended; its result is built once every card has."""
+
+    position: int
+    gpu_index: int | None
+    run: object
+    spec: object
+    started: datetime
+    ended: datetime
+    reached_load: bool
+
+
+def _together_reason(others: int) -> str:
+    return f"loaded together with {others} other card{'' if others == 1 else 's'}: measurements only"
+
+
+def _mark_together(run, others: int):
+    """A card loaded alongside others is measurements only: it shares the machine's power and
+    cooling with them, so it is not graded and is never a reference for cards measured alone."""
+    pre = run.preflight
+    mode = "measurements_only" if pre.mode == "full" else pre.mode
+    marked = dataclasses.replace(pre, mode=mode, reasons=[*pre.reasons, _together_reason(others)])
+    return dataclasses.replace(run, preflight=marked)
+
+
+def _measure_together(adapter, load, args, *, position: int, gpu_index: int | None, gate: _StartGate, stop):
+    """Run one card of an all-at-once lot in its own thread; returns a CardOutcome when there is
+    nothing to build a result from, else a _Measured."""
+
+    def outcome(inventory, reason) -> CardOutcome:
+        return CardOutcome(position, gpu_index, inventory, NOT_TESTED, reason, None)
+
+    reached = []
+
+    def before_load() -> None:
+        reached.append(True)
+        gate.arrive()
+
+    inventory = None
+    try:
+        try:
+            inventory = adapter.inventory()
+        except Exception as e:
+            return outcome(None, _one_line(f"could not read the card: {e}"))
+        if isinstance(load, Exception):
+            return outcome(inventory, _one_line(f"run failed: {type(load).__name__}: {load}"))
+        started = _now()
+        spec = lookup(inventory.model_name)
+        extras = _extras(args, adapter, gpu_index, label=f"GPU {gpu_index} ")
+        run = execute_run(adapter, load, _config(args), spec, **_timer(args), **extras,
+                          before_load=before_load, should_stop=stop.is_set)
+        return _Measured(position, gpu_index, run, spec, started, _now(), bool(reached))
+    except Exception as e:  # one card's failure must not lose the rest of the lot
+        return outcome(inventory, _one_line(f"run failed: {type(e).__name__}: {e}"))
+    finally:
+        if not reached:
+            gate.withdraw()
+
+
+def _together_outcome(m: _Measured, lot: dict, loaded: int, transfer: dict | None = None) -> CardOutcome:
+    run = m.run
+
+    def outcome(kind, reason, result=None) -> CardOutcome:
+        return CardOutcome(m.position, m.gpu_index, run.inventory, kind, reason, result)
+
+    if run.aborted == "preflight_refused":
+        return outcome(NOT_TESTED, "; ".join(run.preflight.reasons))
+    if run.aborted == RUN_INTERRUPTED and not run.load:
+        return outcome(NOT_TESTED, INTERRUPTED)
+    extra = {}
+    if m.reached_load and loaded >= 2:
+        run = _mark_together(run, loaded - 1)
+        extra["together"] = {"cards": loaded}
+    result = _result(
+        run, m.spec, lot=lot, extra=extra,
+        timing={"started_utc": _iso(m.started), "ended_utc": _iso(m.ended), "settle_s": None},
+    )
+    if run.aborted:
+        return outcome(ABORTED, run.aborted, result)
+    return outcome(TESTED, None, result)
+
+
+def _join(threads: list) -> None:
+    """Wait for every thread while staying interruptible by Ctrl-C."""
+    while any(t.is_alive() for t in threads):
+        for t in threads:
+            t.join(0.1)
+
+
+def _run_together(adapters, args, gpu_indices: list[int], lot_ref: dict) -> tuple[list[CardOutcome], bool]:
+    """Load every card of the lot at the same time. Returns (the cards in position order, interrupted).
+
+    Each card runs the ordinary single-card run in its own thread: the same idle baseline (every
+    card idle), then the loads start together. The first Ctrl-C stops every card at its next
+    sample and keeps what was measured; a second one propagates."""
+    n = len(adapters)
+    gate, stop = _StartGate(n), threading.Event()
+    loads: list = []
+    for pos in range(n):  # built here, not in the threads: constructing a load imports PyTorch
+        try:
+            loads.append(_make_load(args, None, device_index=gpu_indices[pos]))
+        except Exception as e:
+            loads.append(e)
+    measured: list = [None] * n
+
+    def work(pos: int) -> None:
+        try:
+            measured[pos] = _measure_together(
+                adapters[pos], loads[pos], args, position=pos, gpu_index=gpu_indices[pos], gate=gate, stop=stop)
+        except BaseException as e:  # nothing may escape a thread and leave a position empty
+            measured[pos] = CardOutcome(
+                pos, gpu_indices[pos], None, NOT_TESTED, _one_line(f"run failed: {type(e).__name__}: {e}"), None)
+
+    threads = [threading.Thread(target=work, args=(pos,), daemon=True, name=f"gpucheck-card-{pos}") for pos in range(n)]
+    _say(f"Testing {n} GPUs at the same time (GPU {', '.join(str(i) for i in gpu_indices)})...")
+    for t in threads:
+        t.start()
+    interrupted = False
+    try:
+        _join(threads)
+    except KeyboardInterrupt:
+        interrupted = True
+        stop.set()
+        gate.release()
+        _say("Interrupted: stopping every card at its next sample and keeping what was measured.")
+        _join(threads)
+    cards = []
+    for pos, m in enumerate(measured):
+        if isinstance(m, _Measured):
+            m = _together_outcome(m, {**lot_ref, "position": pos}, gate.arrived)
+        cards.append(m)
+        _say(_progress_line(m))
+    return cards, interrupted
+
+
 def _say(text: str) -> None:
     """A progress line for a long lot, flushed so a log file or a pipe shows it at once.
 
@@ -461,7 +630,7 @@ def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None
         """lot.json as of now; positions not reached get rest_reason."""
         rest = [CardOutcome(p, gpu_indices[p], None, NOT_TESTED, rest_reason, None)
                 for p in range(len(cards), len(adapters))]
-        return lot_summary(lot_id, args.label, created, cards + rest, finished=finished)
+        return lot_summary(lot_id, args.label, created, cards + rest, finished=finished, together=args.together)
 
     def save(finished: bool, rest_reason: str) -> None:
         """Write the card files not yet on disk, then lot.json."""
@@ -484,7 +653,13 @@ def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None
         return EXIT_REFUSED
 
     interrupted = False
-    for pos, adapter in enumerate(adapters):
+    if args.together:
+        try:
+            together, interrupted = _run_together(adapters, args, gpu_indices, lot_ref)
+            cards.extend(together)
+        except KeyboardInterrupt:  # a second Ctrl-C: nothing is kept
+            interrupted = True
+    for pos, adapter in enumerate(adapters if not args.together else []):
         try:
             _say(f"Testing GPU {gpu_indices[pos]} (card {pos + 1} of {len(adapters)})...")
             cards.append(_run_card(
@@ -505,7 +680,7 @@ def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None
             break
     for pos in range(len(cards), len(adapters)):
         cards.append(CardOutcome(pos, gpu_indices[pos], None, NOT_TESTED, INTERRUPTED, None))
-    summary = lot_summary(lot_id, args.label, created, cards)
+    summary = lot_summary(lot_id, args.label, created, cards, together=args.together)
     try:
         save(True, INTERRUPTED)
         write_error = None
@@ -796,6 +971,10 @@ def main(argv: list[str] | None = None) -> int:
                 "(for example --gpus all)",
                 file=sys.stderr,
             )
+            return EXIT_REFUSED
+        if args.together and len(selected) < 2:
+            print("gpucheck: --together needs at least two GPUs; choose them with --gpus (for example --gpus all)",
+                  file=sys.stderr)
             return EXIT_REFUSED
         if len(selected) > 1 or wants_lot:
             if len(selected) > 1 and not args.fake and not _load_available():

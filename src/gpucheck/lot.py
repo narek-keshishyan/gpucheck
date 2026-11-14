@@ -44,9 +44,11 @@ def _card_file(position: int) -> str:
 
 
 def lot_summary(
-    lot_id: str, label: str | None, created_utc: str, cards: list[CardOutcome], *, finished: bool = True
+    lot_id: str, label: str | None, created_utc: str, cards: list[CardOutcome], *, finished: bool = True,
+    together: bool = False,
 ) -> dict:
-    """lot.json's content. `finished` is False while the lot is still running (or was killed)."""
+    """lot.json's content. `finished` is False while the lot is still running (or was killed).
+    `together` marks a lot whose cards were loaded at the same time; the key is absent otherwise."""
     entries = []
     for c in cards:
         inv = c.inventory
@@ -64,7 +66,7 @@ def lot_summary(
                 "findings": [f["code"] for f in c.result["findings"]] if c.result is not None else [],
             }
         )
-    return {
+    summary = {
         "lot_id": lot_id,
         "label": label,
         "size": len(cards),
@@ -73,6 +75,9 @@ def lot_summary(
         "uploaded": None,
         "finished": finished,
     }
+    if together:
+        summary["together"] = True
+    return summary
 
 
 CARD_MODE = 0o666  # narrowed by the umask, like the single-run result file
@@ -246,6 +251,8 @@ def render_lot_table(summary: dict) -> str:
     out = ["Lot summary", "=" * 11]
     if summary.get("label"):
         out.append(f"Label: {summary['label']}")
+    if summary.get("together"):
+        out.append("The cards were loaded at the same time: measurements only, not graded.")
     for c in summary["cards"]:
         gpu = "?" if c["gpu_index"] is None else c["gpu_index"]
         model = c["model_name"] or "unknown model"
