@@ -249,3 +249,31 @@ def test_a_burn_in_lot_summarises_every_card_and_says_what_no_card_covered(tmp_p
     assert "GPU 1 burn-in: 0 h 10 min of 1 h 0 min of load done" in out
     assert NOT_COVERED not in out.split("Lot summary")[1]
     assert "No run listed here tests memory cells, silent data corruption, links between GPUs, or physical damage." in out
+
+
+def test_ctrl_c_in_a_burn_in_lot_keeps_the_hours_of_the_card_being_tested(tmp_path, monkeypatch, capsys):
+    cards = make_fakes("healthy,healthy,healthy")
+    second = _InterruptAt(5000)
+    second.inventory, second.busy = cards[1].inventory, cards[1].busy
+    second._card = cards[1]
+    monkeypatch.setattr(cli, "make_fakes", lambda spec: [cards[0], second, cards[2]])
+    d = tmp_path / "lot"
+    rc = main(["--fake", "healthy,healthy,healthy", "--burn-in", "2", "--lot-dir", str(d), "--yes-upload"])
+    assert rc == 130
+    summary = json.loads((d / "lot.json").read_text())
+    assert [(c["outcome"], c["reason"]) for c in summary["cards"]] == [
+        ("tested", None), ("aborted", "interrupted"), ("not_tested", "interrupted")]
+    kept = json.loads((d / "gpu1.json").read_text())
+    assert kept["aborted"] == "interrupted" and 4800 < kept["checks"]["burn_in"]["completed_s"] < 5000
+    assert not (d / "gpu2.json").exists() and summary["finished"] is True
+
+
+def test_ctrl_c_in_a_plain_lot_still_drops_the_card_being_tested(tmp_path, monkeypatch):
+    cards = make_fakes("healthy,healthy")
+    second = _InterruptAt(100)
+    second.inventory, second.busy, second._card = cards[1].inventory, cards[1].busy, cards[1]
+    monkeypatch.setattr(cli, "make_fakes", lambda spec: [cards[0], second])
+    d = tmp_path / "lot"
+    assert main(["--fake", "healthy,healthy", "--offline", "--quick", "--lot-dir", str(d)]) == 130
+    summary = json.loads((d / "lot.json").read_text())
+    assert [(c["outcome"], c["reason"]) for c in summary["cards"]] == [("tested", None), ("not_tested", "interrupted")]

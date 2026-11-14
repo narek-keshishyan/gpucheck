@@ -413,7 +413,11 @@ def _run_card(
         spec = lookup(inventory.model_name)
         load = _make_load(args, None, device_index=gpu_index)
         extras = _extras(args, adapter, gpu_index, label=f"GPU {gpu_index} ")
-        run = execute_run(adapter, load, _config(args), spec, **timer, **extras)
+        if getattr(args, "burn_in", None) is None:
+            run = execute_run(adapter, load, _config(args), spec, **timer, **extras)
+        else:  # hours of load: the first Ctrl-C stops at the next sample and keeps them
+            with _StopOnInterrupt() as stop:
+                run = execute_run(adapter, load, _config(args), spec, **timer, **extras, should_stop=stop.is_set)
     except KeyboardInterrupt:
         raise _CardInterrupted(outcome(inventory, NOT_TESTED, INTERRUPTED)) from None
     except Exception as e:  # one card's failure must not lose the rest of the lot
@@ -421,11 +425,15 @@ def _run_card(
     ended = _now()
     if run.aborted == "preflight_refused":
         return outcome(run.inventory, NOT_TESTED, "; ".join(run.preflight.reasons))
+    if run.aborted == RUN_INTERRUPTED and not run.load:
+        raise _CardInterrupted(outcome(run.inventory, NOT_TESTED, INTERRUPTED))
     result = _result(
         run, spec,
         timing={"started_utc": _iso(started), "ended_utc": _iso(ended), "settle_s": settle_s},
         lot=lot,
     )
+    if run.aborted == RUN_INTERRUPTED:  # a burn-in stopped with Ctrl-C: kept, and the lot ends here
+        raise _CardInterrupted(outcome(run.inventory, ABORTED, run.aborted, result))
     if run.aborted:
         return outcome(run.inventory, ABORTED, run.aborted, result)
     return outcome(run.inventory, TESTED, None, result)
