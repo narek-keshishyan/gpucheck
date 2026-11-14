@@ -136,7 +136,7 @@ Nobody rents a machine without the owner's go-ahead. What each check needs, what
 
 One machine covers all six: **two A100 SXM4 80GB cards in one chassis**. On Vast.ai that was $2.1 per hour on 13 November 2026. Filter for "A100 SXM4", 2 GPUs, a PyTorch image, and check before renting that `nvidia-smi nvlink -s` is going to mean something: the listing should be an HGX or DGX host, not two PCIe A100s.
 
-- Steps 1 to 9 below take about two hours including set-up when they are scripted: the first run took 1 hour 49 minutes and cost **$4.48** at $2.489 per hour. Allow 2.5 to 3 hours, about $6 to $7, when doing them by hand.
+- Steps 1 to 9 below take about two hours including set-up when they are scripted: the first run took 1 hour 49 minutes and cost **$4.59** at $2.489 per hour, bandwidth included. Allow 2.5 to 3 hours, about $6 to $7, when doing them by hand.
 - Optional second machine, for a card without ECC or NVLink and for four cards at once: four RTX 3090s, as rented on 12 November 2026, for about an hour. Use that day's price from the Vast.ai billing page; at the "$0.30 to $2 per hour" range in section 1 it is **$2 or less**.
 - Optional, later: a full 24-hour burn-in on one cheap card. At $0.20 to $0.40 per hour for an RTX 3090 that is **$5 to $10**; it only adds the 24-hour memory and file-size figures, so it can wait until someone asks for burn-in.
 
