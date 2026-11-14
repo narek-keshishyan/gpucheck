@@ -16,7 +16,8 @@ from .adapter import AdapterUnavailable, NvmlAdapter, gpu_count
 from .checks import CheckPlan, burn_in_report
 from .coverage import narrowed, not_covered_many
 from .diagnose import diagnose
-from .fakes import make_fakes
+from .deepchecks import TorchMemtest
+from .fakes import fake_memtest, make_fakes
 from .lot import (
     MAX_LABEL_LEN,
     ABORTED,
@@ -95,6 +96,7 @@ def _parser() -> argparse.ArgumentParser:
         "Off by default: a plain run is unchanged by them. Each one adds to the result what it checked.",
     )
     x.add_argument("--driver-errors", action="store_true", help="listen for hardware error events (Xid) the driver reports for the card during the run")
+    x.add_argument("--memtest", action="store_true", help="after the load, write test patterns across most of the card's free memory and read them back (needs PyTorch with CUDA)")
     p.add_argument("--fake", metavar="PROFILE", help=argparse.SUPPRESS)
     return p
 
@@ -114,7 +116,7 @@ def _parse(argv):
             ("--fake", args.fake), ("--gpus", args.gpus is not None), ("--quick", args.quick),
             ("--long", args.long), ("--label", args.label is not None),
             ("--lot-dir", args.lot_dir is not None), ("--include-serial", args.include_serial),
-            ("--driver-errors", args.driver_errors),
+            ("--driver-errors", args.driver_errors), ("--memtest", args.memtest),
         ):
             if used:
                 p.error(f"--upload-saved cannot be combined with {flag}")
@@ -217,13 +219,20 @@ def _timer(args) -> dict:
 
 def _plan(args) -> CheckPlan:
     """The extra checks this run was asked for; none by default."""
-    return CheckPlan(driver_errors=getattr(args, "driver_errors", False))
+    return CheckPlan(
+        driver_errors=getattr(args, "driver_errors", False),
+        memtest=getattr(args, "memtest", False),
+    )
 
 
 def _make_checks(args, adapter, device_index: int = 0) -> list:
     """The checks that run as their own phases after the load, in the order they run."""
-    del args, adapter, device_index
-    return []
+    plan = _plan(args)
+    simulated = getattr(adapter, "extras", {}) if args.fake else None
+    checks = []
+    if plan.memtest:
+        checks.append(fake_memtest(simulated) if simulated is not None else TorchMemtest(device_index))
+    return checks
 
 
 def _extras(args, adapter, device_index: int = 0) -> dict:

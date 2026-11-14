@@ -106,3 +106,63 @@ def test_upload_saved_cannot_be_combined_with_an_extra_check(capsys):
     with pytest.raises(SystemExit):
         main(["--upload-saved", "x.json", "--driver-errors"])
     assert "--upload-saved cannot be combined with --driver-errors" in capsys.readouterr().err
+
+
+# ---- memory test --------------------------------------------------------------------------
+
+
+def test_memtest_passing_card(tmp_path, capsys):
+    rc, result = single(tmp_path, "healthy", "--memtest")
+    assert rc == 0 and codes(result) == []
+    m = result["checks"]["memtest"]
+    assert m["status"] == "ran" and m["mismatched_words"] == 0 and len(m["patterns"]) == 6
+    out = capsys.readouterr().out
+    assert "Memory test: wrote 6 patterns to 72 GiB (about 90% of the card's memory) and read them back: no mismatch" in out
+    assert "It does not test silent data corruption, faults that appear only after hours of use, links between GPUs, or physical damage." in out
+    assert "The memory test wrote patterns to about 90% of the card's memory and read them back" in out
+    assert "does not test memory cells" not in out
+
+
+def test_memtest_failing_card(tmp_path, capsys):
+    rc, result = single(tmp_path, "bad_memory", "--memtest")
+    assert rc == 0 and codes(result) == ["MEMTEST_MISMATCH"]
+    assert result["findings"][0]["severity"] == "bad" and "3 words that differed" in result["findings"][0]["message"]
+    assert result["checks"]["memtest"]["by_pattern"] == {"checker_a": 2, "random": 1}
+    assert "read them back: 3 words differed" in capsys.readouterr().out
+
+
+def test_a_run_without_the_memory_test_still_says_memory_cells_are_not_tested(tmp_path, capsys):
+    single(tmp_path, "bad_memory", "--driver-errors")
+    assert NOT_COVERED in capsys.readouterr().out
+
+
+def test_memtest_does_not_change_the_load_measurement(tmp_path):
+    _, plain = single(tmp_path, "healthy", name="a.json")
+    _, tested = single(tmp_path, "healthy", "--memtest", name="b.json")
+    for key in ("metrics", "samples", "config", "preflight", "inventory"):
+        assert plain[key] == tested[key]
+
+
+def test_the_real_memory_test_is_built_for_the_selected_card(monkeypatch):
+    import argparse
+
+    made = []
+    monkeypatch.setattr(cli, "TorchMemtest", lambda index: made.append(index) or "memtest")
+    args = argparse.Namespace(fake=None, memtest=True, driver_errors=False)
+    assert cli._make_checks(args, object(), 3) == ["memtest"] and made == [3]
+    assert sorted(cli._extras(args, object(), 3)) == ["checks", "plan"]
+    assert cli._extras(argparse.Namespace(fake=None, memtest=False, driver_errors=False), object(), 3) == {}
+
+
+def test_memtest_without_pytorch_is_reported_as_not_run(tmp_path, monkeypatch, capsys):
+    import sys
+
+    from gpucheck.deepchecks import TorchMemtest
+
+    monkeypatch.setitem(sys.modules, "torch", None)
+    monkeypatch.setattr(cli, "fake_memtest", lambda extras: TorchMemtest(0))
+    rc, result = single(tmp_path, "healthy", "--memtest")
+    assert rc == 0 and codes(result) == ["CHECK_NOT_RUN"]
+    assert result["checks"]["memtest"] == {"status": "unavailable", "reason": "PyTorch is not installed"}
+    out = capsys.readouterr().out
+    assert "Memory test: could not be run, so memory cells were not tested" in out and NOT_COVERED in out
