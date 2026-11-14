@@ -1,6 +1,6 @@
 [project]
 name = "gpucheck-cli"
-version = "0.2.0"
+version = "0.2.1"
 description = "Open-source CLI that health-checks NVIDIA GPUs"
 readme = "README.md"
 license = "Apache-2.0"
