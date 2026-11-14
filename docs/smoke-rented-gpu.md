@@ -142,7 +142,7 @@ One machine covers all six: **two A100 SXM4 80GB cards in one chassis**. On Vast
 
 So a full run is **about $5 to $7, or up to $9 with the second machine; allow $10**. Prices move; read the hourly price on the listing before renting and destroy the instance as soon as the steps are done.
 
-Install as in section 2, from the `deeper-tests` branch. Some images have no `python` on the path outside a login shell: on Vast.ai's PyTorch image run `source /venv/main/bin/activate` first. In a container the kernel log cannot be read (`dmesg: Operation not permitted`), so step 5 can only compare against what the fault itself prints. Start the local server from the server's `deeper-tests` branch and open the tunnel as in section 4.
+Install as in section 2, from the `deeper-tests` branch. Some images have no `python` on the path outside a login shell: on Vast.ai's PyTorch image run `source /venv/main/bin/activate` first. In a container the kernel log cannot be read (`dmesg: Operation not permitted`), so step 5 can only compare against what the fault itself prints. Start the local server from the server's `deeper-tests` branch and open the tunnel as in section 4. A lot upload now needs an account key, so for the lot uploads in the steps below either start that local test server with `ALLOW_ANONYMOUS_LOTS=1` in front of the command (never on the production server), or create a key on it with the server's admin tool and set `GPUCHECK_API_KEY` on the rented machine. The first run, on 14 November 2026, used a server from before that requirement.
 
 ### Steps
 
