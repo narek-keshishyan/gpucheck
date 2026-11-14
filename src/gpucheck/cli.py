@@ -7,13 +7,15 @@ import dataclasses
 import json
 import os
 import shlex
+import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .adapter import AdapterUnavailable, NvmlAdapter, gpu_count
-from .checks import CheckPlan, burn_in_report
+from .checks import BURN_IN_MIN_LOAD_S, CheckPlan, burn_in_report
 from .coverage import narrowed, not_covered_many
 from .diagnose import diagnose
 from .deepchecks import ANSWER_QUICK_S, ANSWER_S, TorchAnswerCheck, TorchMemtest
@@ -43,6 +45,7 @@ from .load import LoadUnavailable, TorchGemmLoad
 from .metrics import derive
 from .report import render_report
 from .resultjson import build_result, canonical_dumps
+from .run import INTERRUPTED as RUN_INTERRUPTED
 from .run import NullLoad, RunConfig, execute_run
 from .specs import lookup
 from .upload import (
@@ -60,6 +63,10 @@ DEFAULT_SERVER = "https://gpucheck-api.fly.dev"
 # The gpucheck project's own server, under both of its names. It takes a lot only with an account key.
 OFFICIAL_HOSTS = frozenset({"gpucheck-api.fly.dev", "api.gpucheck.dev"})
 SUPPORT_EMAIL = "support@gpucheck.dev"
+
+MIN_BURN_IN_H = BURN_IN_MIN_LOAD_S / 3600
+MAX_BURN_IN_H = 72.0  # three days; one-second samples are held in memory until the run ends
+BURN_IN_PROGRESS_S = 600  # a burn-in prints one line this often, so a log shows how far it got
 
 EXIT_OK, EXIT_REFUSED, EXIT_NO_GPU, EXIT_ABORTED = 0, 1, 2, 3
 EXIT_INTERRUPTED = 130
@@ -79,6 +86,7 @@ def _parser() -> argparse.ArgumentParser:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--quick", action="store_true", help="shorter run (30s baseline, 150s load)")
     g.add_argument("--long", action="store_true", help="longer run (60s baseline, 1800s load)")
+    g.add_argument("--burn-in", metavar="HOURS", type=float, default=None, help=f"burn-in: 60s baseline, then a load of this many hours ({MIN_BURN_IN_H:g} to {MAX_BURN_IN_H:g}); the result is graded but never used as a reference")
     p.add_argument("--offline", action="store_true", help="never upload; report locally only")
     p.add_argument("--certify", action="store_true", help="request a one-time server challenge so the result can earn a certificate (requires a server; excludes --offline/--dry-run/--quick)")
     p.add_argument("--yes-upload", action="store_true", help="upload without prompting")
@@ -111,6 +119,11 @@ def _parse(argv):
         p.error("--certify cannot be combined with --dry-run")
     if args.certify and args.quick:
         p.error("--certify cannot be combined with --quick")
+    if args.burn_in is not None:
+        if not MIN_BURN_IN_H <= args.burn_in <= MAX_BURN_IN_H:  # also refuses nan
+            p.error(f"--burn-in must be from {MIN_BURN_IN_H:g} to {MAX_BURN_IN_H:g} hours")
+        if args.certify:  # a challenge is valid for two hours and prescribes its own workload
+            p.error("--certify cannot be combined with --burn-in")
     if args.upload_saved is not None:
         for flag, used in (
             ("--offline", args.offline), ("--dry-run", args.dry_run), ("--certify", args.certify),
@@ -118,7 +131,7 @@ def _parse(argv):
             ("--long", args.long), ("--label", args.label is not None),
             ("--lot-dir", args.lot_dir is not None), ("--include-serial", args.include_serial),
             ("--driver-errors", args.driver_errors), ("--memtest", args.memtest),
-            ("--answer-check", args.answer_check),
+            ("--answer-check", args.answer_check), ("--burn-in", args.burn_in is not None),
         ):
             if used:
                 p.error(f"--upload-saved cannot be combined with {flag}")
@@ -201,6 +214,8 @@ def _config(args) -> RunConfig:
         return RunConfig(baseline_s=30, load_s=150, hz=1.0)
     if args.long:
         return RunConfig(baseline_s=60, load_s=1800, hz=1.0)
+    if getattr(args, "burn_in", None) is not None:
+        return RunConfig(baseline_s=60, load_s=round(args.burn_in * 3600), hz=1.0)
     return RunConfig(baseline_s=60, load_s=600, hz=1.0)
 
 
@@ -241,13 +256,63 @@ def _make_checks(args, adapter, device_index: int = 0) -> list:
     return checks
 
 
-def _extras(args, adapter, device_index: int = 0) -> dict:
-    """Keyword arguments that turn on the extra checks in execute_run; empty for a plain run,
+def _hm(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    return f"{minutes // 60} h {minutes % 60} min"
+
+
+def _burn_in_progress(label: str = ""):
+    """A progress callback for a burn-in: one line every ten minutes of load."""
+
+    def progress(i: int, count: int, sample) -> None:
+        done = i + 1
+        if done % BURN_IN_PROGRESS_S or done == count:
+            return
+        temp = "" if sample.temp_c is None else f", {sample.temp_c:.0f} C"
+        rate = "" if sample.achieved_tflops is None else f", {sample.achieved_tflops:.1f} TFLOPS"
+        _say(f"{label}burn-in: {_hm(done)} of {_hm(count)} of load done{temp}{rate}")
+
+    return progress
+
+
+def _extras(args, adapter, device_index: int = 0, label: str = "") -> dict:
+    """Keyword arguments that turn on the opt-in extras in execute_run; empty for a plain run,
     so a plain run calls execute_run exactly as it always has."""
+    extras: dict = {}
     plan = _plan(args)
-    if not plan.any():
-        return {}
-    return {"plan": plan, "checks": _make_checks(args, adapter, device_index)}
+    if plan.any():
+        extras.update(plan=plan, checks=_make_checks(args, adapter, device_index))
+    if getattr(args, "burn_in", None) is not None:
+        extras["progress"] = _burn_in_progress(label)
+    return extras
+
+
+class _StopOnInterrupt:
+    """While a burn-in runs, the first Ctrl-C asks the run to stop at its next sample, so hours
+    of measurements are kept and written as a run that was stopped early. A second Ctrl-C
+    interrupts at once, as in any other run. Outside the main thread it does nothing."""
+
+    def __init__(self) -> None:
+        self._flag = threading.Event()
+        self._old = None
+
+    def is_set(self) -> bool:
+        return self._flag.is_set()
+
+    def _handle(self, signum, frame) -> None:
+        self._flag.set()
+        signal.signal(signal.SIGINT, self._old)
+        print("\nstopping at the next sample and keeping what was measured; Ctrl-C again quits without saving",
+              file=sys.stderr, flush=True)
+
+    def __enter__(self) -> "_StopOnInterrupt":
+        if threading.current_thread() is threading.main_thread():
+            self._old = signal.signal(signal.SIGINT, self._handle)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._old is not None:
+            signal.signal(signal.SIGINT, self._old)
 
 
 def _checks_block(run) -> dict:
@@ -274,7 +339,11 @@ def _execute(adapter, args, challenge=None, device_index: int = 0):
     spec = lookup(adapter.inventory().model_name)
     load = _make_load(args, challenge, device_index=device_index)
     extras = _extras(args, adapter, device_index)
-    return spec, load, execute_run(adapter, load, _config(args), spec, **_timer(args), **extras)
+    if getattr(args, "burn_in", None) is None:
+        return spec, load, execute_run(adapter, load, _config(args), spec, **_timer(args), **extras)
+    with _StopOnInterrupt() as stop:
+        run = execute_run(adapter, load, _config(args), spec, **_timer(args), **extras, should_stop=stop.is_set)
+    return spec, load, run
 
 
 MAX_REASON_LEN = 300
@@ -335,7 +404,8 @@ def _run_card(
         settle_s = settle(adapter, sleep=timer.get("sleep", time.sleep)) if settle_first else None
         spec = lookup(inventory.model_name)
         load = _make_load(args, None, device_index=gpu_index)
-        run = execute_run(adapter, load, _config(args), spec, **timer, **_extras(args, adapter, gpu_index))
+        extras = _extras(args, adapter, gpu_index, label=f"GPU {gpu_index} ")
+        run = execute_run(adapter, load, _config(args), spec, **timer, **extras)
     except KeyboardInterrupt:
         raise _CardInterrupted(outcome(inventory, NOT_TESTED, INTERRUPTED)) from None
     except Exception as e:  # one card's failure must not lose the rest of the lot
@@ -797,6 +867,9 @@ def main(argv: list[str] | None = None) -> int:
     Path(args.json).write_text(canonical_dumps(result))  # before any upload consideration
     print(render_report(result))
     print(f"Result written to {args.json}")
+    if run.aborted == RUN_INTERRUPTED:  # a burn-in stopped with Ctrl-C: kept, never uploaded
+        print(f"Interrupted: not uploaded. Upload what was measured later with: gpucheck --upload-saved {args.json}")
+        return EXIT_INTERRUPTED
     if challenge is not None and challenge_expired(challenge):
         print("warning: challenge expired before upload; run again to certify — result saved locally")
     elif not args.offline:
