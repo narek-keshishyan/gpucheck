@@ -143,6 +143,7 @@ _PROFILES: dict[str, tuple[Callable[[], Iterator[TelemetrySample]], dict]] = {
     "nvlink": (_healthy, {}),
     "nvlink_errors": (_healthy, {}),
     "nvlink_idle": (_healthy, {}),
+    "nvlink_no_counter": (_healthy, {}),
 }
 
 _BUSY_PROFILES = frozenset({"busy"})
@@ -176,6 +177,9 @@ _EXTRAS: dict[str, dict] = {
         "transfer_mismatch": 4,
     },
     "nvlink_idle": {"nvlink": [_nvlink_snapshot([False] * 3, _ZERO), _nvlink_snapshot([False] * 3, _ZERO)]},
+    # Links are fine, but copies to and from this card do not show on its NVLink data counter.
+    "nvlink_no_counter": {"nvlink": [_nvlink_snapshot([True] * 4, _ZERO), _nvlink_snapshot([True] * 4, _ZERO)],
+                          "transfer_off_nvlink": True},
 }
 
 
@@ -241,7 +245,10 @@ TRANSFER_BYTES = 256 << 20
 
 
 def fake_transfer(a: "FakeAdapter", b: "FakeAdapter") -> dict:
-    """One simulated copy from card a to card b and back."""
+    """One simulated copy from card a to card b and back; it shows on both cards' data counters."""
+    for card in (a, b):
+        if not card.extras.get("transfer_off_nvlink"):
+            card.transferred_kib += TRANSFER_BYTES // 1024
     return {
         "bytes": TRANSFER_BYTES,
         "mismatched_words": max(a.extras.get("transfer_mismatch", 0), b.extras.get("transfer_mismatch", 0)),

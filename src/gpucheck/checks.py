@@ -15,7 +15,7 @@ from .coverage import NO_LINKS, NVLINK_COUNTERS, PARTIAL, RAN, UNAVAILABLE
 
 __all__ = [
     "RAN", "PARTIAL", "UNAVAILABLE", "NO_LINKS", "Check", "CheckPlan", "CheckUnavailable",
-    "burn_in_report", "driver_errors_report", "nvlink_report", "one_line", "thin_load",
+    "add_transfer", "burn_in_report", "driver_errors_report", "nvlink_report", "one_line", "thin_load",
 ]
 
 MAX_REASON_LEN = 200
@@ -115,6 +115,31 @@ def nvlink_report(before: dict | None, after: dict | None, transfer: dict | None
     }
     if transfer is not None:
         out["transfer"] = transfer
+    return out
+
+
+def add_transfer(report: dict, before: dict | None, after: dict | None, transfer: dict) -> dict:
+    """A card's "nvlink" entry with the card-to-card copies added.
+
+    `before` and `after` are link snapshots taken around the copies: counter rises and links
+    that went down during them are added to the run's own, and the rise of the card's NVLink
+    data counter (KiB sent) is kept as the evidence that the copies travelled over the links."""
+    out = {**report, "transfer": dict(transfer)}
+    if before is None or after is None:
+        return out
+    b, a = _counter_totals(before), _counter_totals(after)
+    errors = dict(report.get("errors") or {})
+    for k in NVLINK_COUNTERS:
+        if k in errors and k in a and k in b and a[k] >= b[k]:
+            errors[k] += a[k] - b[k]
+    was = {link["link"]: bool(link.get("active")) for link in before.get("links") or []}
+    now = {link["link"]: bool(link.get("active")) for link in after.get("links") or []}
+    out["errors"] = errors
+    out["dropped"] = report.get("dropped", 0) + sum(1 for i, up in was.items() if up and not now.get(i, False))
+    out["active"] = sum(1 for up in now.values() if up)
+    sent_before, sent_after = before.get("tx_kib"), after.get("tx_kib")
+    if isinstance(sent_before, int) and isinstance(sent_after, int) and sent_after >= sent_before:
+        out["transfer"]["nvlink_kib"] = sent_after - sent_before
     return out
 
 

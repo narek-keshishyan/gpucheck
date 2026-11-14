@@ -321,12 +321,15 @@ def _transfer_mismatch(result: dict) -> Finding | None:
     t = n["transfer"] if n else None
     if not t or not t["mismatched"]:
         return None
+    where = f", in the copies with {t['bad_peers']} of them" if t["bad_peers"] and t["peers"] > 1 else ""
     return Finding(
         "LINK_TRANSFER_MISMATCH",
         "bad",
         "high",
         f"Test data copied between this card and {t['peers']} other card{'' if t['peers'] == 1 else 's'} "
-        f"came back changed ({t['mismatched']} word{'' if t['mismatched'] == 1 else 's'} differed).",
+        f"came back changed ({t['mismatched']} word{'' if t['mismatched'] == 1 else 's'} differed{where}). "
+        "A copy involves two cards, so compare the cards of the lot: the one that differs with every peer "
+        "is the likelier cause.",
     )
 
 

@@ -78,7 +78,10 @@ def test_transfer_mismatch():
     (f,) = findings({"nvlink": {"status": "ran", "links": 2, "active": 2, "errors": {},
                                 "transfer": {"peers": 1, "bytes": GIB, "mismatched_words": 4, "nvlink_kib": 9}}})
     assert (f.code, f.severity) == ("LINK_TRANSFER_MISMATCH", "bad")
-    assert f.message == "Test data copied between this card and 1 other card came back changed (4 words differed)."
+    assert f.message.startswith("Test data copied between this card and 1 other card came back changed (4 words differed). ")
+    (g,) = findings({"nvlink": {"status": "ran", "links": 2, "active": 2, "errors": {}, "transfer": {
+        "peers": 3, "peers_with_mismatch": 1, "bytes": GIB, "mismatched_words": 4, "nvlink_kib": 9}}})
+    assert "(4 words differed, in the copies with 1 of them)" in g.message
 
 
 def test_throughput_that_fell_over_a_burn_in():

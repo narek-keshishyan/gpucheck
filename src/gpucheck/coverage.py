@@ -190,7 +190,9 @@ def nvlink_facts(result: Any) -> dict | None:
     transfer = None
     peers, moved = count(t.get("peers"), hi=64), count(t.get("bytes"))
     if peers and moved:
+        bad_peers = count(t.get("peers_with_mismatch"), hi=64)
         transfer = {"peers": peers, "bytes": moved, "mismatched": count(t.get("mismatched_words")),
+                    "bad_peers": bad_peers if bad_peers is not None and bad_peers <= peers else None,
                     "over_nvlink": (count(t.get("nvlink_kib")) or 0) > 0}
     return {"links": links, "active": active, "dropped": count(c.get("dropped"), hi=64) or 0,
             "rises": rises, "counters_read": bool(rises), "transfer": transfer}
@@ -405,6 +407,8 @@ def check_lines(result: Any) -> list[tuple[str, str]]:
                     outcome = "it came back unchanged"
                 else:
                     outcome = f"{_plural(t['mismatched'], 'word')} came back changed"
+                    if t["bad_peers"]:
+                        outcome += f" (in the copies with {t['bad_peers']} of them)"
                 how = ("the NVLink data counters rose during the copies" if t["over_nvlink"]
                        else "the NVLink data counters did not show the copies, so they may have travelled another way")
                 parts.append(

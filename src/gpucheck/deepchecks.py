@@ -388,6 +388,44 @@ class TorchAnswerCheck:
         }
 
 
+# ---- card-to-card transfer -----------------------------------------------------------------
+
+TRANSFER_BYTES = 256 * MIB
+
+
+class TorchTransfer:
+    """Copy pseudo-random data from one card to another and back, and compare.
+
+    PyTorch and the driver choose the path the copy takes; this class does not know whether
+    it was NVLink. The caller reads the cards' NVLink data counters around the copies for that.
+    A short copy says nothing about how fast the link is or how it behaves under long traffic."""
+
+    def __init__(self, nbytes: int = TRANSFER_BYTES, seed: int = 0x6770636B) -> None:
+        self._words = max(1, nbytes // WORD)
+        self._seed = seed
+
+    def copy(self, src: int, dst: int) -> dict:
+        t = _import_torch()
+        a_dev, b_dev = f"cuda:{src}", f"cuda:{dst}"
+        t0 = time.perf_counter()
+        g = t.Generator(device=a_dev)
+        g.manual_seed(self._seed + 64 * src + dst)
+        sent = there = back = None
+        try:
+            sent = t.empty(self._words, dtype=t.int64, device=a_dev).random_(generator=g)
+            there = sent.to(b_dev)
+            back = there.to(a_dev)
+            wrong = int(t.count_nonzero(sent != back))
+            _sync(t, a_dev)
+        finally:
+            del sent, there, back
+            try:
+                t.cuda.empty_cache()
+            except Exception as e:
+                warn_cleanup_failed(e)
+        return {"bytes": self._words * WORD, "mismatched_words": wrong, "seconds": time.perf_counter() - t0}
+
+
 # ---- self-test -----------------------------------------------------------------------------
 
 SELF_TEST_CASES = (("float32", 256, 256), ("float16", 256, 128), ("bfloat16", 256, 64), ("float64", 128, 128))

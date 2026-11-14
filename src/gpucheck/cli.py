@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import itertools
 import json
 import os
 import shlex
@@ -15,11 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .adapter import AdapterUnavailable, NvmlAdapter, gpu_count
-from .checks import BURN_IN_MIN_LOAD_S, CheckPlan, burn_in_report
+from .checks import BURN_IN_MIN_LOAD_S, RAN, CheckPlan, add_transfer, burn_in_report
 from .coverage import narrowed, not_covered_many
 from .diagnose import diagnose
-from .deepchecks import ANSWER_QUICK_S, ANSWER_S, TorchAnswerCheck, TorchMemtest
-from .fakes import fake_answer, fake_memtest, make_fakes
+from .deepchecks import ANSWER_QUICK_S, ANSWER_S, TorchAnswerCheck, TorchMemtest, TorchTransfer
+from .fakes import fake_answer, fake_memtest, fake_transfer, make_fakes
 from .lot import (
     MAX_LABEL_LEN,
     ABORTED,
@@ -106,6 +107,7 @@ def _parser() -> argparse.ArgumentParser:
     x.add_argument("--driver-errors", action="store_true", help="listen for hardware error events (Xid) the driver reports for the card during the run")
     x.add_argument("--memtest", action="store_true", help="after the load, write test patterns across most of the card's free memory and read them back (needs PyTorch with CUDA)")
     x.add_argument("--answer-check", action="store_true", help="after the load, compute matrix products whose correct result is known and count wrong ones; catches some silent data corruption, cannot rule it out (needs PyTorch with CUDA)")
+    x.add_argument("--links", action="store_true", help="read the state and error counters of the card's NVLink links before and after the run; with --together, also copy test data between linked cards. A card without active NVLink links reports nothing")
     x.add_argument("--together", action="store_true", help="in a lot, load every selected card at the same time instead of one after another, to exercise the machine's power supply and cooling; the results are measurements only (never graded, never used as references)")
     p.add_argument("--fake", metavar="PROFILE", help=argparse.SUPPRESS)
     return p
@@ -133,7 +135,7 @@ def _parse(argv):
             ("--lot-dir", args.lot_dir is not None), ("--include-serial", args.include_serial),
             ("--driver-errors", args.driver_errors), ("--memtest", args.memtest),
             ("--answer-check", args.answer_check), ("--burn-in", args.burn_in is not None),
-            ("--together", args.together),
+            ("--together", args.together), ("--links", args.links),
         ):
             if used:
                 p.error(f"--upload-saved cannot be combined with {flag}")
@@ -242,6 +244,7 @@ def _plan(args) -> CheckPlan:
         driver_errors=getattr(args, "driver_errors", False),
         memtest=getattr(args, "memtest", False),
         answer=getattr(args, "answer_check", False),
+        links=getattr(args, "links", False),
     )
 
 
@@ -516,6 +519,61 @@ def _measure_together(adapter, load, args, *, position: int, gpu_index: int | No
             gate.withdraw()
 
 
+def _links_now(adapter) -> dict | None:
+    reader = getattr(adapter, "nvlink", None)
+    try:
+        return reader() if reader is not None else None
+    except Exception:
+        return None
+
+
+def _transfer_phase(adapters, measured: list, gpu_indices: list[int], args) -> dict[int, dict]:
+    """After an all-at-once run with --links: copy test data between every pair of cards that
+    finished, have active NVLink links, and that NVML reports as NVLink peers. Returns, by
+    position, each such card's "nvlink" entry with the copies added.
+
+    A pair NVML does not report as linked is not copied between, and a card with no linked peer
+    gets no transfer entry: nothing was checked, which is not a pass."""
+    linked = [
+        pos for pos, m in enumerate(measured)
+        if isinstance(m, _Measured) and not m.run.aborted and m.run.checks.get("nvlink", {}).get("status") == RAN
+    ]
+    pairs = []
+    for i, j in itertools.combinations(linked, 2):
+        try:
+            if adapters[i].nvlink_peer(adapters[j]) is True:
+                pairs.append((i, j))
+        except Exception:
+            pass
+    if not pairs:
+        return {}
+    involved = sorted({pos for pair in pairs for pos in pair})
+    _say(f"Copying test data between {len(involved)} linked cards ({len(pairs)} pair{'' if len(pairs) == 1 else 's'})...")
+    before = {pos: _links_now(adapters[pos]) for pos in involved}
+    copier = None if args.fake else TorchTransfer()
+    totals = {pos: {"peers": 0, "peers_with_mismatch": 0, "bytes": 0, "mismatched_words": 0} for pos in involved}
+    for i, j in pairs:
+        try:
+            if copier is None:
+                out = fake_transfer(adapters[i], adapters[j])
+            else:
+                out = copier.copy(gpu_indices[i], gpu_indices[j])
+        except Exception as e:  # this pair is then not reported: not checked is not a pass
+            print(_one_line(f"warning: the copy between GPU {gpu_indices[i]} and GPU {gpu_indices[j]} "
+                            f"failed ({type(e).__name__}: {e})"), file=sys.stderr)
+            continue
+        for pos in (i, j):
+            totals[pos]["peers"] += 1
+            totals[pos]["bytes"] += out["bytes"]
+            totals[pos]["mismatched_words"] += out["mismatched_words"]
+            totals[pos]["peers_with_mismatch"] += 1 if out["mismatched_words"] else 0
+    merged = {}
+    for pos in involved:
+        if totals[pos]["peers"]:
+            merged[pos] = add_transfer(measured[pos].run.checks["nvlink"], before[pos], _links_now(adapters[pos]), totals[pos])
+    return merged
+
+
 def _together_outcome(m: _Measured, lot: dict, loaded: int, transfer: dict | None = None) -> CardOutcome:
     run = m.run
 
@@ -530,6 +588,8 @@ def _together_outcome(m: _Measured, lot: dict, loaded: int, transfer: dict | Non
     if m.reached_load and loaded >= 2:
         run = _mark_together(run, loaded - 1)
         extra["together"] = {"cards": loaded}
+    if transfer is not None:
+        extra["nvlink"] = transfer
     result = _result(
         run, m.spec, lot=lot, extra=extra,
         timing={"started_utc": _iso(m.started), "ended_utc": _iso(m.ended), "settle_s": None},
@@ -583,10 +643,16 @@ def _run_together(adapters, args, gpu_indices: list[int], lot_ref: dict) -> tupl
         gate.release()
         _say("Interrupted: stopping every card at its next sample and keeping what was measured.")
         _join(threads)
+    transfers: dict[int, dict] = {}
+    if _plan(args).links and not interrupted:
+        try:
+            transfers = _transfer_phase(adapters, measured, gpu_indices, args)
+        except KeyboardInterrupt:
+            interrupted = True
     cards = []
     for pos, m in enumerate(measured):
         if isinstance(m, _Measured):
-            m = _together_outcome(m, {**lot_ref, "position": pos}, gate.arrived)
+            m = _together_outcome(m, {**lot_ref, "position": pos}, gate.arrived, transfers.get(pos))
         cards.append(m)
         _say(_progress_line(m))
     return cards, interrupted
