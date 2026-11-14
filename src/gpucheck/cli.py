@@ -6,6 +6,7 @@ import argparse
 import dataclasses
 import json
 import os
+import shlex
 import sys
 import time
 from datetime import datetime, timezone
@@ -47,11 +48,15 @@ from .upload import (
     UploadOutcome,
     fetch_challenge,
     key_error,
+    server_host,
     upload,
     upload_lot,
 )
 
 DEFAULT_SERVER = "https://gpucheck-api.fly.dev"
+# The gpucheck project's own server, under both of its names. It takes a lot only with an account key.
+OFFICIAL_HOSTS = frozenset({"gpucheck-api.fly.dev", "api.gpucheck.dev"})
+SUPPORT_EMAIL = "support@gpucheck.dev"
 
 EXIT_OK, EXIT_REFUSED, EXIT_NO_GPU, EXIT_ABORTED = 0, 1, 2, 3
 EXIT_INTERRUPTED = 130
@@ -77,7 +82,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="show what would be uploaded")
     p.add_argument("--json", metavar="PATH", default="./gpucheck-result.json", help="where to write result.json")
     p.add_argument("--server", metavar="URL", default=None, help="upload server URL")
-    p.add_argument("--api-key", metavar="KEY", default=None, help="send this API key with the upload; prefer the GPUCHECK_API_KEY environment variable, because command-line arguments are visible to other users of the machine. The key is never saved or printed")
+    p.add_argument("--api-key", metavar="KEY", default=None, help="send this API key with the upload (the gpucheck server needs one to upload a lot, not a single card); prefer the GPUCHECK_API_KEY environment variable, because command-line arguments are visible to other users of the machine. The key is never saved or printed")
     p.add_argument("--gpus", metavar="SPEC", default=None, help='which GPUs to test: "all" or indices such as "0,2" (default: 0)')
     p.add_argument("--include-serial", action="store_true", help="also record the card's serial number in the result")
     p.add_argument("--label", metavar="TEXT", default=None, help=f"a name for a lot, such as a rack or chassis (at most {MAX_LABEL_LEN} characters); makes the run a lot even with one card")
@@ -391,6 +396,25 @@ def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None
     return lot_exit_code(cards)
 
 
+def _official(server: str) -> bool:
+    return server_host(server) in OFFICIAL_HOSTS
+
+
+def _lot_needs_key(directory: Path, server: str, server_arg: str | None) -> str:
+    """What to tell someone whose lot was not uploaded for want of an account key."""
+    retry = f"gpucheck --upload-saved {shlex.quote(str(directory))}"
+    if server_arg:  # without it the retry would go to the default server
+        retry += f" --server {shlex.quote(server_arg)}"
+    who = f"write to {SUPPORT_EMAIL}" if _official(server) else f"ask whoever runs {server}"
+    return "\n".join((
+        f"Not uploaded: {server} takes a lot only with an account key, and no key was given. "
+        "(A single card uploads without one.)",
+        f"The lot is saved in {directory}.",
+        f"To get a key, {who}.",
+        f"Then set the GPUCHECK_API_KEY environment variable to the key and run: {retry}",
+    ))
+
+
 def _maybe_upload_lot(summary: dict, results: list[dict], directory: Path, args, api_key: str | None) -> None:
     if args.dry_run:
         print(canonical_dumps(lot_request(summary, results)))  # the key is a header, never in the body
@@ -402,6 +426,11 @@ def _maybe_upload_lot(summary: dict, results: list[dict], directory: Path, args,
         print(later)
         return
     if not args.yes_upload:
+        if not api_key and _official(server):
+            # The answer is known, so do not ask a question that would end in a refusal.
+            # --yes-upload and --upload-saved still send the lot and let the server decide.
+            print(_lot_needs_key(directory, server, args.server))
+            return
         if not sys.stdin.isatty():
             print(later)
             return
@@ -411,6 +440,9 @@ def _maybe_upload_lot(summary: dict, results: list[dict], directory: Path, args,
         out = upload_lot(summary, results, server, api_key)
     except KeyboardInterrupt:
         print(f"upload interrupted; the lot is saved in {directory}. Retry with: gpucheck --upload-saved {directory}")
+        return
+    if out.needs_key:
+        print(_lot_needs_key(directory, server, args.server))
         return
     if not out.ok:
         print(
@@ -545,6 +577,9 @@ def _main_upload_saved(path_arg: str, args, api_key: str | None) -> int:
             except KeyboardInterrupt:
                 print(UPLOAD_INTERRUPTED)
                 return EXIT_INTERRUPTED
+            if out.needs_key:
+                print(f"gpucheck: {_lot_needs_key(path, server, args.server)}", file=sys.stderr)
+                return EXIT_REFUSED
             if not out.ok:
                 print(f"gpucheck: upload failed ({out.error}); {path} is unchanged", file=sys.stderr)
                 return EXIT_REFUSED

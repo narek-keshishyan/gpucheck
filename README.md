@@ -33,7 +33,7 @@ gpucheck --gpus 0,2      # test only these GPU indices
 gpucheck --gpus all --label "Rack 4"   # name a lot (at most 80 characters)
 gpucheck --gpus all --lot-dir DIR      # where a lot writes its files (default ./gpucheck-lot-<id>)
 gpucheck --include-serial        # also record the card's serial number
-gpucheck --api-key KEY   # send an API key with the upload; prefer the GPUCHECK_API_KEY environment variable
+gpucheck --api-key KEY   # send an account key with the upload (needed to upload a lot); prefer the GPUCHECK_API_KEY environment variable
 gpucheck --upload-saved PATH     # upload a saved result file or lot directory; tests no GPU
 ```
 
@@ -44,6 +44,8 @@ A single-card result is always written locally to `result.json` first, before an
 ### Upload flow
 
 After a run, unless you passed `--offline`, gpucheck asks whether to upload (to `https://gpucheck-api.fly.dev` unless you pass `--server URL`). If you say yes you get a result page URL, a grade such as `Grade B — 94.1% of the median clean reference run for <model> (n=12, low confidence)` (or the reason there is none, for example "insufficient reference (n=X)" while too few comparable runs exist, or "measurements only" for MIG), and a delete token. Save the token: it is the only way to delete the page later.
+
+Running the test, reading the report on your own machine, and uploading a single card are free and need no account. Uploading a lot (every card of a machine in one report, see below) to the gpucheck server needs an account key; write to support@gpucheck.dev to get one.
 
 ```
 curl -X DELETE -H "X-Delete-Token: <token>" <server>/v1/runs/<run_id>
@@ -67,7 +69,27 @@ GPU numbering: PyTorch and NVML must agree on which card is GPU N, or the tool w
 
 `--certify` cannot be used with a lot. A single card (a machine with one GPU and `--gpus all`, or `--gpus N`) is an ordinary single run, unless you pass `--lot-dir` or `--label`: then that one card is written as a lot of one, and `--json` is not used. On a machine with more than one GPU, `--lot-dir` or `--label` needs `--gpus` as well: gpucheck refuses rather than make a labelled lot out of GPU 0 alone.
 
-After a lot, gpucheck asks once whether to upload (or uses `--yes-upload`; with `--dry-run` it prints the request instead). In a non-interactive shell it prints how to upload later with `--upload-saved`. Ctrl-C during the upload stops it and prints the same retry command. Uploading a lot needs a server deployed with lot support; an older server answers 404, the upload is reported as failed, and the lot stays saved for `--upload-saved`.
+The lot is always tested and saved on your machine, with or without an account. Uploading it to the gpucheck server needs an account key, because the public lot report is the paid part of gpucheck; a single card can be uploaded by anyone, so a buyer can re-run the test on one card and compare. To get a key, write to support@gpucheck.dev. Give it to gpucheck in the `GPUCHECK_API_KEY` environment variable:
+
+```
+export GPUCHECK_API_KEY='<your key>'
+gpucheck --gpus all
+```
+
+With a key set, gpucheck asks once after the lot whether to upload (or uses `--yes-upload`; with `--dry-run` it prints the request instead). In a non-interactive shell it prints how to upload later with `--upload-saved`. Ctrl-C during the upload stops it and prints the same retry command.
+
+With no key set, gpucheck does not ask about the gpucheck server: it says that the lot is saved, how to get a key, and the command that uploads the saved lot once the key is set, for example:
+
+```
+Not uploaded: https://gpucheck-api.fly.dev takes a lot only with an account key, and no key was given. (A single card uploads without one.)
+The lot is saved in gpucheck-lot-1a2b3c4d.
+To get a key, write to support@gpucheck.dev.
+Then set the GPUCHECK_API_KEY environment variable to the key and run: gpucheck --upload-saved gpucheck-lot-1a2b3c4d
+```
+
+Nothing has to be tested again. `--yes-upload` and `--upload-saved` send the lot even without a key and print the same message if the server refuses it. With `--server URL` pointing at another server, gpucheck asks as before, since a server you run yourself may accept lots without a key; if that server refuses for want of a key, the message says to ask whoever runs it. A key that the server does not know is reported as "API key was rejected by the server".
+
+Uploading a lot needs a server deployed with lot support; an older server answers 404, the upload is reported as failed, and the lot stays saved for `--upload-saved`.
 
 ## What gets uploaded
 
@@ -81,13 +103,13 @@ All runs for the same card are listed together on a public card history page, wh
 
 A lot is uploaded in one request. The upload tool does not follow HTTP redirects (so an API key can never be forwarded to another host); `--server` must be the final URL, and a redirect is reported as an error.
 
-Result pages are public to anyone with the link, and the server also serves back the full uploaded JSON (every field above, including the sample time series) at `/v1/runs/<run_id>`. The run ID is derived from the content. Without an API key the server returns a delete token (stored only as a hash) for each run that lets you remove that page. A lot upload saves its tokens in the `uploaded` section of `lot.json`, so anyone who has that file can delete those result pages; keep it private.
+Result pages are public to anyone with the link, and the server also serves back the full uploaded JSON (every field above, including the sample time series) at `/v1/runs/<run_id>`. The run ID is derived from the content. Without an API key the server returns a delete token (stored only as a hash) for each run that lets you remove that page. The gpucheck server takes a lot only with an account key, so a lot uploaded there has no delete tokens. A server that accepts a lot without a key returns one token per card, and gpucheck saves them in the `uploaded` section of `lot.json`, so anyone who has that file can delete those result pages; keep it private.
 
-With an API key (`--api-key`, or better the `GPUCHECK_API_KEY` environment variable, since command-line arguments are visible to other users of the machine) the upload is attributed to your account and gets no delete token: the uploader cannot delete it. The key is never written to a file, printed, or put in a URL, and it is only sent over https: with a key set, gpucheck refuses to upload to a plain `http://` server unless the host is `localhost`, `127.0.0.1` or `[::1]`, and treats that as a failed upload (the files are kept). An anonymous upload that comes back without a delete token was already uploaded before, and gpucheck says so.
+With an API key (`--api-key`, or better the `GPUCHECK_API_KEY` environment variable, since command-line arguments are visible to other users of the machine) the upload is attributed to your account, whose name is shown on the public lot page and card history pages, and gets no delete token: the uploader cannot delete it (write to support@gpucheck.dev to have a page removed). A key is optional for a single card and required for a lot on the gpucheck server. The key is never written to a file, printed, or put in a URL, and it is only sent over https: with a key set, gpucheck refuses to upload to a plain `http://` server unless the host is `localhost`, `127.0.0.1` or `[::1]`, and treats that as a failed upload (the files are kept). An anonymous upload that comes back without a delete token was already uploaded before, and gpucheck says so.
 
 ### Uploading later (`--upload-saved`)
 
-`gpucheck --upload-saved PATH` uploads a saved result file or a lot directory without touching a GPU, and without a prompt. It uses `--server`, `--api-key` and `GPUCHECK_API_KEY` as usual, and cannot be combined with flags that run a test (`--gpus`, `--quick`, `--long`, `--label`, `--lot-dir`, `--include-serial`, `--offline`, `--dry-run`, `--certify`). It refuses a lot whose card files were changed after the run, and a single `gpu<N>.json` from a lot (upload its directory instead). A lot that did not finish (its run was killed) is uploaded with a note that the cards not reached are recorded as not tested. After a successful lot upload it records the URLs and delete tokens in `lot.json`; uploading the same lot again does not create duplicates and keeps tokens recorded earlier, and tokens from an upload to a different server are kept under `previous_uploads`. A single result file's delete token is printed, not saved.
+`gpucheck --upload-saved PATH` uploads a saved result file or a lot directory without touching a GPU, and without a prompt. It uses `--server`, `--api-key` and `GPUCHECK_API_KEY` as usual, and cannot be combined with flags that run a test (`--gpus`, `--quick`, `--long`, `--label`, `--lot-dir`, `--include-serial`, `--offline`, `--dry-run`, `--certify`). It refuses a lot whose card files were changed after the run, and a single `gpu<N>.json` from a lot (upload its directory instead). A lot that did not finish (its run was killed) is uploaded with a note that the cards not reached are recorded as not tested. After a successful lot upload it records the URLs and delete tokens in `lot.json`; uploading the same lot again does not create duplicates and keeps tokens recorded earlier, and tokens from an upload to a different server are kept under `previous_uploads`. A single result file's delete token is printed, not saved. If the server refuses a lot because no key was given, gpucheck exits 1, leaves the directory unchanged, and prints how to get a key and the command to run again once `GPUCHECK_API_KEY` is set.
 
 ## Certificates (`--certify`)
 

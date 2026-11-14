@@ -313,3 +313,56 @@ def test_ctrl_c_during_upload_saved_changes_nothing(tmp_path, capsys, monkeypatc
         assert "Traceback" not in c.out + c.err
         assert "upload interrupted; nothing was changed on disk" in c.out + c.err
         assert {p.name: p.read_bytes() for p in path.parent.iterdir() if p.is_file()} == before
+
+
+def test_saved_lot_refused_for_want_of_a_key_says_how_to_get_one(server, tmp_path, capsys):
+    server["status"] = 401
+    d = _offline_lot(tmp_path)
+    before = {p.name: p.read_bytes() for p in d.iterdir()}
+    capsys.readouterr()
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 1
+    c = capsys.readouterr()
+    assert c.out == "" and c.err.rstrip().splitlines() == [
+        f"gpucheck: Not uploaded: {server['url']} takes a lot only with an account key, and no key was given. "
+        "(A single card uploads without one.)",
+        f"The lot is saved in {d}.",
+        f"To get a key, ask whoever runs {server['url']}.",
+        "Then set the GPUCHECK_API_KEY environment variable to the key and run: "
+        f"gpucheck --upload-saved {d} --server {server['url']}",
+    ]
+    assert {p.name: p.read_bytes() for p in d.iterdir()} == before
+
+
+def test_saved_lot_is_sent_to_the_gpucheck_server_even_without_a_key(tmp_path, capsys, monkeypatch):
+    from test_lot_upload import _refuses_without_a_key
+
+    seen = _refuses_without_a_key(monkeypatch)
+    d = _offline_lot(tmp_path)
+    capsys.readouterr()
+    assert main(["--upload-saved", str(d)]) == 1
+    err = capsys.readouterr().err
+    assert len(seen) == 1  # asked for by name, so the server decides
+    assert "write to support@gpucheck.dev" in err and err.rstrip().endswith(f"run: gpucheck --upload-saved {d}")
+
+
+def test_saved_lot_with_a_rejected_key_says_the_key_was_rejected(server, tmp_path, capsys):
+    server["status"] = 401
+    d = _offline_lot(tmp_path)
+    capsys.readouterr()
+    assert main(["--upload-saved", str(d), "--server", server["url"], "--api-key", "gpk_bad"]) == 1
+    err = capsys.readouterr().err
+    assert "API key was rejected by the server" in err and "account key" not in err and "gpk_bad" not in err
+
+
+def test_saved_lot_uploads_once_the_key_is_set(server, tmp_path, capsys, monkeypatch):
+    d = _offline_lot(tmp_path)
+    server["status"] = 401
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 1
+    server["status"] = 200
+    monkeypatch.setenv("GPUCHECK_API_KEY", "gpk_env")
+    capsys.readouterr()
+    assert main(["--upload-saved", str(d), "--server", server["url"]]) == 0
+    c = capsys.readouterr()
+    assert server["requests"][-1][1]["Authorization"] == "Bearer gpk_env"
+    assert "Lot page: https://x.test/l/abc" in c.out and "gpk_env" not in c.out + c.err
+    assert "gpk_env" not in (d / "lot.json").read_text()

@@ -27,6 +27,7 @@ class UploadOutcome:
 
 
 KEY_REJECTED = "API key was rejected by the server"
+LOT_NEEDS_KEY = "the server takes a lot only with an account key, and none was sent"
 
 
 class _Redirected(Exception):
@@ -83,6 +84,12 @@ def _split(server: str) -> tuple[str, str | None] | None:
         return parts.scheme, parts.hostname
     except ValueError:
         return None
+
+
+def server_host(server: str) -> str | None:
+    """The host a server URL names, or None when it has none or is malformed."""
+    split = _split(server)
+    return split[1] if split else None
 
 
 def server_error(server: str) -> str | None:
@@ -195,6 +202,7 @@ class LotUploadOutcome:
     url: str | None
     runs: list[dict]
     error: str | None
+    needs_key: bool = False  # refused because the server wants an account key and none was sent
 
 
 def upload_lot(
@@ -221,4 +229,7 @@ def upload_lot(
         url = body.get("url")
         return LotUploadOutcome(True, url if isinstance(url, str) else None, runs, None)
     except Exception as e:  # noqa: BLE001 - upload must never break the local run
+        if isinstance(e, urllib.error.HTTPError) and e.code == 401 and not api_key:
+            # No key was sent, so none was rejected: the server takes lots only from accounts.
+            return LotUploadOutcome(False, None, [], LOT_NEEDS_KEY, needs_key=True)
         return LotUploadOutcome(False, None, [], _error_text(e, api_key))

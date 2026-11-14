@@ -251,3 +251,123 @@ def test_lot_run_refuses_a_key_over_plain_http(tmp_path, capsys, monkeypatch):
     assert rc == 0 and calls == [] and HTTP_REFUSAL in c.err
     assert f"gpucheck --upload-saved {d}" in c.out and "gpk_secret" not in c.out + c.err
     assert json.loads((d / "lot.json").read_text())["uploaded"] is None
+
+
+# --- a server that takes a lot only with an account key --------------------------------------
+
+REJECTED = "API key was rejected by the server"
+
+
+def _refuses_without_a_key(monkeypatch):
+    """Stand in for the gpucheck server: every request is answered 401. Returns the requests seen."""
+    import urllib.error
+
+    seen = []
+
+    def refuse(req, timeout):
+        seen.append(req)
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("gpucheck.upload._open", refuse)
+    return seen
+
+
+def _terminal(monkeypatch, answer=None):
+    """A terminal on stdin. Returns the prompts shown; with no answer, being asked fails the test."""
+    asked = []
+
+    def ask(prompt=""):
+        asked.append(prompt)
+        if answer is None:
+            pytest.fail("asked whether to upload")
+        return answer
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", ask)
+    return asked
+
+
+def test_lot_refused_for_want_of_a_key_says_how_to_get_one(server, tmp_path, capsys):
+    server["status"] = 401
+    rc, d = run_lot(tmp_path, server, "healthy,healthy")
+    out = capsys.readouterr().out
+    assert rc == 0 and len(server["requests"]) == 1
+    assert out.rstrip().splitlines()[-4:] == [
+        f"Not uploaded: {server['url']} takes a lot only with an account key, and no key was given. "
+        "(A single card uploads without one.)",
+        f"The lot is saved in {d}.",
+        f"To get a key, ask whoever runs {server['url']}.",
+        "Then set the GPUCHECK_API_KEY environment variable to the key and run: "
+        f"gpucheck --upload-saved {d} --server {server['url']}",
+    ]
+    assert REJECTED not in out and "upload failed" not in out
+    assert json.loads((d / "lot.json").read_text())["uploaded"] is None
+
+
+def test_refusal_by_the_gpucheck_server_names_the_support_address(tmp_path, capsys, monkeypatch):
+    seen = _refuses_without_a_key(monkeypatch)
+    d = tmp_path / "lot"
+    rc = main(["--fake", "healthy,healthy", "--quick", "--lot-dir", str(d), "--yes-upload"])
+    lines = capsys.readouterr().out.rstrip().splitlines()
+    assert rc == 0 and len(seen) == 1 and seen[0].get_header("Authorization") is None
+    assert lines[-2] == "To get a key, write to support@gpucheck.dev."
+    assert lines[-1].endswith(f"run: gpucheck --upload-saved {d}")  # the default server needs no --server
+
+
+def test_the_public_name_of_the_gpucheck_server_is_recognised(tmp_path, capsys, monkeypatch):
+    _refuses_without_a_key(monkeypatch)
+    d = tmp_path / "lot"
+    main(["--fake", "healthy,healthy", "--quick", "--lot-dir", str(d), "--yes-upload",
+          "--server", "https://api.gpucheck.dev"])
+    lines = capsys.readouterr().out.rstrip().splitlines()
+    assert lines[-2] == "To get a key, write to support@gpucheck.dev."
+    assert lines[-1].endswith(f"gpucheck --upload-saved {d} --server https://api.gpucheck.dev")
+
+
+@pytest.mark.parametrize("tty", [True, False])
+def test_no_key_for_the_gpucheck_server_is_explained_without_asking_or_sending(tmp_path, capsys, monkeypatch, tty):
+    calls = _no_network(monkeypatch)
+    if tty:
+        _terminal(monkeypatch)
+    d = tmp_path / "lot"
+    rc = main(["--fake", "healthy,healthy", "--quick", "--lot-dir", str(d)])
+    out = capsys.readouterr().out
+    assert rc == 0 and calls == []
+    assert "takes a lot only with an account key" in out and "support@gpucheck.dev" in out
+    assert out.rstrip().endswith(f"run: gpucheck --upload-saved {d}")
+    assert json.loads((d / "lot.json").read_text())["uploaded"] is None
+
+
+def test_with_a_key_the_gpucheck_server_upload_is_still_asked_about(tmp_path, capsys, monkeypatch):
+    calls = _no_network(monkeypatch)
+    asked = _terminal(monkeypatch, answer="n")
+    main(["--fake", "healthy,healthy", "--quick", "--lot-dir", str(tmp_path / "lot"), "--api-key", "gpk_secret"])
+    c = capsys.readouterr()
+    assert len(asked) == 1 and "Upload this lot" in asked[0] and calls == []
+    assert "account key" not in c.out and "gpk_secret" not in c.out + c.err
+
+
+def test_another_server_is_still_asked_about_without_a_key(server, tmp_path, capsys, monkeypatch):
+    asked = _terminal(monkeypatch, answer="y")
+    d = tmp_path / "lot"
+    main(["--fake", "healthy,healthy", "--quick", "--lot-dir", str(d), "--server", server["url"]])
+    assert len(asked) == 1 and len(server["requests"]) == 1  # a server that takes anonymous lots keeps working
+    assert json.loads((d / "lot.json").read_text())["uploaded"]["url"] == "https://x.test/l/abc"
+
+
+def test_retry_command_quotes_a_directory_with_a_space(server, tmp_path, capsys):
+    server["status"] = 401
+    d = tmp_path / "rack 4"
+    main(["--fake", "healthy,healthy", "--quick", "--lot-dir", str(d), "--yes-upload", "--server", server["url"]])
+    assert f"gpucheck --upload-saved '{d}' --server {server['url']}" in capsys.readouterr().out
+
+
+def test_a_rejected_key_is_not_mistaken_for_a_missing_one(server):
+    from gpucheck.upload import upload_lot
+
+    server["status"] = 401
+    summary = {"lot_id": "ab" * 16, "label": None, "size": 0, "cards": []}
+    sent = upload_lot(summary, [], server["url"], api_key="gpk_bad")
+    assert not sent.ok and not sent.needs_key and sent.error == REJECTED
+    none = upload_lot(summary, [], server["url"])
+    assert not none.ok and none.needs_key and REJECTED not in none.error
