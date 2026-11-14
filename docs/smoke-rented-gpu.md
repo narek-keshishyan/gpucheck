@@ -115,7 +115,7 @@ This section was first run on real hardware on 2026-11-12 (four RTX 3090s). Run 
 
 ## Extra checks
 
-Not yet run on real hardware. This section is the gate for `--driver-errors`, `--answer-check`, `--memtest`, `--links`, `--burn-in`, `--together` and `--thorough`: none of them should be described as working until it has been run. They were developed on a machine with no NVIDIA GPU and no PyTorch, against simulated cards and a small stand-in for PyTorch, so the first real run is also the first time real PyTorch and a real driver see this code. Earlier real runs found bugs that tests with fakes had missed; expect some here.
+Not yet run on real hardware. This section is the gate for `--driver-errors`, `--answer-check`, `--memtest`, `--links`, `--burn-in`, `--together` and `--thorough`: none of them should be described as working until it has been run. They were developed on a machine with no NVIDIA GPU, against simulated cards and a small stand-in for PyTorch. On 14 November 2026 the answer check and the memory test were run against real PyTorch 2.15.0 on that machine's CPU (`python -m gpucheck.deepchecks --device cpu`, and each full-size case once): every call was accepted, no product was wrong and no word differed. So the first rented run is the first time a real GPU, its multiply routines and a real driver see this code, and the first time the driver error log, the NVLink readings, the card-to-card copy and the all-at-once mode run on anything real. Earlier real runs found bugs that tests with fakes had missed; expect some here.
 
 Nobody rents a machine without the owner's go-ahead. The proposal, its cost and what each step is for:
 
