@@ -116,6 +116,17 @@ class Tensor:
     def __sub__(self, other):
         return self._zip(other, lambda a, b: a - b)
 
+    def __lshift__(self, bits):
+        def shift(a):  # wraps like a signed 64-bit integer, as torch's int64 does
+            v = (a << bits) & 0xFFFFFFFFFFFFFFFF
+            return v - (1 << 64) if v >> 63 else v
+
+        return self._like([shift(a) for a in self.data])
+
+    def __ixor__(self, other):
+        self.data = [a ^ b for a, b in zip(self.data, other.data)]
+        return self
+
     def __neg__(self):
         return self._like([-a for a in self.data])
 

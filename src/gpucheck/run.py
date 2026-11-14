@@ -264,8 +264,10 @@ def execute_run(
         status, reason, aborted = RAN, None, None
         ecc: list[int] = []
         temps: list[float] = []
+        started = False
         try:
             check.start()
+            started = True
             while check.step():
                 s = take()
                 if s.ecc_volatile is not None:
@@ -284,7 +286,9 @@ def execute_run(
         except CheckUnavailable as e:
             status, reason = UNAVAILABLE, " ".join(str(e).split())[:200]
         except Exception as e:  # a check that breaks must not lose the run that came before it
-            status, reason = UNAVAILABLE, one_line(e)
+            # Once it had started, what it had already counted is kept: an error partway (a CUDA
+            # fault, say) must never turn mismatches already found into "the check did not run".
+            status, reason = (PARTIAL if started else UNAVAILABLE), one_line(e)
         finally:
             try:
                 check.stop()

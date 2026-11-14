@@ -199,23 +199,38 @@ class NvmlEventLog:
         if not mask:
             raise EventLogUnavailable("the driver reports no error events for this card")
         self._set = None
+        self._pending: list[dict] = []
         try:
             self._set = nv.nvmlEventSetCreate()
             nv.nvmlDeviceRegisterEvents(handle, mask, self._set)
         except Exception as exc:
             self.close()
             raise EventLogUnavailable(f"the driver refused to register for error events ({exc})") from exc
+        try:
+            # One wait now: a driver library too old to have this call fails here, where it can
+            # be reported as "not available", not at the first sample as a log that broke.
+            self._pending = self._waiting(1)
+        except Exception as exc:
+            self.close()
+            raise EventLogUnavailable(f"the driver cannot be asked for error events ({exc})") from exc
 
     def _timed_out(self, exc: Exception) -> bool:
         timeout = _const(self._nv, "NVML_ERROR_TIMEOUT", default=_NVML_ERROR_TIMEOUT)
         return getattr(exc, "value", None) == timeout
 
     def poll(self) -> list[dict]:
-        """The events reported since the last poll, oldest first. Raises if the log stops working."""
-        out: list[dict] = []
+        """The events reported since the last poll, oldest first. Raises if the log stops working.
+
+        NVML reports the most recent Xid number for every Xid event that was waiting, so when
+        several arrive between two polls their count is right but their numbers may repeat."""
         if self._set is None:
-            return out
-        for _ in range(MAX_EVENTS_PER_POLL):
+            return []
+        out, self._pending = self._pending, []
+        return out + self._waiting(MAX_EVENTS_PER_POLL - len(out))
+
+    def _waiting(self, limit: int) -> list[dict]:
+        out: list[dict] = []
+        for _ in range(limit):
             try:
                 data = self._nv.nvmlEventSetWait_v2(self._set, EVENT_WAIT_MS)
             except Exception as exc:
@@ -257,7 +272,8 @@ _NVLINK_DATA_FIELDS = (
     ("tx_kib", "NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX", 138),
     ("rx_kib", "NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX", 139),
 )
-_ALL_LINKS = 0xFFFFFFFF  # scope id meaning "summed over every link"
+_NVLINK_COUNT_FIELD = (("count", "NVML_FI_DEV_NVLINK_LINK_COUNT", 91),)
+_ALL_LINKS = 0xFFFFFFFF  # scope id meaning "summed over every link" (documented for the data counters)
 _MAX_NVLINKS = 36
 # nvmlFieldValue_t.valueType -> the union member holding the value
 _FIELD_MEMBERS = {0: "dVal", 1: "uiVal", 2: "ulVal", 3: "ullVal", 4: "sllVal", 5: "siVal", 6: "usVal"}
@@ -379,10 +395,10 @@ class NvmlAdapter(TelemetryAdapter):
         """Start listening for hardware error events on this card; EventLogUnavailable if it cannot."""
         return NvmlEventLog(self._nv, self._h)
 
-    def _fields(self, wanted: tuple) -> dict[str, int]:
-        """NVML field values by name, for the ones the card answers; scope "every link"."""
+    def _fields(self, wanted: tuple, scope: int = 0) -> dict[str, int]:
+        """NVML field values by name, for the ones the card answers."""
         nv = self._nv
-        ids = [(_const(nv, name, default=abi), _ALL_LINKS) for _, name, abi in wanted]
+        ids = [(_const(nv, name, default=abi), scope) for _, name, abi in wanted]
         values = self._q("nvmlDeviceGetFieldValues", self._h, ids)
         out: dict[str, int] = {}
         if values is None:
@@ -400,7 +416,13 @@ class NvmlAdapter(TelemetryAdapter):
         "tx_kib": n, "rx_kib": n}; a value the driver does not report is absent."""
         nv, h = self._nv, self._h
         links = []
-        for i in range(min(_const(nv, "NVML_NVLINK_MAX_LINKS", default=_MAX_NVLINKS), _MAX_NVLINKS)):
+        limit = min(_const(nv, "NVML_NVLINK_MAX_LINKS", default=_MAX_NVLINKS), _MAX_NVLINKS)
+        # Where the card says how many links it has, look no further: a driver that answers
+        # "inactive" for a link that does not exist would otherwise inflate the count.
+        count = self._fields(_NVLINK_COUNT_FIELD).get("count")
+        if count is not None:
+            limit = min(limit, count)
+        for i in range(limit):
             state = self._q("nvmlDeviceGetNvLinkState", h, i)
             if state is None:
                 continue  # no such link on this card
@@ -412,7 +434,11 @@ class NvmlAdapter(TelemetryAdapter):
             links.append({"link": i, "active": bool(_int(state)), "errors": errors})
         if not links:
             return None
-        return {"links": links, "error_totals": self._fields(_NVLINK_TOTAL_FIELDS), **self._fields(_NVLINK_DATA_FIELDS)}
+        return {
+            "links": links,
+            "error_totals": self._fields(_NVLINK_TOTAL_FIELDS),
+            **self._fields(_NVLINK_DATA_FIELDS, _ALL_LINKS),
+        }
 
     def nvlink_peer(self, other) -> bool | None:
         """Whether NVML reports NVLink peer-to-peer access between this card and `other`'s; None if unknown."""

@@ -50,6 +50,7 @@ EVENT_KINDS = {
     "gpu_recovery": "GPU recovery action",
 }
 NVLINK_COUNTERS = ("replay", "recovery", "crc_flit", "crc_data")
+ANSWER_FORMATS = ("float32", "float16", "bfloat16", "float64")  # the answer check's number formats
 _COUNTER_WORDS = {"replay": "replay", "recovery": "recovery", "crc_flit": "CRC (flit)", "crc_data": "CRC (data)"}
 MAX_EVENTS_SHOWN = 6
 GIB = 1 << 30
@@ -134,7 +135,9 @@ def answer_facts(result: Any) -> dict | None:
     if not products:
         return None
     wrong = count(c.get("wrong_products"))
-    return {"complete": c["status"] == RAN, "products": products,
+    skipped = c.get("skipped")
+    skipped = [name for name in ANSWER_FORMATS if name in skipped] if isinstance(skipped, list) else []
+    return {"complete": c["status"] == RAN, "products": products, "skipped": skipped,
             "wrong": wrong if wrong is not None and wrong <= products else None}
 
 
@@ -371,7 +374,8 @@ def check_lines(result: Any) -> list[tuple[str, str]]:
             else:
                 outcome = f"{a['wrong']} wrong"
             early = "" if a["complete"] else "; it stopped before finishing"
-            text = f"compared {_plural(a['products'], 'computed product')} with known results: {outcome}{early}"
+            unused = f"; not used, because the card could not multiply them: {', '.join(a['skipped'])}" if a["skipped"] else ""
+            text = f"compared {_plural(a['products'], 'computed product')} with known results: {outcome}{early}{unused}"
         out.append((CHECK_LABELS["answer"], text))
 
     b = check(result, "burn_in")

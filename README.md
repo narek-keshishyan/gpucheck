@@ -117,17 +117,17 @@ A plain `gpucheck` run is exactly what it was before these existed: the same bas
 
 ### Driver error log (`--driver-errors`)
 
-gpucheck registers with the driver, through NVML's event functions, as a listener for error events on the card it is testing, and collects what arrives at every sample. Registering changes no GPU setting. Each event is recorded with the phase it arrived in (baseline, load, or the checks after the load) and, for an Xid, its number. Any event is a `DRIVER_ERRORS` finding. Xid numbers are NVIDIA's driver error codes; NVIDIA publishes what each means.
+gpucheck registers with the driver, through NVML's event functions, as a listener for error events on the card it is testing, and collects what arrives at every sample. Registering changes no GPU setting. Each event is recorded with the phase it arrived in (baseline, load, or the checks after the load) and, for an Xid, its number. Any event is a `DRIVER_ERRORS` finding. Xid numbers are NVIDIA's driver error codes; NVIDIA publishes what each means. When several Xid events arrive within the same second, the driver reports the most recent number for all of them, so their count is right but a number may be repeated in place of another.
 
 ### Answer check (`--answer-check`)
 
-The operands are built from a Hadamard matrix, whose rows are all at right angles to each other. With its rows shuffled and scaled by signed powers of two, the product of one such matrix with the transpose of another has exactly one known non-zero entry in each row and zeros everywhere else. The expected result is written down from the shuffles; nothing is compared with a second computation on the same card. Every case is built so that it is exact in its own number format whatever order the card adds the terms in, so a card that works cannot be reported as wrong for rounding. A product with any entry that differs is counted, and any wrong product is a `WRONG_ANSWERS` finding. A number format the card cannot multiply is skipped and listed, not counted as wrong.
+The operands are built from a Hadamard matrix, whose rows are all at right angles to each other. With its rows shuffled and scaled by signed powers of two, the product of one such matrix with the transpose of another has exactly one known non-zero entry in each row and zeros everywhere else. The expected result is written down from the shuffles; nothing is compared with a second computation on the same card. Every case is built so that it is exact in its own number format whatever order the card adds the terms in, so a card that works cannot be reported as wrong for rounding. A product with any entry that differs is counted, and any wrong product is a `WRONG_ANSWERS` finding. A number format the card cannot multiply at all is skipped and named in the report, not counted as wrong. If a format that had been working then fails with an error, the check stops there: the products already counted, wrong ones included, are kept, and the check is reported as stopped early.
 
 A result that ran this check says so in these words and no stronger ones: it can catch some silent data corruption and cannot rule it out.
 
 ### Memory test (`--memtest`)
 
-It runs as its own phase after the load and the answer check, once the load has freed its buffers, and frees its own memory when it ends, so it never holds memory the load needs. Every pattern is written to the whole tested area before any of it is read back. The card keeps being sampled between slices of work, so the temperature limit still stops the run. Any word that differs is a `MEMTEST_MISMATCH` finding.
+It runs as its own phase after the load and the answer check, once the load has freed its buffers, and frees its own memory when it ends, so it never holds memory the load needs. Every pattern is written to the whole tested area before any of it is read back. The card keeps being sampled between slices of work, so the temperature limit still stops the run. Any word that differs is a `MEMTEST_MISMATCH` finding. If the test is cut short by an error or the temperature limit, the mismatches counted up to then are still reported, with a `CHECK_NOT_RUN` finding saying it did not finish.
 
 ### Burn-in (`--burn-in HOURS`)
 
@@ -146,7 +146,7 @@ It runs as its own phase after the load and the answer check, once the load has 
 
 A card loaded alongside others shares the machine's power supply and cooling with them, so its result is marked as measured together (`checks.together`, and `preflight.mode` is `measurements_only` with the reason). It is not graded and is never used as a reference. For grades, run the ordinary lot (one card after another) as well. If only one card ends up being loaded, because the others were refused, its run is an ordinary one.
 
-Ctrl-C stops every card at its next sample, keeps what each measured as a run that was stopped early, uploads nothing and exits 130. A second Ctrl-C quits without keeping anything. Unlike the one-after-another lot, the card files are written when all cards have finished, not one by one.
+Ctrl-C stops every card at its next sample, keeps what each measured as a run that was stopped early, uploads nothing and exits 130. A card that was still waiting for the others to finish idling is recorded as not tested, and its load is never started. A card that does not stop within a minute (a driver call that hangs) is recorded as not tested and the others are written. A second Ctrl-C quits without keeping anything. Cards that are ready wait up to two minutes for one that is not, then start without it. Unlike the one-after-another lot, the card files are written when all cards have finished, not one by one.
 
 All loads run in one process, one thread per card. Whether that costs throughput compared with a card tested alone has not been measured.
 

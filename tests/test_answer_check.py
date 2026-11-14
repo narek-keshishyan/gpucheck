@@ -223,3 +223,33 @@ def test_self_test_runs_both_checks_and_reports_what_they_found(torch, capsys, m
     torch.faults.append(lambda result: result.data.__setitem__(0, 12345))
     assert deepchecks.self_test(seconds=0.0) == 1
     assert "self-test: see above" in capsys.readouterr().out
+
+
+def test_an_error_after_a_format_had_worked_keeps_every_wrong_product_already_counted(torch):
+    real, calls = minitorch.Tensor.__matmul__, []
+
+    def matmul(self, other):
+        calls.append(1)
+        if len(calls) == 6:  # the second float16 product: the card, not the format, is failing
+            raise RuntimeError("CUDA error: uncorrectable ECC error encountered")
+        out = real(self, other)
+        if self.dtype == "float16":
+            out.data[0] += 1  # and float16 had been returning wrong numbers
+        return out
+
+    minitorch.Tensor.__matmul__ = matmul
+    try:
+        c = check()
+        r = execute_run(make_fake("healthy"), NullLoad(), RunConfig(5, 20), None,
+                        clock=lambda: 0.0, sleep=lambda s: None, checks=[c])
+    finally:
+        minitorch.Tensor.__matmul__ = real
+    out = r.checks["answer"]
+    assert out["status"] == "partial" and "uncorrectable ECC" in out["reason"]
+    assert out["products"] == 5 and out["wrong_products"] == 1 and out["skipped"] == []
+
+    from gpucheck.diagnose import diagnose
+    from gpucheck.metrics import derive
+
+    codes = [f.code for f in diagnose(derive(r, None), r.preflight, r.inventory, None, r.checks)]
+    assert codes == ["WRONG_ANSWERS", "CHECK_NOT_RUN"]  # the fault is reported, and so is the early stop

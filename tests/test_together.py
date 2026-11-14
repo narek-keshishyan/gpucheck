@@ -194,14 +194,14 @@ def _interrupt_when_blocked(monkeypatch, at):
     monkeypatch.setattr(cli, "make_fakes", lambda s: cards)
     real, calls = cli._join, []
 
-    def join(threads):
+    def join(threads, timeout_s=None):
         calls.append(1)
         if len(calls) == 1:
             for _ in cards:
                 reached.acquire(timeout=10)  # every card is now waiting at the same sample
             raise KeyboardInterrupt
         go.set()
-        real(threads)
+        real(threads, timeout_s)
 
     monkeypatch.setattr(cli, "_join", join)
 
@@ -225,7 +225,7 @@ def test_ctrl_c_before_any_load_leaves_the_cards_not_tested(tmp_path, monkeypatc
 
 
 def test_a_second_ctrl_c_keeps_nothing_and_still_writes_the_summary(tmp_path, monkeypatch):
-    def join(threads):
+    def join(threads, timeout_s=None):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(cli, "_join", join)
@@ -251,3 +251,95 @@ def test_start_gate_opens_when_everyone_has_arrived_or_withdrawn():
     for t in threads:
         t.join(5)
     assert sorted(passed) == [0, 1] and gate.arrived == 2
+
+
+def test_ctrl_c_while_cards_wait_to_start_does_not_start_any_load(tmp_path, monkeypatch):
+    cards, log = _instrument(monkeypatch, "healthy,healthy")
+    waiting, go = threading.Event(), threading.Event()
+    real_sample = cards[1].sample
+
+    def slow_baseline():  # card 1 is still idling while card 0 waits at the gate
+        if cards[1].samples == 20:
+            waiting.set()
+            go.wait(10)
+        return real_sample()
+
+    cards[1].sample = slow_baseline
+    real, calls = cli._join, []
+
+    def join(threads, timeout_s=None):
+        calls.append(1)
+        if len(calls) == 1:
+            waiting.wait(10)
+            while cards[0].samples < 31:  # card 0 has finished its baseline and is at the gate
+                pass
+            raise KeyboardInterrupt
+        go.set()
+        real(threads, timeout_s)
+
+    monkeypatch.setattr(cli, "_join", join)
+    rc, summary, results = together(tmp_path, "healthy,healthy")
+    assert rc == 130 and results == {} and [e for e in log if e[0] == "start"] == []
+    assert [(c["outcome"], c["reason"]) for c in summary["cards"]] == [("not_tested", "interrupted")] * 2
+
+
+def test_a_card_whose_load_fails_to_start_is_not_counted_as_loaded_together(tmp_path, monkeypatch):
+    cards, log = _instrument(monkeypatch, "healthy,healthy,healthy")
+    real = cli._make_load
+
+    class NoStart(NullLoad):
+        def start(self):
+            raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(cli, "_make_load", lambda args, challenge=None, device_index=0:
+                        NoStart() if device_index == 1 else real(args, challenge, device_index))
+    rc, summary, results = together(tmp_path, "healthy,healthy,healthy")
+    assert [c["outcome"] for c in summary["cards"]] == ["tested", "not_tested", "tested"]
+    assert [r["checks"]["together"] for r in results.values()] == [{"cards": 2}, {"cards": 2}]
+
+
+def test_a_card_that_never_stops_does_not_lose_what_the_others_measured(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "STOP_WAIT_S", 0.3)
+    cards = make_fakes("healthy,healthy")
+    hung, release = threading.Event(), threading.Event()
+    real_sample = cards[1].sample
+    seen = [0]
+
+    def hangs():  # a driver call that never returns, 20 samples into the load
+        seen[0] += 1
+        if seen[0] == 51:
+            hung.set()
+            release.wait(30)
+        return real_sample()
+
+    cards[1].sample = hangs
+    monkeypatch.setattr(cli, "make_fakes", lambda s: cards)
+    real, calls = cli._join, []
+
+    def join(threads, timeout_s=None):
+        calls.append(1)
+        if len(calls) == 1:
+            hung.wait(10)
+            while threads[0].is_alive():  # card 0 runs to its end
+                threads[0].join(0.05)
+            raise KeyboardInterrupt
+        real(threads, timeout_s)
+
+    monkeypatch.setattr(cli, "_join", join)
+    try:
+        rc, summary, results = together(tmp_path, "healthy,healthy")
+    finally:
+        release.set()
+    assert rc == 130 and sorted(results) == [0]
+    assert [(c["outcome"], c["reason"]) for c in summary["cards"]] == [
+        ("tested", None), ("not_tested", "did not stop after the interrupt")]
+    assert len(results[0]["samples"]["load"]) == 150
+    # It ran alongside the card that hung, so it is still marked and can never be a reference.
+    assert results[0]["checks"]["together"] == {"cards": 2} and results[0]["preflight"]["mode"] == "measurements_only"
+
+
+def test_cards_that_are_ready_do_not_wait_for_ever_for_one_that_is_not():
+    gate = cli._StartGate(2, wait_s=0.2)
+    t0 = cli.time.monotonic()
+    gate.arrive()  # the other card never arrives and never withdraws
+    assert 0.15 < cli.time.monotonic() - t0 < 5 and gate.arrived == 1

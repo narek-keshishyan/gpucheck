@@ -142,7 +142,12 @@ class TorchMemtest:
         if name == "address":
             base = c_i << 40
             return t.arange(base + a, base + b, dtype=t.int64, device=self._device)
-        return t.empty(b - a, dtype=t.int64, device=self._device).random_(generator=self._generator(c_i, k))
+        # random_() fills 63 bits (never the top one). Folding in a copy shifted left by one bit
+        # makes every one of the 64 bits vary.
+        drawn = t.empty(b - a, dtype=t.int64, device=self._device).random_(generator=self._generator(c_i, k))
+        mixed = drawn << 1
+        mixed ^= drawn
+        return mixed
 
     def _write(self, name: str, value: int | None, c_i: int, chunk) -> None:
         if value is not None:
@@ -304,7 +309,6 @@ class TorchAnswerCheck:
     def _skip(self, case) -> None:
         self._cases.remove(case)
         self._base.pop(case, None)
-        self._counts.pop(case, None)
         if case[0] not in self._skipped:
             self._skipped.append(case[0])
 
@@ -345,8 +349,13 @@ class TorchAnswerCheck:
             case = self._cases[self._i % len(self._cases)]
             try:
                 wrong = self._product(case)
-            except RuntimeError as e:  # this format's product is not supported here: not a wrong answer
-                self._skip(case)
+            except RuntimeError as e:
+                if self._counts[case][0]:
+                    # This format multiplied before, so this is the card or the driver failing, not
+                    # an unsupported format. The run records the check as stopped early and keeps
+                    # every product counted so far.
+                    raise
+                self._skip(case)  # never multiplied here: unsupported, which is not a wrong answer
                 if not self._cases:
                     # Nothing left to compare. Say the check did not run, never that nothing was wrong.
                     raise CheckUnavailable(f"every number format failed to multiply ({e})") from e
@@ -383,6 +392,7 @@ class TorchAnswerCheck:
                 {"dtype": name, "n": n, "products": self._counts[(name, n, w)][0],
                  "wrong_products": self._counts[(name, n, w)][1]}
                 for name, n, w in self._counts
+                if self._counts[(name, n, w)][0]
             ],
             "skipped": list(self._skipped),
         }

@@ -186,15 +186,28 @@ def test_a_check_that_cannot_run_is_recorded_and_the_next_one_still_runs():
     assert r.checks["answer"]["status"] == "ran" and a.stopped and b.stopped and r.aborted is None
 
 
-def test_a_check_that_crashes_is_recorded_as_not_run_and_keeps_the_run():
+def test_a_check_that_crashes_keeps_the_run_and_what_it_had_already_found():
     class Crashing(FakeCheck):
         def step(self):
-            raise RuntimeError("CUDA error: device-side assert")
+            if self._left == 1:
+                raise RuntimeError("CUDA error: device-side assert")
+            return super().step()
 
-    c = Crashing("memtest", {})
+    c = Crashing("memtest", {"mismatched_words": 7, "bytes_tested": 1 << 30})
     r = run(make_fake("healthy"), checks=[c])
-    assert r.checks["memtest"] == {"status": "unavailable", "reason": "RuntimeError: CUDA error: device-side assert"}
+    out = r.checks["memtest"]
+    assert out["status"] == "partial" and out["reason"] == "RuntimeError: CUDA error: device-side assert"
+    assert out["mismatched_words"] == 7 and out["ecc_delta"] == 0  # not turned into "did not run"
     assert c.stopped and len(r.load) == 100 and r.aborted is None
+
+
+def test_a_check_that_cannot_even_start_is_not_run():
+    class NoStart(FakeCheck):
+        def start(self):
+            raise RuntimeError("CUDA out of memory")
+
+    r = run(make_fake("healthy"), checks=[NoStart("memtest", {"mismatched_words": 7})])
+    assert r.checks["memtest"] == {"status": "unavailable", "reason": "RuntimeError: CUDA out of memory"}
 
 
 def test_a_check_whose_cleanup_fails_warns_and_keeps_its_result(capsys):

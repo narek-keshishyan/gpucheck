@@ -168,3 +168,11 @@ def test_in_a_run_the_memory_test_is_its_own_phase_after_the_load():
     out = r.checks["memtest"]
     assert out["status"] == "ran" and out["bytes_tested"] == 4096 and out["mismatched_words"] == 0
     assert m._chunks == [] and len(r.load) == 20
+
+
+def test_the_random_pattern_uses_all_64_bits():
+    m = memtest()
+    m.start()
+    words = m._expected("random", 0, 0, 0, 50).data
+    assert any(w < 0 for w in words) and any(w >= 0 for w in words)  # the top bit varies too
+    assert all(-(1 << 63) <= w < (1 << 63) for w in words)

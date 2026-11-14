@@ -58,7 +58,8 @@ def adapter(monkeypatch, nv):
 def test_registers_only_for_error_events_the_card_supports(monkeypatch):
     nv = with_events([])
     adapter(monkeypatch, nv).open_event_log()
-    assert nv.calls == ["create", ("register", "h", XID | DBE, "set")]  # never power-state or clock events
+    # never power-state or clock events; then one wait, to see that the driver can be asked at all
+    assert nv.calls == ["create", ("register", "h", XID | DBE, "set"), ("wait", 1)]
 
 
 def test_poll_returns_the_events_waiting_and_stops_at_the_timeout(monkeypatch):
@@ -76,9 +77,23 @@ def test_poll_never_drains_more_than_64_events_at_once(monkeypatch):
 
 
 def test_an_error_other_than_a_timeout_is_raised(monkeypatch):
-    log = adapter(monkeypatch, with_events([Lost("GPU is lost")])).open_event_log()
+    queue = []
+    log = adapter(monkeypatch, with_events(queue)).open_event_log()
+    queue.append(Lost("GPU is lost"))
     with pytest.raises(Lost):
         log.poll()
+
+
+def test_a_driver_that_cannot_be_asked_for_events_is_unavailable_from_the_start(monkeypatch):
+    nv = with_events([Lost("Function Not Found")])  # an old driver library without this call
+    with pytest.raises(EventLogUnavailable, match="cannot be asked for error events"):
+        adapter(monkeypatch, nv).open_event_log()
+    assert nv.calls[-1] == "free"
+
+
+def test_an_event_that_arrives_while_the_log_is_opened_is_not_lost(monkeypatch):
+    log = adapter(monkeypatch, with_events([(XID, 79), (XID, 48)])).open_event_log()
+    assert log.poll() == [{"kind": "xid", "xid": 79}, {"kind": "xid", "xid": 48}]
 
 
 def test_close_frees_the_event_set_once(monkeypatch):
@@ -162,10 +177,12 @@ def with_nvlink(states, counters=None, fields=None):
             raise RuntimeError("Not Supported")
         return counters[(i, which)]
 
+    nv.scopes = {}
+
     def field_values(h, ids):
         out = []
         for field_id, scope in ids:
-            assert scope == 0xFFFFFFFF
+            nv.scopes[field_id] = scope
             ok = fields is not None and field_id in fields
             out.append(types.SimpleNamespace(
                 nvmlReturn=0 if ok else 3, valueType=3,
@@ -200,6 +217,18 @@ def test_card_wide_totals_and_data_counters_come_from_field_values(monkeypatch):
     assert snap["error_totals"] == {"replay": 4, "recovery": 1, "crc_flit": 0, "crc_data": 0}
     assert snap["tx_kib"] == 1000 and snap["rx_kib"] == 2000
     assert snap["links"] == [{"link": 0, "active": True, "errors": {}}]
+    # "every link" is a scope NVML documents for the data counters only; the totals take none.
+    assert nv.scopes[138] == nv.scopes[139] == 0xFFFFFFFF
+    assert nv.scopes[52] == nv.scopes[59] == nv.scopes[38] == nv.scopes[45] == nv.scopes[91] == 0
+
+
+def test_the_card_s_own_link_count_bounds_the_links_that_are_read(monkeypatch):
+    # A driver that answers "inactive" for links that do not exist must not inflate the count.
+    nv = with_nvlink({i: (1 if i < 4 else 0) for i in range(36)}, fields={91: 4})
+    snap = adapter(monkeypatch, nv).nvlink()
+    assert [link["link"] for link in snap["links"]] == [0, 1, 2, 3]
+    unbounded = adapter(monkeypatch, with_nvlink({i: (1 if i < 4 else 0) for i in range(6)})).nvlink()
+    assert len(unbounded["links"]) == 6  # no count reported: every link that answers is listed
 
 
 def test_nvlink_peer_asks_nvml_for_nvlink_p2p_between_the_two_cards(monkeypatch):

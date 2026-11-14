@@ -439,23 +439,38 @@ def _run_card(
     return outcome(run.inventory, TESTED, None, result)
 
 
+GATE_WAIT_S = 120.0  # how long cards that are ready wait for one that is not, before starting without it
+STOP_WAIT_S = 60.0  # how long an interrupted lot waits for its cards to stop before writing what it has
+
+
 class _StartGate:
     """Holds every card at the end of its idle baseline until all of them are there, so the loads
     start at the same moment. A card that will never get there (refused, unreadable, failed)
-    withdraws, so the others are not kept waiting."""
+    withdraws, so the others are not kept waiting; one that neither arrives nor withdraws (a
+    driver call that hangs) is waited for GATE_WAIT_S and then left behind."""
 
-    def __init__(self, expected: int) -> None:
+    def __init__(self, expected: int, wait_s: float = GATE_WAIT_S) -> None:
         self._cond = threading.Condition()
         self._expected = expected
+        self._wait_s = wait_s
         self._open = False
-        self.arrived = 0  # cards whose load started together
+        self.arrived = 0
+        self.loaded = 0  # cards whose load really started
+
+    def note_loaded(self) -> None:
+        with self._cond:
+            self.loaded += 1
 
     def arrive(self) -> None:
         with self._cond:
             self.arrived += 1
             self._cond.notify_all()
+            deadline = time.monotonic() + self._wait_s
             while not self._open and self.arrived < self._expected:
-                self._cond.wait()
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._cond.wait(left)
             self._open = True
             self._cond.notify_all()
 
@@ -483,6 +498,28 @@ class _Measured:
     reached_load: bool
 
 
+class _CountedLoad:
+    """A card's load in an all-at-once lot: tells the gate when it has really started, so a card
+    is marked as loaded together with exactly the cards whose loads ran."""
+
+    def __init__(self, load, gate: _StartGate) -> None:
+        self._load, self._gate = load, gate
+
+    def start(self) -> None:
+        self._load.start()
+        self._gate.note_loaded()
+
+    def tick(self):
+        return self._load.tick()
+
+    def stop(self) -> None:
+        self._load.stop()
+
+
+class _StoppedAtGate(Exception):
+    """The lot was interrupted while this card waited to start its load: the load never starts."""
+
+
 def _together_reason(others: int) -> str:
     return f"loaded together with {others} other card{'' if others == 1 else 's'}: measurements only"
 
@@ -508,6 +545,8 @@ def _measure_together(adapter, load, args, *, position: int, gpu_index: int | No
     def before_load() -> None:
         reached.append(True)
         gate.arrive()
+        if stop.is_set():  # Ctrl-C opened the gate: do not start a load only to stop it
+            raise _StoppedAtGate
 
     inventory = None
     try:
@@ -520,9 +559,11 @@ def _measure_together(adapter, load, args, *, position: int, gpu_index: int | No
         started = _now()
         spec = lookup(inventory.model_name)
         extras = _extras(args, adapter, gpu_index, label=f"GPU {gpu_index} ")
-        run = execute_run(adapter, load, _config(args), spec, **_timer(args), **extras,
+        run = execute_run(adapter, _CountedLoad(load, gate), _config(args), spec, **_timer(args), **extras,
                           before_load=before_load, should_stop=stop.is_set)
         return _Measured(position, gpu_index, run, spec, started, _now(), bool(reached))
+    except _StoppedAtGate:
+        return outcome(inventory, INTERRUPTED)
     except Exception as e:  # one card's failure must not lose the rest of the lot
         return outcome(inventory, _one_line(f"run failed: {type(e).__name__}: {e}"))
     finally:
@@ -596,7 +637,7 @@ def _together_outcome(m: _Measured, lot: dict, loaded: int, transfer: dict | Non
     if run.aborted == RUN_INTERRUPTED and not run.load:
         return outcome(NOT_TESTED, INTERRUPTED)
     extra = {}
-    if m.reached_load and loaded >= 2:
+    if m.reached_load and run.load and loaded >= 2:
         run = _mark_together(run, loaded - 1)
         extra["together"] = {"cards": loaded}
     if transfer is not None:
@@ -610,9 +651,12 @@ def _together_outcome(m: _Measured, lot: dict, loaded: int, transfer: dict | Non
     return outcome(TESTED, None, result)
 
 
-def _join(threads: list) -> None:
-    """Wait for every thread while staying interruptible by Ctrl-C."""
+def _join(threads: list, timeout_s: float | None = None) -> None:
+    """Wait for every thread while staying interruptible by Ctrl-C; give up after timeout_s if given."""
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
     while any(t.is_alive() for t in threads):
+        if deadline is not None and time.monotonic() >= deadline:
+            return
         for t in threads:
             t.join(0.1)
 
@@ -653,7 +697,13 @@ def _run_together(adapters, args, gpu_indices: list[int], lot_ref: dict) -> tupl
         stop.set()
         gate.release()
         _say("Interrupted: stopping every card at its next sample and keeping what was measured.")
-        _join(threads)
+        # A card whose driver call hangs would never stop: wait a while, then write what the
+        # others measured and record that one as not tested.
+        _join(threads, STOP_WAIT_S)
+    # A card counts as loaded together only if its load really started: not one whose load
+    # failed to start, and not one still waiting at the gate when the lot was interrupted. A
+    # card whose thread never came back still counts: the others were loaded alongside it.
+    loaded = gate.loaded
     transfers: dict[int, dict] = {}
     if _plan(args).links and not interrupted:
         try:
@@ -663,7 +713,9 @@ def _run_together(adapters, args, gpu_indices: list[int], lot_ref: dict) -> tupl
     cards = []
     for pos, m in enumerate(measured):
         if isinstance(m, _Measured):
-            m = _together_outcome(m, {**lot_ref, "position": pos}, gate.arrived, transfers.get(pos))
+            m = _together_outcome(m, {**lot_ref, "position": pos}, loaded, transfers.get(pos))
+        elif m is None:  # its thread never came back
+            m = CardOutcome(pos, gpu_indices[pos], None, NOT_TESTED, "did not stop after the interrupt", None)
         cards.append(m)
         _say(_progress_line(m))
     return cards, interrupted
