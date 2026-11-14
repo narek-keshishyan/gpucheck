@@ -138,7 +138,7 @@ It runs as its own phase after the load and the answer check, once the load has 
 - All measurements are computed from every one-second sample. The result file would be far too large to upload with a day of them, so a load of more than an hour is stored as at most 3600 summaries: `samples.load_bucket_s` says how many seconds each covers (24 for a 24-hour run), and each summary keeps the highest temperature and fan speed, the lowest clock, every throttle reason seen, the latest error count and the mean power and throughput of its span. A 72-hour result is about half a megabyte. Loads of up to an hour (`--quick`, the standard run, `--long`) are stored sample for sample, as before.
 - The result's `checks.burn_in` records how long the load really ran, the throughput where a standard run reads it (the last two minutes of the first ten) and the throughput over the final 20%. A fall of more than 5% is a `THROUGHPUT_FELL` finding. That threshold has not been calibrated on real hardware.
 - The "not covered" note names the hours the load really ran: "faults that appear only after more than 24 hours of use".
-- One-second samples are held in memory until the run ends: about 20 MB per card per day.
+- One-second samples are held in memory until the run ends: about 30 MB per card per day of load (measured on a simulated card), and about as much again for a moment while the result file is written.
 
 ### All cards at once (`--together`)
 
