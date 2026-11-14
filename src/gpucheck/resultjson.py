@@ -13,6 +13,7 @@ import hashlib
 import json
 from typing import Any
 
+from .checks import thin_load
 from .diagnose import Finding
 from .metrics import Metrics
 from .run import RawRun
@@ -60,7 +61,10 @@ def build_result(
     challenge_workload: dict | None = None,
     timing: dict | None = None,
     lot: dict | None = None,
+    checks: dict | None = None,
 ) -> dict:
+    """`checks` is the extra-check block; a run without extra checks passes none and its result
+    is byte-identical to one built before they existed."""
     result = _normalize(
         {
             "schema_version": SCHEMA_VERSION,
@@ -87,6 +91,13 @@ def build_result(
         result["timing"] = _normalize(timing)
     if lot is not None:
         result["lot"] = _normalize(lot)
+    if checks:
+        result["checks"] = _normalize(checks)
+    # A load of more than an hour is stored as summaries, so a day-long run still fits an upload.
+    load, bucket = thin_load(result["samples"]["load"])
+    if bucket > 1:
+        result["samples"]["load"] = load
+        result["samples"]["load_bucket_s"] = bucket / run.config.hz
     return result
 
 

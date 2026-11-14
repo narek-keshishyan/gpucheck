@@ -1,6 +1,7 @@
 """Telemetry types and the adapter protocol, plus the real NVML adapter.
 
-All NVML access here is read-only: no NVML setter is ever called.
+All NVML access here is read-only: no NVML setter is ever called. Listening for driver error
+events (open_event_log) registers this process as a listener; it changes nothing on the GPU.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ class GpuInventory:
     serial: str | None = None  # read only on explicit opt-in
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)  # slots: a day-long run holds 86,400 of these per card
 class TelemetrySample:
     t_s: float
     temp_c: float | None
@@ -63,7 +64,12 @@ class TelemetrySample:
 
 class TelemetryAdapter(Protocol):
     """An adapter may also offer pcie_link() -> (generation, width): the link as it is right now.
-    The run reads it under load, because a link drops to a lower speed at idle to save power."""
+    The run reads it under load, because a link drops to a lower speed at idle to save power.
+
+    For the opt-in extra checks it may also offer open_event_log() -> an object with poll() and
+    close() (hardware error events the driver reports for this card), nvlink() -> a snapshot of
+    its NVLink links or None when it has none, and nvlink_peer(other) -> whether NVML reports
+    NVLink peer-to-peer access between this card and another adapter's card."""
 
     def inventory(self) -> GpuInventory: ...
 
@@ -141,6 +147,129 @@ def _reason_bit(nv, suffix: str) -> int:
         f"nvmlClocksThrottleReason{suffix}",
         default=_ABI[suffix],
     )
+
+
+# Driver events that report a hardware error, by the name gpucheck records and the NVML ABI bit.
+# Clock, power-state and configuration-change events are not errors and are not listened for.
+ERROR_EVENTS = (
+    ("xid", "nvmlEventTypeXidCriticalError", 0x8),
+    ("double_bit_ecc", "nvmlEventTypeDoubleBitEccError", 0x2),
+    ("single_bit_ecc_storm", "nvmlEventTypeSingleBitEccErrorStorm", 0x200),
+    ("dram_retirement", "nvmlEventTypeDramRetirementEvent", 0x400),
+    ("dram_retirement_failure", "nvmlEventTypeDramRetirementFailure", 0x800),
+    ("non_fatal_poison", "nvmlEventTypeNonFatalPoisonError", 0x1000),
+    ("fatal_poison", "nvmlEventTypeFatalPoisonError", 0x2000),
+    ("gpu_unavailable", "nvmlEventTypeGpuUnavailableError", 0x4000),
+    ("gpu_recovery", "nvmlEventTypeGpuRecoveryAction", 0x8000),
+)
+EVENT_WAIT_MS = 1  # a wait of 0 is not documented as "return at once", so wait one millisecond
+MAX_EVENTS_PER_POLL = 64
+_NVML_ERROR_TIMEOUT = 10
+
+
+class EventLogUnavailable(Exception):
+    """The driver offers no usable event log for this card to this process."""
+
+
+class NvmlEventLog:
+    """Hardware error events (Xid and memory errors) the driver reports for one card.
+
+    The driver delivers only events that happen after registration, which is what a run wants:
+    errors while it was testing. Registering is not a GPU setting and needs no root on a normal
+    driver install; where the driver refuses (some containers and virtual GPUs), opening raises
+    EventLogUnavailable and the run says the log was not available. gpucheck never falls back to
+    reading the kernel log, which needs root."""
+
+    def __init__(self, nv, handle) -> None:
+        self._nv = nv
+        self._kinds: dict[int, str] = {}
+        wanted = 0
+        for kind, name, abi in ERROR_EVENTS:
+            bit = _const(nv, name, default=abi)
+            self._kinds[bit] = kind
+            wanted |= bit
+        for name in ("nvmlEventSetCreate", "nvmlDeviceRegisterEvents", "nvmlEventSetWait_v2", "nvmlEventSetFree"):
+            if getattr(nv, name, None) is None:
+                raise EventLogUnavailable("the installed NVML bindings have no event functions")
+        try:
+            supported = int(nv.nvmlDeviceGetSupportedEventTypes(handle))
+        except Exception as exc:
+            raise EventLogUnavailable(f"the driver does not report which events this card supports ({exc})") from exc
+        mask = supported & wanted
+        if not mask:
+            raise EventLogUnavailable("the driver reports no error events for this card")
+        self._set = None
+        try:
+            self._set = nv.nvmlEventSetCreate()
+            nv.nvmlDeviceRegisterEvents(handle, mask, self._set)
+        except Exception as exc:
+            self.close()
+            raise EventLogUnavailable(f"the driver refused to register for error events ({exc})") from exc
+
+    def _timed_out(self, exc: Exception) -> bool:
+        timeout = _const(self._nv, "NVML_ERROR_TIMEOUT", default=_NVML_ERROR_TIMEOUT)
+        return getattr(exc, "value", None) == timeout
+
+    def poll(self) -> list[dict]:
+        """The events reported since the last poll, oldest first. Raises if the log stops working."""
+        out: list[dict] = []
+        if self._set is None:
+            return out
+        for _ in range(MAX_EVENTS_PER_POLL):
+            try:
+                data = self._nv.nvmlEventSetWait_v2(self._set, EVENT_WAIT_MS)
+            except Exception as exc:
+                if self._timed_out(exc):
+                    break  # nothing more waiting
+                raise
+            kind = self._kinds.get(_int(getattr(data, "eventType", None)) or 0, "other")
+            event: dict = {"kind": kind}
+            if kind == "xid":
+                event["xid"] = _int(getattr(data, "eventData", None))
+            out.append(event)
+        return out
+
+    def close(self) -> None:
+        if self._set is not None:
+            try:
+                self._nv.nvmlEventSetFree(self._set)
+            except Exception:
+                pass
+            self._set = None
+
+
+# NVLink error counters by the name gpucheck records, the NVML enum name and its ABI value.
+_NVLINK_ERRORS = (
+    ("replay", "NVML_NVLINK_ERROR_DL_REPLAY", 0),
+    ("recovery", "NVML_NVLINK_ERROR_DL_RECOVERY", 1),
+    ("crc_flit", "NVML_NVLINK_ERROR_DL_CRC_FLIT", 2),
+    ("crc_data", "NVML_NVLINK_ERROR_DL_CRC_DATA", 3),
+)
+# Card-wide totals of the same counters as NVML field ids, for drivers that no longer answer the
+# per-link query, and the data counters (KiB) summed over every link.
+_NVLINK_TOTAL_FIELDS = (
+    ("replay", "NVML_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL", 52),
+    ("recovery", "NVML_FI_DEV_NVLINK_RECOVERY_ERROR_COUNT_TOTAL", 59),
+    ("crc_flit", "NVML_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL", 38),
+    ("crc_data", "NVML_FI_DEV_NVLINK_CRC_DATA_ERROR_COUNT_TOTAL", 45),
+)
+_NVLINK_DATA_FIELDS = (
+    ("tx_kib", "NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX", 138),
+    ("rx_kib", "NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX", 139),
+)
+_ALL_LINKS = 0xFFFFFFFF  # scope id meaning "summed over every link"
+_MAX_NVLINKS = 36
+# nvmlFieldValue_t.valueType -> the union member holding the value
+_FIELD_MEMBERS = {0: "dVal", 1: "uiVal", 2: "ulVal", 3: "ullVal", 4: "sllVal", 5: "siVal", 6: "usVal"}
+
+
+def _field_int(value) -> int | None:
+    """A whole number from one nvmlFieldValue_t; None when NVML could not read the field."""
+    if _int(getattr(value, "nvmlReturn", 1)) != 0:
+        return None
+    member = _FIELD_MEMBERS.get(_int(getattr(value, "valueType", None)))
+    union = getattr(value, "value", None)
+    return _int(getattr(union, member, None)) if member and union is not None else None
 
 
 def gpu_count() -> int:
@@ -245,6 +374,54 @@ class NvmlAdapter(TelemetryAdapter):
             _int(self._q("nvmlDeviceGetCurrPcieLinkGeneration", h)),
             _int(self._q("nvmlDeviceGetCurrPcieLinkWidth", h)),
         )
+
+    def open_event_log(self) -> NvmlEventLog:
+        """Start listening for hardware error events on this card; EventLogUnavailable if it cannot."""
+        return NvmlEventLog(self._nv, self._h)
+
+    def _fields(self, wanted: tuple) -> dict[str, int]:
+        """NVML field values by name, for the ones the card answers; scope "every link"."""
+        nv = self._nv
+        ids = [(_const(nv, name, default=abi), _ALL_LINKS) for _, name, abi in wanted]
+        values = self._q("nvmlDeviceGetFieldValues", self._h, ids)
+        out: dict[str, int] = {}
+        if values is None:
+            return out
+        for (key, _, _), value in zip(wanted, values):
+            n = _field_int(value)
+            if n is not None:
+                out[key] = n
+        return out
+
+    def nvlink(self) -> dict | None:
+        """This card's NVLink links as they are now, or None when it has none.
+
+        {"links": [{"link": i, "active": bool, "errors": {counter: count}}], "error_totals": {...},
+        "tx_kib": n, "rx_kib": n}; a value the driver does not report is absent."""
+        nv, h = self._nv, self._h
+        links = []
+        for i in range(min(_const(nv, "NVML_NVLINK_MAX_LINKS", default=_MAX_NVLINKS), _MAX_NVLINKS)):
+            state = self._q("nvmlDeviceGetNvLinkState", h, i)
+            if state is None:
+                continue  # no such link on this card
+            errors = {}
+            for key, name, abi in _NVLINK_ERRORS:
+                n = _int(self._q("nvmlDeviceGetNvLinkErrorCounter", h, i, _const(nv, name, default=abi)))
+                if n is not None:
+                    errors[key] = n
+            links.append({"link": i, "active": bool(_int(state)), "errors": errors})
+        if not links:
+            return None
+        return {"links": links, "error_totals": self._fields(_NVLINK_TOTAL_FIELDS), **self._fields(_NVLINK_DATA_FIELDS)}
+
+    def nvlink_peer(self, other) -> bool | None:
+        """Whether NVML reports NVLink peer-to-peer access between this card and `other`'s; None if unknown."""
+        handle = getattr(other, "_h", None)
+        if handle is None:
+            return None
+        index = _const(self._nv, "NVML_P2P_CAPS_INDEX_NVLINK", default=2)
+        status = self._q("nvmlDeviceGetP2PStatus", self._h, handle, index)
+        return None if status is None else _int(status) == _const(self._nv, "NVML_P2P_STATUS_OK", default=0)
 
     def _throttle_mask(self) -> int | None:
         for name in ("nvmlDeviceGetCurrentClocksEventReasons", "nvmlDeviceGetCurrentClocksThrottleReasons"):

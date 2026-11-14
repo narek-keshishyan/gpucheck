@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import sys
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
-from .adapter import GpuInventory, TelemetryAdapter, TelemetrySample
+from .adapter import EventLogUnavailable, GpuInventory, TelemetryAdapter, TelemetrySample
+from .checks import (
+    PARTIAL, RAN, UNAVAILABLE, Check, CheckPlan, CheckUnavailable, driver_errors_report, nvlink_report, one_line,
+)
 from .preflight import Preflight, run_preflight
 from .specs import GpuSpec
 
@@ -25,6 +28,7 @@ UNKNOWN_GPU_THERMAL_LIMIT_C = 95.0  # abort limit when the model is not in the s
 THERMAL_CONSECUTIVE = 3
 ECC_JUMP = 100
 MAX_CONSECUTIVE_SAMPLE_ERRORS = 10
+INTERRUPTED = "interrupted"  # `aborted` when should_stop() ended the run
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,7 @@ class RawRun:
     load: list[TelemetrySample]
     config: RunConfig
     aborted: str | None
+    checks: dict = field(default_factory=dict)  # one entry per extra check asked for; empty by default
 
 
 class _Watchdog:
@@ -119,7 +124,20 @@ def execute_run(
     *,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    plan: CheckPlan | None = None,
+    checks: Sequence[Check] = (),
+    before_load: Callable[[], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    progress: Callable[[int, int, TelemetrySample], None] | None = None,
 ) -> RawRun:
+    """Run one card. Everything after `sleep` is for the opt-in extras and is unused by default:
+
+    plan: which extra checks were asked for. `checks` are the ones that run as their own phases
+    after the load, in order. before_load is called once, just before the load starts (the
+    all-cards-at-once mode waits there for the other cards). should_stop is polled every sample
+    and ends the run as "interrupted". progress is called with (index, count, sample) for every
+    load sample."""
+    plan = plan or CheckPlan()
     inventory = adapter.inventory()
     preflight = run_preflight(adapter)
     baseline: list[TelemetrySample] = []
@@ -127,8 +145,53 @@ def execute_run(
     period = 1.0 / config.hz
     state = {"last_t": None, "errors": 0}
     link: dict[str, int] = {}  # best PCIe generation and width seen while the load ran
+    outcomes: dict = {}
+    events: list[dict] = []
+    log: dict = {"log": None, "status": None, "reason": None}  # the driver's event log, when listening
+    links_before: dict = {}
+
+    def read_links() -> dict | None:
+        reader = getattr(adapter, "nvlink", None)
+        if reader is None:
+            return None
+        try:
+            return reader()
+        except Exception:
+            return None
+
+    def close_log() -> None:
+        if log["log"] is not None:
+            try:
+                log["log"].close()
+            except Exception:
+                pass
+            log["log"] = None
+
+    def drain(phase_name: str, t_s: float) -> None:
+        """Move the events the driver has reported since the last sample into `events`."""
+        if log["log"] is None:
+            return
+        try:
+            new = log["log"].poll()
+        except Exception as e:  # listening broke: keep what was heard and say it is partial
+            log["status"], log["reason"] = PARTIAL, one_line(e)
+            close_log()
+            return
+        events.extend({**e, "phase": phase_name, "t_s": t_s} for e in new)
+
+    def finish() -> None:
+        """Close what the extras opened and write their entries."""
+        if plan.driver_errors:
+            last = state["last_t"]
+            drain("end", 0.0 if last is None else last)
+            close_log()
+            outcomes["driver_errors"] = driver_errors_report(log["status"] or RAN, events, log["reason"])
+        if plan.links:
+            outcomes["nvlink"] = nvlink_report(links_before.get("snapshot"), read_links())
 
     def result(aborted: str | None) -> RawRun:
+        if aborted != "preflight_refused":
+            finish()
         inv = inventory
         if "gen" in link and "width" in link:
             # A link drops to a lower speed at idle, so the idle reading from inventory() says
@@ -136,7 +199,7 @@ def execute_run(
             inv = replace(
                 inv, pcie_gen_current=link["gen"], pcie_width_current=link["width"], pcie_link_under_load=True
             )
-        return RawRun(inv, preflight, baseline, loaded, config, aborted)
+        return RawRun(inv, preflight, baseline, loaded, config, aborted, outcomes)
 
     def read_link() -> None:
         reader = getattr(adapter, "pcie_link", None)
@@ -167,6 +230,7 @@ def execute_run(
 
     def phase(count: int, out: list[TelemetrySample], watchdog: _Watchdog | None, tick: bool) -> str | None:
         start = clock()
+        name = "load" if tick else "baseline"
         for i in range(count):
             if tick:
                 # Sample straight after the burst. Sampling first would read the card after the
@@ -180,22 +244,99 @@ def execute_run(
             else:
                 s = take()
             out.append(s)
+            drain(name, s.t_s)
+            if tick and progress is not None:
+                progress(i, count, s)
             if watchdog is not None and (reason := watchdog.check(s)):
                 return reason
             if state["errors"] >= MAX_CONSECUTIVE_SAMPLE_ERRORS:
                 return "telemetry"
+            if should_stop is not None and should_stop():
+                return INTERRUPTED
             sleep(max(0.0, start + (i + 1) * period - clock()))
         return None
 
-    aborted = phase(round(config.baseline_s * config.hz), baseline, None, tick=False)
-    if aborted:
-        return result(aborted)
-    try:
-        load.start()
-        aborted = phase(round(config.load_s * config.hz), loaded, _Watchdog(spec), tick=True)
-    finally:
+    def run_check(check: Check, watchdog: _Watchdog) -> str | None:
+        """One extra check as its own phase: a slice of work, then a sample, until it is done.
+
+        The card keeps being sampled so its temperature limit still stops the run, and so that
+        driver events and memory-error counts during the check are recorded with it."""
+        status, reason, aborted = RAN, None, None
+        ecc: list[int] = []
+        temps: list[float] = []
         try:
-            load.stop()
-        except Exception as e:  # a failed cleanup must not replace the samples already taken
-            warn_cleanup_failed(e)
-    return result(aborted)
+            check.start()
+            while check.step():
+                s = take()
+                if s.ecc_volatile is not None:
+                    ecc.append(s.ecc_volatile)
+                if s.temp_c is not None:
+                    temps.append(s.temp_c)
+                drain("checks", s.t_s)
+                aborted = watchdog.check(s)
+                if aborted is None and state["errors"] >= MAX_CONSECUTIVE_SAMPLE_ERRORS:
+                    aborted = "telemetry"
+                if aborted is None and should_stop is not None and should_stop():
+                    aborted = INTERRUPTED
+                if aborted:
+                    status = PARTIAL
+                    break
+        except CheckUnavailable as e:
+            status, reason = UNAVAILABLE, " ".join(str(e).split())[:200]
+        except Exception as e:  # a check that breaks must not lose the run that came before it
+            status, reason = UNAVAILABLE, one_line(e)
+        finally:
+            try:
+                check.stop()
+            except Exception as e:
+                warn_cleanup_failed(e)
+        entry = {"status": status}
+        if status != UNAVAILABLE:
+            try:
+                entry.update(check.result())
+            except Exception as e:
+                entry, reason = {"status": UNAVAILABLE}, one_line(e)
+            if len(ecc) >= 2:
+                entry["ecc_delta"] = ecc[-1] - ecc[0]
+            if temps:
+                entry["max_temp_c"] = max(temps)
+        if reason:
+            entry["reason"] = reason
+        outcomes[check.name] = entry
+        return aborted
+
+    if plan.driver_errors:
+        opener = getattr(adapter, "open_event_log", None)
+        try:
+            if opener is None:
+                raise CheckUnavailable("this card's driver interface offers no event log")
+            log["log"] = opener()
+        except Exception as e:
+            log["status"] = UNAVAILABLE
+            known = isinstance(e, (CheckUnavailable, EventLogUnavailable))
+            log["reason"] = " ".join(str(e).split())[:200] if known else one_line(e)
+    if plan.links:
+        links_before["snapshot"] = read_links()
+
+    try:
+        aborted = phase(round(config.baseline_s * config.hz), baseline, None, tick=False)
+        if aborted:
+            return result(aborted)
+        try:
+            if before_load is not None:
+                before_load()
+            load.start()
+            aborted = phase(round(config.load_s * config.hz), loaded, _Watchdog(spec), tick=True)
+        finally:
+            try:
+                load.stop()
+            except Exception as e:  # a failed cleanup must not replace the samples already taken
+                warn_cleanup_failed(e)
+        guard = _Watchdog(spec)
+        for check in checks:
+            if aborted:
+                break  # the run was stopped: the remaining checks are not run and are not listed
+            aborted = run_check(check, guard)
+        return result(aborted)
+    finally:
+        close_log()  # also on Ctrl-C or an unexpected error; a second close is a no-op

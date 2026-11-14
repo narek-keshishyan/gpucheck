@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .adapter import AdapterUnavailable, NvmlAdapter, gpu_count
+from .checks import CheckPlan, burn_in_report
+from .coverage import narrowed, not_covered_many
 from .diagnose import diagnose
 from .fakes import make_fakes
 from .lot import (
@@ -38,7 +40,7 @@ from .lot import (
 )
 from .load import LoadUnavailable, TorchGemmLoad
 from .metrics import derive
-from .report import NOT_COVERED, render_report
+from .report import render_report
 from .resultjson import build_result, canonical_dumps
 from .run import NullLoad, RunConfig, execute_run
 from .specs import lookup
@@ -88,6 +90,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--label", metavar="TEXT", default=None, help=f"a name for a lot, such as a rack or chassis (at most {MAX_LABEL_LEN} characters); makes the run a lot even with one card")
     p.add_argument("--lot-dir", metavar="DIR", default=None, help="where a lot writes its files (default: ./gpucheck-lot-<id>); makes the run a lot even with one card")
     p.add_argument("--upload-saved", metavar="PATH", default=None, help="upload a saved result file or lot directory without testing any GPU")
+    x = p.add_argument_group(
+        "extra checks",
+        "Off by default: a plain run is unchanged by them. Each one adds to the result what it checked.",
+    )
+    x.add_argument("--driver-errors", action="store_true", help="listen for hardware error events (Xid) the driver reports for the card during the run")
     p.add_argument("--fake", metavar="PROFILE", help=argparse.SUPPRESS)
     return p
 
@@ -107,6 +114,7 @@ def _parse(argv):
             ("--fake", args.fake), ("--gpus", args.gpus is not None), ("--quick", args.quick),
             ("--long", args.long), ("--label", args.label is not None),
             ("--lot-dir", args.lot_dir is not None), ("--include-serial", args.include_serial),
+            ("--driver-errors", args.driver_errors),
         ):
             if used:
                 p.error(f"--upload-saved cannot be combined with {flag}")
@@ -207,10 +215,51 @@ def _timer(args) -> dict:
     return {"clock": clock, "sleep": sleep}
 
 
+def _plan(args) -> CheckPlan:
+    """The extra checks this run was asked for; none by default."""
+    return CheckPlan(driver_errors=getattr(args, "driver_errors", False))
+
+
+def _make_checks(args, adapter, device_index: int = 0) -> list:
+    """The checks that run as their own phases after the load, in the order they run."""
+    del args, adapter, device_index
+    return []
+
+
+def _extras(args, adapter, device_index: int = 0) -> dict:
+    """Keyword arguments that turn on the extra checks in execute_run; empty for a plain run,
+    so a plain run calls execute_run exactly as it always has."""
+    plan = _plan(args)
+    if not plan.any():
+        return {}
+    return {"plan": plan, "checks": _make_checks(args, adapter, device_index)}
+
+
+def _checks_block(run) -> dict:
+    """The result's "checks" block: what the run's extra checks reported, plus the burn-in entry."""
+    checks = dict(run.checks)
+    burn_in = burn_in_report(run.load, run.config.load_s, run.config.hz)
+    if burn_in is not None:
+        checks["burn_in"] = burn_in
+    return checks
+
+
+def _result(run, spec, *, challenge=None, challenge_workload=None, timing=None, lot=None) -> dict:
+    """Metrics, findings and the result dict for a finished run."""
+    metrics = derive(run, spec)
+    checks = _checks_block(run)
+    if not checks:  # a plain run: exactly the calls it has always made
+        findings = diagnose(metrics, run.preflight, run.inventory, spec)
+        return build_result(run, metrics, findings, challenge, challenge_workload, timing=timing, lot=lot)
+    findings = diagnose(metrics, run.preflight, run.inventory, spec, checks)
+    return build_result(run, metrics, findings, challenge, challenge_workload, timing=timing, lot=lot, checks=checks)
+
+
 def _execute(adapter, args, challenge=None, device_index: int = 0):
     spec = lookup(adapter.inventory().model_name)
     load = _make_load(args, challenge, device_index=device_index)
-    return spec, load, execute_run(adapter, load, _config(args), spec, **_timer(args))
+    extras = _extras(args, adapter, device_index)
+    return spec, load, execute_run(adapter, load, _config(args), spec, **_timer(args), **extras)
 
 
 MAX_REASON_LEN = 300
@@ -271,7 +320,7 @@ def _run_card(
         settle_s = settle(adapter, sleep=timer.get("sleep", time.sleep)) if settle_first else None
         spec = lookup(inventory.model_name)
         load = _make_load(args, None, device_index=gpu_index)
-        run = execute_run(adapter, load, _config(args), spec, **timer)
+        run = execute_run(adapter, load, _config(args), spec, **timer, **_extras(args, adapter, gpu_index))
     except KeyboardInterrupt:
         raise _CardInterrupted(outcome(inventory, NOT_TESTED, INTERRUPTED)) from None
     except Exception as e:  # one card's failure must not lose the rest of the lot
@@ -279,10 +328,8 @@ def _run_card(
     ended = _now()
     if run.aborted == "preflight_refused":
         return outcome(run.inventory, NOT_TESTED, "; ".join(run.preflight.reasons))
-    metrics = derive(run, spec)
-    findings = diagnose(metrics, run.preflight, run.inventory, spec)
-    result = build_result(
-        run, metrics, findings,
+    result = _result(
+        run, spec,
         timing={"started_utc": _iso(started), "ended_utc": _iso(ended), "settle_s": settle_s},
         lot=lot,
     )
@@ -383,7 +430,7 @@ def _main_lot(adapters, args, gpu_indices: list[int], api_key: str | None = None
         if card.result is not None:
             print(render_report(card.result))
     print(render_lot_table(summary))
-    print(NOT_COVERED)
+    print(not_covered_many([narrowed(c.result) for c in cards if c.result is not None]))
     if write_error is not None:  # nothing saved to upload from
         print(f"gpucheck: could not write the lot to {directory}: {write_error}", file=sys.stderr)
         return EXIT_REFUSED
@@ -716,8 +763,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {reason}")
         return EXIT_REFUSED
 
-    metrics = derive(run, spec)
-    findings = diagnose(metrics, run.preflight, run.inventory, spec)
     challenge_workload = None
     if challenge is not None:
         challenge_workload = getattr(load, "resolved_workload", None)
@@ -730,8 +775,8 @@ def main(argv: list[str] | None = None) -> int:
                 "gemm_n": [8192 + o for o in w["gemm_n_offsets"]],
                 "order_seed": w["order_seed"],
             }
-    result = build_result(
-        run, metrics, findings, challenge, challenge_workload,
+    result = _result(
+        run, spec, challenge=challenge, challenge_workload=challenge_workload,
         timing={"started_utc": _iso(started), "ended_utc": _iso(ended), "settle_s": None},
     )
     Path(args.json).write_text(canonical_dumps(result))  # before any upload consideration

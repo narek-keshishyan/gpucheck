@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-NOT_COVERED = (
-    "This is a pre-flight check, not proof of health. It does not test memory cells, "
-    "silent data corruption, faults that appear only after hours of use, links between "
-    "GPUs, or physical damage."
-)
+from .coverage import NOT_COVERED, check_lines, not_covered, together_others
+
+__all__ = ["NOT_COVERED", "render_report"]
 
 _MEASUREMENTS: list[tuple[str, str, str]] = [
     ("idle_temp_c", "Idle temperature", "C"),
@@ -26,6 +24,7 @@ _ABORT_TEXT = {
     "ecc": "ECC errors jumped during the run",
     "telemetry": "telemetry became unreadable",
     "preflight_refused": "preflight refused the run",
+    "interrupted": "the run was interrupted",
 }
 
 
@@ -60,10 +59,11 @@ def render_report(result: dict) -> str:
         why = _ABORT_TEXT.get(result["aborted"], result["aborted"])
         out += [f"!! Run aborted early ({why}); showing what was collected.", ""]
     if pre.get("mode") == "measurements_only":
-        out += [
-            "NOTE: MIG/fractional GPU configuration - measurements only, no grade is given.",
-            "",
-        ]
+        if together_others(result) is not None:
+            note = "NOTE: loaded together with other cards - measurements only, no grade is given."
+        else:
+            note = "NOTE: MIG/fractional GPU configuration - measurements only, no grade is given."
+        out += [note, ""]
 
     out.append("Inventory")
     out.append("---------")
@@ -114,6 +114,16 @@ def render_report(result: dict) -> str:
         out.append("  none found by this test")
     out.append("")
 
+    lines = check_lines(result)
+    if lines:  # only a run that was asked for extra checks has this section
+        out.append("Extra checks")
+        out.append("------------")
+        out += [f"  {label}: {text}" for label, text in lines]
+        bucket = (result.get("samples") or {}).get("load_bucket_s")
+        if bucket:
+            out.append(f"  Stored samples: each load sample in the result file summarises {bucket:g} s")
+        out.append("")
+
     out.append("Telemetry gaps")
     out.append("--------------")
     gaps = list(met.get("telemetry_gaps") or [])
@@ -125,5 +135,5 @@ def render_report(result: dict) -> str:
 
     out.append("Not covered")
     out.append("-----------")
-    out.append("  " + NOT_COVERED)
+    out.append("  " + not_covered(result))
     return "\n".join(out) + "\n"

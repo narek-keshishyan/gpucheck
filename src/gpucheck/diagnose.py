@@ -2,7 +2,9 @@
 
 Rules are evaluated in a fixed order (MEMORY_ERRORS, MEMORY_NOT_CHECKED, HOT_UNDER_LOAD,
 HOT_ENVIRONMENT, THERMAL_THROTTLING, POWER_CAPPED, UNDERPERFORMING_UNKNOWN,
-INSUFFICIENT_EVIDENCE, PCIE_LINK_DEGRADED) and each rule fires at most once. Unknown throttle data
+INSUFFICIENT_EVIDENCE, PCIE_LINK_DEGRADED, then the rules for the opt-in extra checks:
+DRIVER_ERRORS, MEMTEST_MISMATCH, WRONG_ANSWERS, LINK_TRANSFER_MISMATCH, NVLINK_ERRORS,
+NVLINK_LINKS_INACTIVE, THROUGHPUT_FELL, CHECK_NOT_RUN) and each rule fires at most once. Unknown throttle data
 ("throttle_reasons" in telemetry_gaps) is treated as unknown, never as "none". A rule whose required inputs are None does
 not fire. Rules that compare against the datasheet need `spec`; they are
 skipped when it is None.
@@ -13,7 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from . import coverage
 from .adapter import GpuInventory
+from .coverage import PARTIAL, UNAVAILABLE
 from .metrics import THERMAL_REASON, Metrics
 from .preflight import Preflight
 from .specs import GpuSpec
@@ -35,6 +39,12 @@ UNDERPERFORMING_RATIO = 0.9
 # to 300 W 0.60. So this is only a floor for gross shortfalls; comparing a card with others of its
 # model is the server's job, not this rule's.
 UNDERPERFORMING_AT_POWER_LIMIT_RATIO = 0.4
+_CHECK_WORDS = {
+    "driver_errors": "driver error log", "memtest": "memory test", "answer": "answer check", "nvlink": "NVLink links",
+}
+# A burn-in whose final throughput is below this share of its first ten minutes is reported.
+# Not calibrated on real hardware: one H100 held within 0.4% between a 150 s and a 600 s load.
+THROUGHPUT_FELL_RATIO = 0.95
 
 
 @dataclass(frozen=True)
@@ -53,10 +63,14 @@ def _throttled(m: Metrics) -> bool:
     return m.time_to_throttle_s is not None or THERMAL_REASON in m.throttle_reasons_seen
 
 
-def _memory_errors(m: Metrics, inv: GpuInventory) -> Finding | None:
+def _memory_errors(m: Metrics, inv: GpuInventory, checks: dict | None = None) -> Finding | None:
     parts: list[str] = []
     if m.ecc_delta is not None and m.ecc_delta > 0:
         parts.append(f"ECC error count rose by {m.ecc_delta} during the run")
+    for name in ("answer", "memtest"):  # the phases after the load are not in metrics.ecc_delta
+        rose = coverage.count((checks or {}).get(name, {}).get("ecc_delta"))
+        if rose:
+            parts.append(f"ECC error count rose by {rose} during the {_CHECK_WORDS[name]}")
     if inv.remapped_rows is not None and inv.remapped_rows > 0:
         parts.append(f"{inv.remapped_rows} memory row(s) were remapped")
     if inv.row_remap_failure:
@@ -261,19 +275,145 @@ def _insufficient_evidence(m: Metrics, spec: GpuSpec | None) -> Finding | None:
     )
 
 
+def _driver_errors(result: dict) -> Finding | None:
+    events = coverage.driver_events(result)
+    if not events:
+        return None
+    total = sum(n for _, n in events)
+    listed = ", ".join(f"{name} x{n}" for name, n in events)
+    return Finding(
+        "DRIVER_ERRORS",
+        "bad",
+        "high",
+        f"The driver reported {total} hardware error event{'' if total == 1 else 's'} for this card "
+        f"during the run: {listed}. Xid numbers are NVIDIA driver error codes.",
+    )
+
+
+def _memtest_mismatch(result: dict) -> Finding | None:
+    m = coverage.memtest_facts(result)
+    if not m or not m["mismatched"]:
+        return None
+    return Finding(
+        "MEMTEST_MISMATCH",
+        "bad",
+        "high",
+        f"The memory test read back {m['mismatched']} word{'' if m['mismatched'] == 1 else 's'} that differed "
+        f"from what it wrote ({m['bytes'] / coverage.GIB:.1f} GiB tested).",
+    )
+
+
+def _wrong_answers(result: dict) -> Finding | None:
+    a = coverage.answer_facts(result)
+    if not a or not a["wrong"]:
+        return None
+    return Finding(
+        "WRONG_ANSWERS",
+        "bad",
+        "high",
+        f"The answer check got {a['wrong']} of {a['products']} products wrong: the card returned "
+        "results that differ from the known correct ones.",
+    )
+
+
+def _transfer_mismatch(result: dict) -> Finding | None:
+    n = coverage.nvlink_facts(result)
+    t = n["transfer"] if n else None
+    if not t or not t["mismatched"]:
+        return None
+    return Finding(
+        "LINK_TRANSFER_MISMATCH",
+        "bad",
+        "high",
+        f"Test data copied between this card and {t['peers']} other card{'' if t['peers'] == 1 else 's'} "
+        f"came back changed ({t['mismatched']} word{'' if t['mismatched'] == 1 else 's'} differed).",
+    )
+
+
+def _nvlink_errors(result: dict) -> Finding | None:
+    n = coverage.nvlink_facts(result)
+    if not n:
+        return None
+    parts = [f"{k.replace('_', ' ')} +{v}" for k, v in n["rises"].items() if v]
+    if not parts and not n["dropped"]:
+        return None
+    said = []
+    if parts:
+        said.append("NVLink error counters rose during the run (" + ", ".join(parts) + ")")
+    if n["dropped"]:
+        said.append(f"{n['dropped']} NVLink link{'' if n['dropped'] == 1 else 's'} that {'was' if n['dropped'] == 1 else 'were'} "
+                    "active before the run had gone down after it")
+    sentence = " and ".join(said)
+    return Finding("NVLINK_ERRORS", "warn", "medium", sentence[0].upper() + sentence[1:] + ".")
+
+
+def _nvlink_inactive(result: dict) -> Finding | None:
+    n = coverage.nvlink_facts(result)
+    if not n or n["active"] >= n["links"]:
+        return None
+    return Finding(
+        "NVLINK_LINKS_INACTIVE",
+        "info",
+        "high",
+        f"{n['links'] - n['active']} of this card's {n['links']} NVLink links were inactive. Whether that is "
+        "expected depends on how the machine is wired.",
+    )
+
+
+def _throughput_fell(result: dict) -> Finding | None:
+    b = coverage.check(result, "burn_in")
+    early, late = b.get("early_tflops"), b.get("late_tflops")
+    if not isinstance(early, (int, float)) or not isinstance(late, (int, float)) or early <= 0:
+        return None
+    if late >= THROUGHPUT_FELL_RATIO * early:
+        return None
+    return Finding(
+        "THROUGHPUT_FELL",
+        "warn",
+        "low",
+        f"Throughput over the final part of the run was {100 * (1 - late / early):.1f}% lower than in its "
+        "first ten minutes.",
+    )
+
+
+def _check_not_run(result: dict) -> Finding | None:
+    """A check that was asked for and did not run to its end is said, never passed over."""
+    missed = []
+    for name in ("driver_errors", "memtest", "answer", "nvlink"):
+        status = coverage.status(result, name)
+        if status == UNAVAILABLE:
+            missed.append(f"{_CHECK_WORDS[name]} (could not be run)")
+        elif status == PARTIAL:
+            missed.append(f"{_CHECK_WORDS[name]} (stopped before finishing)")
+    if not missed:
+        return None
+    return Finding(
+        "CHECK_NOT_RUN",
+        "info",
+        "high",
+        "These requested checks did not run to the end, so what they would have covered is not covered: "
+        + ", ".join(missed) + ".",
+    )
+
+
 def diagnose(
     metrics: Metrics,
     preflight: Preflight,
     inventory: GpuInventory,
     spec: GpuSpec | None,
+    checks: dict | None = None,
 ) -> list[Finding]:
-    """Return the findings for one card, in fixed rule order; empty means no findings."""
+    """Return the findings for one card, in fixed rule order; empty means no findings.
+
+    `checks` is the run's extra-check block (RawRun.checks plus any burn-in entry); without it
+    the rules are exactly the ones a standard run has always had."""
     del preflight  # the v1 rule table does not consult preflight
     tim = _hot_under_load(metrics, spec)
     insufficient = _insufficient_evidence(metrics, spec)
     throttling = _thermal_throttling(metrics) if tim is None and insufficient is None else None
+    extra = {"checks": checks} if checks else {}
     rules = (
-        _memory_errors(metrics, inventory),
+        _memory_errors(metrics, inventory, checks),
         _memory_not_checked(metrics, inventory),
         tim,
         _hot_environment(metrics),
@@ -282,5 +422,13 @@ def diagnose(
         _underperforming(metrics, inventory, spec),
         insufficient,
         _pcie_link(inventory),
+        _driver_errors(extra),
+        _memtest_mismatch(extra),
+        _wrong_answers(extra),
+        _transfer_mismatch(extra),
+        _nvlink_errors(extra),
+        _nvlink_inactive(extra),
+        _throughput_fell(extra),
+        _check_not_run(extra),
     )
     return [f for f in rules if f is not None]
